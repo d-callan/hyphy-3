@@ -146,3 +146,80 @@ TEST_CASE("Optimizer: L-BFGS-B optimization of omega on cd2_reduced") {
     CHECK(res.log_likelihood > -92.77745); // Strictly improved from initial -92.777
 }
 
+TEST_CASE("LikelihoodEngine: Exact Spectral Fréchet Joint Gradients vs Finite Differences") {
+    std::string aln_path = "/Users/sergei/Development/hyphy/hyphy-next/benchmarks/data/cd2_reduced.fna";
+    std::string nwk = "((((Pig:0.147969,Cow:0.213430):0.085099,Horse:0.165787,Cat:0.264806):0.058611,((RhMonkey:0.002015,Baboon:0.003108):0.022733,(Human:0.004349,Chimp:0.000799):0.011873):0.101856):0.340802,Rat:0.050958,Mouse:0.097950);";
+
+    auto aln = Alignment::from_fasta(aln_path);
+    auto tree = Tree::from_newick(nwk);
+
+    MG94Parameters params;
+    params.alpha = 1.0;
+    params.beta = 0.45;
+    params.theta_AC = 0.8;
+    params.theta_AT = 1.2;
+    params.theta_CG = 0.6;
+    params.theta_CT = 1.8;
+    params.theta_GT = 0.9;
+
+    size_t num_nodes = tree.num_nodes();
+    std::vector<Scalar> bl(num_nodes, 0.0);
+    for (const auto& node : tree.nodes) {
+        if (node.id != tree.root_id) bl[node.id] = std::max(1e-4, node.branch_length);
+    }
+    auto leaf_map = LikelihoodEngine::build_leaf_to_taxon_map(tree, aln);
+
+    auto ana = LikelihoodEngine::compute_joint_frechet_gradients(tree, aln, params, bl, &leaf_map);
+
+    auto eval_lnl = [&](const MG94Parameters& p, const std::vector<Scalar>& b) -> Scalar {
+        MG94Matrix mg;
+        mg.update(p, aln.pos_nuc_frequencies, aln.codon_frequencies_f3x4, *(aln.code ? aln.code : GeneticCode::universal()));
+        Scalar conv = (mg.scale_factor > 1e-12) ? (3.0 / mg.scale_factor) : 1.0;
+        Tree t_eval = tree;
+        for (const auto& node : t_eval.nodes) {
+            if (node.id != t_eval.root_id) {
+                t_eval.nodes[node.id].branch_length = b[node.id] * conv;
+            }
+        }
+        return LikelihoodEngine::compute_mg94_log_likelihood(t_eval, aln, mg, &leaf_map);
+    };
+
+    Scalar eps = 1e-6;
+
+    // Test Global Parameters Gradients
+    auto test_param = [&](Scalar ana_grad, auto mutate) {
+        MG94Parameters p_plus = params, p_minus = params;
+        mutate(p_plus, eps);
+        mutate(p_minus, -eps);
+        Scalar fd = (eval_lnl(p_plus, bl) - eval_lnl(p_minus, bl)) / (2.0 * eps);
+        CHECK(std::abs(ana_grad - fd) / (std::abs(ana_grad) + 1.0) < 1e-4);
+    };
+
+    test_param(ana.grad_omega, [](MG94Parameters& p, Scalar d) { p.beta += d; });
+    test_param(ana.grad_theta_AC, [](MG94Parameters& p, Scalar d) { p.theta_AC += d; });
+    test_param(ana.grad_theta_AT, [](MG94Parameters& p, Scalar d) { p.theta_AT += d; });
+    test_param(ana.grad_theta_CG, [](MG94Parameters& p, Scalar d) { p.theta_CG += d; });
+    test_param(ana.grad_theta_CT, [](MG94Parameters& p, Scalar d) { p.theta_CT += d; });
+    test_param(ana.grad_theta_GT, [](MG94Parameters& p, Scalar d) { p.theta_GT += d; });
+
+    // Test Branch Length Gradients
+    for (const auto& node : tree.nodes) {
+        if (node.id != tree.root_id) {
+            int32_t bid = node.id;
+            auto bl_plus = bl, bl_minus = bl;
+            bl_plus[bid] += eps;
+            bl_minus[bid] -= eps;
+            Scalar fd = (eval_lnl(params, bl_plus) - eval_lnl(params, bl_minus)) / (2.0 * eps);
+            CHECK(std::abs(ana.grad_branches[bid] - fd) / (std::abs(ana.grad_branches[bid]) + 1.0) < 1e-4);
+        }
+    }
+
+    // Verify Unified Joint Fit full model converges and improves likelihood
+    MG94Fitter fitter(tree, aln);
+    auto fit_res = fitter.fit_full_model(1.0, params);
+    CHECK(fit_res.converged);
+    CHECK(fit_res.log_likelihood > ana.log_likelihood);
+    CHECK(fit_res.params.beta > 0.0);
+}
+
+

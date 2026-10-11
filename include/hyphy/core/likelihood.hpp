@@ -445,6 +445,200 @@ public:
 
         return {total_log_l, grad_b};
     }
+
+    struct JointMG94Gradients {
+        Scalar log_likelihood = 0.0;
+        std::vector<Scalar> grad_branches; // d ln L / d t_b (in substitutions/site)
+        Scalar grad_omega = 0.0;           // d ln L / d omega
+        Scalar grad_theta_AC = 0.0;        // d ln L / d theta_AC
+        Scalar grad_theta_AT = 0.0;        // d ln L / d theta_AT
+        Scalar grad_theta_CG = 0.0;        // d ln L / d theta_CG
+        Scalar grad_theta_CT = 0.0;        // d ln L / d theta_CT
+        Scalar grad_theta_GT = 0.0;        // d ln L / d theta_GT
+    };
+
+    // Evaluates log-likelihood and exact joint analytical gradients for all branch lengths
+    // and all 6 global parameters (omega, theta_AC, theta_AT, theta_CG, theta_CT, theta_GT)
+    // using the 2-pass Inside-Outside adjoint state and spectral Fréchet derivatives of the matrix exponential.
+    static JointMG94Gradients compute_joint_frechet_gradients(
+        const Tree& tree,
+        const Alignment& aln,
+        const MG94Parameters& params,
+        const std::vector<Scalar>& branch_lengths = {},
+        const std::vector<size_t>* custom_leaf_to_taxon = nullptr
+    ) {
+        const auto& gcode = *(aln.code ? aln.code : GeneticCode::universal());
+        int S = gcode.num_sense_codons;
+        size_t num_nodes = tree.num_nodes();
+        size_t num_patterns = aln.patterns.size();
+
+        MG94Matrix mg;
+        mg.update(params, aln.pos_nuc_frequencies, aln.codon_frequencies_f3x4, gcode);
+
+        Scalar mu = mg.scale_factor;
+        Scalar conv = (mu > 1e-12) ? (3.0 / mu) : 1.0;
+
+        std::vector<Scalar> tau(num_nodes, 0.0);
+        std::vector<Matrix> P_branches(num_nodes);
+        std::vector<Matrix> dP_branches(num_nodes);
+
+        bool use_custom_bl = !branch_lengths.empty();
+        for (const auto& node : tree.nodes) {
+            if (node.id != tree.root_id) {
+                int32_t bid = node.id;
+                Scalar bl = (use_custom_bl && static_cast<size_t>(bid) < branch_lengths.size())
+                    ? branch_lengths[bid] : node.branch_length;
+                tau[bid] = bl * conv;
+                P_branches[bid] = mg.transition_matrix(tau[bid]);
+                dP_branches[bid] = mg.Q * P_branches[bid];
+            }
+        }
+
+        std::vector<size_t> local_map;
+        const std::vector<size_t>& leaf_to_taxon = custom_leaf_to_taxon
+            ? *custom_leaf_to_taxon
+            : (local_map = build_leaf_to_taxon_map(tree, aln));
+
+        Scalar total_log_l = 0.0;
+        std::vector<Scalar> dL_dtau(num_nodes, 0.0);
+        std::vector<Matrix> A_branches(num_nodes, Matrix::Zero(S, S));
+
+        #pragma omp parallel
+        {
+            Scalar local_ll = 0.0;
+            std::vector<Scalar> local_dL(num_nodes, 0.0);
+            std::vector<Matrix> local_A(num_nodes, Matrix::Zero(S, S));
+
+            #pragma omp for schedule(dynamic)
+            for (size_t p = 0; p < num_patterns; ++p) {
+                const auto& pattern = aln.patterns[p];
+                auto io = compute_inside_outside(
+                    tree, pattern, leaf_to_taxon, P_branches, aln.codon_frequencies_f3x4, S
+                );
+                Scalar L = io.likelihood;
+                if (L > 0.0) {
+                    local_ll += pattern.weight * io.log_likelihood;
+                    Scalar inv_L = pattern.weight / L;
+
+                    for (const auto& node : tree.nodes) {
+                        if (node.id != tree.root_id) {
+                            int32_t bid = node.id;
+                            Scalar dL_dt = io.V[bid].dot(dP_branches[bid] * io.D[bid]);
+                            local_dL[bid] += inv_L * dL_dt;
+                            local_A[bid].noalias() += inv_L * (io.V[bid] * io.D[bid].transpose());
+                        }
+                    }
+                }
+            }
+
+            #pragma omp critical
+            {
+                total_log_l += local_ll;
+                for (size_t i = 0; i < num_nodes; ++i) {
+                    dL_dtau[i] += local_dL[i];
+                    A_branches[i] += local_A[i];
+                }
+            }
+        }
+
+        Matrix H = Matrix::Zero(S, S);
+        Scalar sum_tau_dL_dtau = 0.0;
+
+        for (const auto& node : tree.nodes) {
+            if (node.id != tree.root_id) {
+                int32_t bid = node.id;
+                Scalar tb = tau[bid];
+                sum_tau_dL_dtau += tb * dL_dtau[bid];
+
+                Matrix A_tilde = mg.U_pi.transpose() * A_branches[bid] * mg.V_pi.transpose();
+
+                Matrix E(S, S);
+                for (int i = 0; i < S; ++i) {
+                    for (int j = 0; j < S; ++j) {
+                        Scalar diff = mg.eigenvalues(i) - mg.eigenvalues(j);
+                        if (std::abs(diff) < 1e-9) {
+                            E(i, j) = tb * std::exp(mg.eigenvalues(i) * tb);
+                        } else {
+                            E(i, j) = (std::exp(mg.eigenvalues(i) * tb) - std::exp(mg.eigenvalues(j) * tb)) / diff;
+                        }
+                    }
+                }
+
+                H.noalias() += A_tilde.cwiseProduct(E);
+            }
+        }
+
+        auto compute_global_grad = [&](const Matrix& dQ_k) -> Scalar {
+            Matrix M_k = mg.V_pi * dQ_k * mg.U_pi;
+            Scalar part1 = (M_k.cwiseProduct(H)).sum();
+            Scalar dmu_k = 0.0;
+            for (int i = 0; i < S; ++i) {
+                dmu_k -= mg.pi(i) * dQ_k(i, i);
+            }
+            Scalar part2 = -(dmu_k / mu) * sum_tau_dL_dtau;
+            return part1 + part2;
+        };
+
+        Scalar r_nuc[4][4] = {
+            {0.0, params.theta_AC, 1.0, params.theta_AT},
+            {params.theta_AC, 0.0, params.theta_CG, params.theta_CT},
+            {1.0, params.theta_CG, 0.0, params.theta_GT},
+            {params.theta_AT, params.theta_CT, params.theta_GT, 0.0}
+        };
+
+        Matrix dQ_omega = Matrix::Zero(S, S);
+        for (int i = 0; i < S; ++i) {
+            for (int j = 0; j < S; ++j) {
+                if (i == j) continue;
+                const auto& diff = gcode.diff_matrix[i][j];
+                if (diff.num_diffs == 1 && !diff.synonymous) {
+                    Scalar nuc_rate = r_nuc[diff.diff_from[0]][diff.diff_to[0]];
+                    Scalar target_nuc_freq = aln.pos_nuc_frequencies(diff.diff_pos[0], diff.diff_to[0]);
+                    dQ_omega(i, j) = 1.0 * nuc_rate * target_nuc_freq;
+                }
+            }
+            dQ_omega(i, i) = -dQ_omega.row(i).sum();
+        }
+
+        auto build_dQ_nuc = [&](int u, int v) -> Matrix {
+            Matrix dQ = Matrix::Zero(S, S);
+            for (int i = 0; i < S; ++i) {
+                for (int j = 0; j < S; ++j) {
+                    if (i == j) continue;
+                    const auto& diff = gcode.diff_matrix[i][j];
+                    if (diff.num_diffs == 1) {
+                        int from = diff.diff_from[0];
+                        int to = diff.diff_to[0];
+                        if ((from == u && to == v) || (from == v && to == u)) {
+                            Scalar rate_mod = diff.synonymous ? params.alpha : params.beta;
+                            Scalar target_nuc_freq = aln.pos_nuc_frequencies(diff.diff_pos[0], to);
+                            dQ(i, j) = rate_mod * 1.0 * target_nuc_freq;
+                        }
+                    }
+                }
+                dQ(i, i) = -dQ.row(i).sum();
+            }
+            return dQ;
+        };
+
+        JointMG94Gradients res;
+        res.log_likelihood = total_log_l;
+        res.grad_branches.resize(num_nodes, 0.0);
+        for (const auto& node : tree.nodes) {
+            if (node.id != tree.root_id) {
+                res.grad_branches[node.id] = conv * dL_dtau[node.id];
+            }
+        }
+
+        res.grad_omega = compute_global_grad(dQ_omega);
+        res.grad_theta_AC = compute_global_grad(build_dQ_nuc(0, 1));
+        res.grad_theta_AT = compute_global_grad(build_dQ_nuc(0, 3));
+        res.grad_theta_CG = compute_global_grad(build_dQ_nuc(1, 2));
+        res.grad_theta_CT = compute_global_grad(build_dQ_nuc(1, 3));
+        res.grad_theta_GT = compute_global_grad(build_dQ_nuc(2, 3));
+
+        return res;
+    }
 };
 
 } // namespace hyphy::core
