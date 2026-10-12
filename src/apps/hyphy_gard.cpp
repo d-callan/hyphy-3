@@ -38,6 +38,8 @@ static void print_gard_usage(const char* prog) {
               << "  " << Console::brand("--output, -o") << " <file>           Path to output JSON file (default: <alignment>.GARD.json)\n"
               << "  " << Console::brand("--format") << " <fmt>                Output format: 'modern' (default) or 'legacy'\n"
               << "  " << Console::brand("--legacy-json") << "                  Output HyPhy 2.5 compatible JSON\n"
+              << "  " << Console::brand("--no-chart") << "                     Disable dynamic breakpoint track & sparkline\n"
+              << "  " << Console::brand("--force-tty") << "                    Force ANSI in-place dynamic chart updates\n"
               << "  " << Console::brand("--quiet, -q") << "                    Suppress progress output\n"
               << "  " << Console::brand("--help, -h") << "                    Show this help message\n\n"
               << Console::bold("Examples:") << "\n"
@@ -53,6 +55,8 @@ int run_gard(int argc, char* argv[]) {
     size_t max_breakpoints = 10000;
     int num_threads = 0;
     bool quiet = false;
+    bool dynamic_chart = true;
+    bool force_tty = false;
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -70,6 +74,12 @@ int run_gard(int argc, char* argv[]) {
             output_format = argv[++i];
         } else if (arg == "--legacy-json") {
             output_format = "legacy";
+        } else if (arg == "--no-chart") {
+            dynamic_chart = false;
+        } else if (arg == "--chart") {
+            dynamic_chart = true;
+        } else if (arg == "--force-tty") {
+            force_tty = true;
         } else if (arg == "--quiet" || arg == "-q") {
             quiet = true;
         } else if (arg == "--help" || arg == "-h") {
@@ -112,6 +122,8 @@ int run_gard(int argc, char* argv[]) {
     settings.run_mode = run_mode;
     settings.max_breakpoints = max_breakpoints;
     settings.quiet = quiet;
+    settings.dynamic_chart = dynamic_chart;
+    settings.force_tty = force_tty;
     settings.legacy_json = (output_format == "legacy");
 
     try {
@@ -134,23 +146,45 @@ int run_gard(int argc, char* argv[]) {
         out.close();
 
         if (!quiet) {
-            std::cout << "\n" << Console::bold("=== GARD Results Summary ===") << "\n";
-            std::cout << "  Alignment: " << result.num_taxa << " taxa, " << result.num_sites << " sites\n";
-            std::cout << "  Baseline c-AIC: " << std::fixed << std::setprecision(4) << result.baseline_aicc << "\n";
-            std::cout << "  Best model c-AIC: " << result.best_model.aicc << " ("
-                      << result.best_model.breakpoints.size() << " breakpoints)\n";
-            if (!result.best_model.breakpoints.empty()) {
-                std::cout << "  Breakpoints (1-based): ";
+            std::string bp_list;
+            if (result.best_model.breakpoints.empty()) {
+                bp_list = "None (0 breakpoints)";
+            } else {
                 for (size_t b = 0; b < result.best_model.breakpoints.size(); ++b) {
-                    if (b > 0) std::cout << ", ";
-                    std::cout << (result.best_model.breakpoints[b] + 1);
+                    if (b > 0) bp_list += ", ";
+                    bp_list += std::to_string(result.best_model.breakpoints[b] + 1);
                 }
-                std::cout << "\n";
             }
-            std::cout << "  Single-tree constrained c-AIC: " << result.single_tree_aicc << "\n";
-            std::cout << "  Topological incongruence (recombination): "
-                      << (result.topological_incongruence ? Console::success("EVIDENCE FOUND") : Console::muted("None detected")) << "\n";
-            std::cout << "  Results written to: " << Console::brand(output_file) << "\n\n";
+
+            std::ostringstream base_ss, best_ss, delta_ss, single_ss;
+            base_ss << std::fixed << std::setprecision(2) << result.baseline_aicc;
+            best_ss << std::fixed << std::setprecision(2) << result.best_model.aicc;
+            Scalar delta_aicc = result.baseline_aicc - result.best_model.aicc;
+            delta_ss << std::fixed << std::setprecision(2) << delta_aicc;
+            single_ss << std::fixed << std::setprecision(2) << result.single_tree_aicc;
+
+            std::string status_conclusion = result.topological_incongruence
+                ? Console::success("✔ Recombination detected: Significant topological incongruence across segments.")
+                : Console::muted("ℹ No significant topological incongruence detected across segments.");
+
+            std::vector<std::pair<std::string, std::string>> summary_items = {
+                {"Alignment", alignment_file + " (" + std::to_string(result.num_taxa) + " taxa, " + std::to_string(result.num_sites) + " sites)"},
+                {"Baseline c-AIC (0 BPs)", base_ss.str()},
+                {"Best Model c-AIC", best_ss.str() + " (" + std::to_string(result.best_model.breakpoints.size()) + " breakpoints)"},
+                {"Delta c-AIC Improvement", delta_ss.str()},
+                {"Breakpoints (1-based)", bp_list},
+                {"Single-Tree Constrained c-AIC", single_ss.str()},
+                {"Topological Incongruence", result.topological_incongruence ? Console::success("SUPPORTED") : Console::muted("NOT SUPPORTED")},
+                {"Total Models Evaluated", std::to_string(result.total_models_evaluated) + " in " + std::to_string(static_cast<int>(result.time_elapsed + 0.5)) + "s"},
+                {"Output Results File", Console::brand(output_file)}
+            };
+
+            Panel::print_summary_card(
+                "GARD Analysis Results",
+                summary_items,
+                status_conclusion,
+                result.topological_incongruence
+            );
         }
 
     } catch (const std::exception& e) {

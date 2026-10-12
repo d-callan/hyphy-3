@@ -9,6 +9,7 @@
 #include "hyphy/core/progress_bar.hpp"
 #include "hyphy/core/console.hpp"
 #include "hyphy/opt/optimizer.hpp"
+#include "hyphy/analyses/gard_visualizer.hpp"
 #include <nlohmann/json.hpp>
 
 #include <vector>
@@ -43,6 +44,8 @@ struct GARDSettings {
     size_t max_stagnant_generations = 100;
     Scalar caic_improvement_threshold = 0.01;
     bool quiet = false;
+    bool dynamic_chart = true;
+    bool force_tty = false;
     bool legacy_json = false;
 };
 
@@ -499,31 +502,30 @@ public:
             }
         }
 
+        GARDVisualizer visualizer(result.num_sites, result.num_taxa, settings.quiet, settings.force_tty, settings.dynamic_chart);
+
         GARDModel best_single_bp_model;
         best_single_bp_model.aicc = std::numeric_limits<Scalar>::infinity();
-        std::mutex best_single_mutex;
 
-        core::ProgressBar progress(candidate_single_bps.size(), "GARD Single-BP");
+        visualizer.start_single_bp(candidate_single_bps.size(), result.baseline_aicc);
 
         #pragma omp parallel for schedule(dynamic)
         for (size_t i = 0; i < candidate_single_bps.size(); ++i) {
             size_t bp = candidate_single_bps[i];
             GARDModel m = evaluate_candidate_model({bp});
 
+            visualizer.record_candidate({bp}, m.aicc);
             #pragma omp critical
             {
                 if (m.aicc < best_single_bp_model.aicc) {
                     best_single_bp_model = m;
-                }
-                if (!settings.quiet) {
-                    progress.update(1);
+                    visualizer.update_best({bp}, m.aicc);
                 }
             }
+            visualizer.tick(1);
         }
 
-        if (!settings.quiet) {
-            progress.finish();
-        }
+        visualizer.finish_single_bp(best_single_bp_model.breakpoints, best_single_bp_model.aicc, result.baseline_aicc);
 
         bool single_bp_improves = (best_single_bp_model.aicc < result.baseline_aicc);
         if (single_bp_improves) {
@@ -531,17 +533,6 @@ public:
             result.improvements.push_back({1, delta});
             best_overall_model = best_single_bp_model;
             result.best_model = best_overall_model;
-
-            if (!settings.quiet) {
-                std::cout << "[GARD] Best single breakpoint at site " << (best_overall_model.breakpoints[0] + 1)
-                          << ": c-AIC = " << std::fixed << std::setprecision(4) << best_overall_model.aicc
-                          << " (delta-AICc = " << delta << ")\n";
-            }
-        } else {
-            if (!settings.quiet) {
-                std::cout << "[GARD] No single breakpoint improved over baseline (best single c-AIC = "
-                          << best_single_bp_model.aicc << " vs baseline " << result.baseline_aicc << ").\n";
-            }
         }
 
         // 4. Multi-Breakpoint CHC Genetic Algorithm (B >= 2)
@@ -554,9 +545,7 @@ public:
                (current_B + 2) * result.min_partition_size <= result.num_sites) {
             current_B += 1;
 
-            if (!settings.quiet) {
-                std::cout << "[GARD] Evaluating " << current_B << " breakpoints using CHC Genetic Algorithm...\n";
-            }
+            visualizer.start_ga(current_B, settings.population_size, best_overall_model.aicc, best_overall_model.breakpoints);
 
             // Initialize population of models
             std::vector<std::vector<size_t>> population;
@@ -659,6 +648,8 @@ public:
                 for (size_t idx = 0; idx < pool.size(); ++idx) {
                     GARDModel m = evaluate_candidate_model(pool[idx]);
                     evaluated_pool[idx] = {pool[idx], m.aicc};
+                    visualizer.record_candidate(pool[idx], m.aicc);
+                    visualizer.tick(1);
                 }
 
                 // Elitist selection: top population_size models
@@ -764,27 +755,28 @@ public:
                     generations_stagnant = 0;
                 }
                 previous_best_caic = current_best_caic;
+
+                visualizer.update_ga_generation(
+                    generation,
+                    settings.max_stagnant_generations,
+                    generations_stagnant,
+                    norm_range,
+                    current_best_model_for_B.breakpoints,
+                    current_best_model_for_B.aicc
+                );
             } // end GA loop for current_B
 
             // Evaluate if this B improved over best overall
-            if (current_best_model_for_B.aicc < best_overall_model.aicc) {
+            bool improved = (current_best_model_for_B.aicc < best_overall_model.aicc);
+            visualizer.finish_ga(current_B, current_best_model_for_B.breakpoints, current_best_model_for_B.aicc, best_overall_model.aicc, improved);
+
+            if (improved) {
                 Scalar delta = best_overall_model.aicc - current_best_model_for_B.aicc;
                 result.improvements.push_back({current_B, delta});
                 best_overall_model = current_best_model_for_B;
                 result.best_model = best_overall_model;
-
-                if (!settings.quiet) {
-                    std::cout << "[GARD] " << current_B << " breakpoints improved c-AIC to "
-                              << std::fixed << std::setprecision(4) << best_overall_model.aicc
-                              << " (delta-AICc = " << delta << ")\n";
-                }
             } else {
                 adding_improves = false;
-                if (!settings.quiet) {
-                    std::cout << "[GARD] " << current_B << " breakpoints did not improve c-AIC ("
-                              << current_best_model_for_B.aicc << " vs best " << best_overall_model.aicc
-                              << "). Concluding search.\n";
-                }
             }
         } // end multi-breakpoint loop
 

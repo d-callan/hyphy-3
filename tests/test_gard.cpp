@@ -146,3 +146,56 @@ TEST_CASE("GARD: Positive Control on adh.nex (Breakpoint at Site 460)") {
     CHECK(result.best_model.partitions[0].end_site == primary_bp + 1);
     CHECK(result.best_model.partitions[1].start_site == primary_bp + 2);
 }
+
+TEST_CASE("GARD: Dynamic Breakpoint Chart and Visualizer") {
+    // 1. Test single-breakpoint dashboard generation
+    GARDVisualizer viz(762, 23, false, true, true);
+    viz.chart_width = 65;
+    viz.start_single_bp(315, 10378.22);
+
+    viz.record_candidate({459}, 10353.93);
+    viz.update_best({459}, 10353.93);
+    viz.tick(50);
+
+    auto lines = viz.format_dashboard_lines();
+    CHECK(lines.size() == 5);
+
+    // Line 0: Status
+    CHECK(lines[0].find("Status:") != std::string::npos);
+    CHECK(lines[0].find("10353.93") != std::string::npos);
+    CHECK(lines[0].find("460") != std::string::npos);
+
+    // Line 1: Ruler
+    CHECK(lines[1].find("Ruler:") != std::string::npos);
+    CHECK(lines[1].find("1") != std::string::npos);
+    CHECK(lines[1].find("460") != std::string::npos);
+    CHECK(lines[1].find("762 bp") != std::string::npos);
+
+    // Line 2: Track
+    CHECK(lines[2].find("Track:") != std::string::npos);
+    CHECK(lines[2].find("├") != std::string::npos);
+    CHECK(lines[2].find("┤") != std::string::npos);
+    CHECK(lines[2].find("▲") != std::string::npos);
+
+    // Line 3: Density
+    CHECK(lines[3].find("Density:") != std::string::npos);
+
+    // Line 4: Partitions
+    CHECK(lines[4].find("Parts:") != std::string::npos);
+    CHECK(lines[4].find("[1..460] (460bp)") != std::string::npos);
+    CHECK(lines[4].find("[461..762] (302bp)") != std::string::npos);
+
+    // 2. Test multi-breakpoint dashboard generation
+    viz.start_ga(2, 50, 10353.93, {459});
+    viz.record_candidate({239, 519}, 10340.12);
+    viz.update_best({239, 519}, 10340.12);
+    viz.tick(100);
+
+    auto ga_lines = viz.format_dashboard_lines();
+    CHECK(ga_lines.size() == 5);
+    CHECK(ga_lines[1].find("240") != std::string::npos);
+    CHECK(ga_lines[1].find("520") != std::string::npos);
+    CHECK(ga_lines[4].find("[1..240] (240bp)") != std::string::npos);
+    CHECK(ga_lines[4].find("[241..520] (280bp)") != std::string::npos);
+    CHECK(ga_lines[4].find("[521..762] (242bp)") != std::string::npos);
+}

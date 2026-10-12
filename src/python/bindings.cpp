@@ -610,6 +610,8 @@ NB_MODULE(_hyphy3, m) {
         .def_rw("max_stagnant_generations", &GARDSettings::max_stagnant_generations)
         .def_rw("caic_improvement_threshold", &GARDSettings::caic_improvement_threshold)
         .def_rw("quiet", &GARDSettings::quiet)
+        .def_rw("dynamic_chart", &GARDSettings::dynamic_chart)
+        .def_rw("force_tty", &GARDSettings::force_tty)
         .def_rw("legacy_json", &GARDSettings::legacy_json);
 
     nb::class_<GARDPartition>(m, "GARDPartition")
