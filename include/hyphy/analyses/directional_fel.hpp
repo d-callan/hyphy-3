@@ -624,6 +624,14 @@ public:
     ) {
         AutoRootResult result;
         result.strategy = settings.root_strategy;
+        if (settings.root_strategy == "keep") {
+            result.best_tree = input_tree;
+            result.chosen_candidate_idx = 0;
+            result.chosen_branch_name = "User Input Root (Preserved)";
+            result.chosen_log_l = 0.0;
+            result.chosen_weight = 1.0;
+            return result;
+        }
         size_t M = input_tree.num_nodes();
 
         // Build adjacency to list unique undirected edges
@@ -897,11 +905,19 @@ public:
             }
         }
 
-        // Compute branch delta_gc
+        // Alignment background GC at CP3
+        Scalar bg_gc = 0.5;
+        if (!comp_test.taxa.empty()) {
+            Scalar sum = 0.0;
+            for (const auto& tc : comp_test.taxa) sum += tc.gc_cp3;
+            bg_gc = sum / comp_test.taxa.size();
+        }
+
+        // Compute branch delta_gc relative to alignment background
         std::vector<Scalar> branch_deltas;
         for (const auto& node : tree.nodes) {
             if (node.id != tree.root_id) {
-                Scalar d = node_gc[node.id] - node_gc[node.parent_id];
+                Scalar d = node_gc[node.id] - bg_gc;
                 branch_deltas.push_back(d);
             }
         }
@@ -915,7 +931,7 @@ public:
             sd_delta = std::sqrt(sum_sq / branch_deltas.size());
         }
 
-        Scalar tau = std::max(0.015, 0.5 * sd_delta);
+        Scalar tau = std::max(0.02, 0.4 * sd_delta);
 
         // Assign regimes
         branch_regime_ids.assign(num_nodes, 1); // Default Neutral
@@ -925,7 +941,7 @@ public:
         if (K == 3) {
             for (const auto& node : tree.nodes) {
                 if (node.id != tree.root_id) {
-                    Scalar d = node_gc[node.id] - node_gc[node.parent_id];
+                    Scalar d = node_gc[node.id] - bg_gc;
                     int r_id = 1;
                     if (d > tau) r_id = 2; // GC-drift
                     else if (d < -tau) r_id = 0; // AT-drift
@@ -946,8 +962,8 @@ public:
 
         // Build regimes
         regimes.clear();
-        Scalar bg_gc = 0.5;
         if (regime_counts[1] > 0) bg_gc = regime_gc_sum[1] / regime_counts[1];
+
 
         auto make_regime = [&](int id, const std::string& name, Scalar psi_val, size_t count, Scalar avg_gc) {
             DirectionalRegime reg;
