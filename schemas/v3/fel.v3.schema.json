@@ -130,6 +130,13 @@
         },
         "partitions": {
           "type": "array"
+        },
+        "sequences": {
+          "type": "object",
+          "description": "Mapping from taxon name to aligned nucleotide sequence string",
+          "additionalProperties": {
+            "type": "string"
+          }
         }
       }
     },
@@ -149,6 +156,9 @@
               "model_tags": {
                 "type": "array",
                 "items": { "type": "string" }
+              },
+              "tested": {
+                "type": "boolean"
               }
             }
           }
@@ -202,7 +212,10 @@
             "total_sites": { "type": "integer" },
             "diversifying_count": { "type": "integer" },
             "purifying_count": { "type": "integer" },
-            "neutral_count": { "type": "integer" }
+            "neutral_count": { "type": "integer" },
+            "tested_branches_count": { "type": "integer" },
+            "background_branches_count": { "type": "integer" },
+            "total_tested_tree_length": { "type": "number" }
           }
         }
       }
@@ -234,10 +247,27 @@
             "lrt": { "type": "array", "items": { "type": "number" } },
             "p_value": { "type": "array", "items": { "type": "number" } },
             "total_branch_length": { "type": "array", "items": { "type": "number" } },
-            "classification": { "type": "array", "items": { "type": "string" } }
+            "beta_background": { "type": "array", "items": { "type": "number" } },
+            "classification": { "type": "array", "items": { "type": "string" } },
+            "synonymous_substitutions": { "type": "array", "items": { "type": "integer" } },
+            "nonsynonymous_substitutions": { "type": "array", "items": { "type": "integer" } },
+            "synonymous_substitutions_background": { "type": "array", "items": { "type": "integer" } },
+            "nonsynonymous_substitutions_background": { "type": "array", "items": { "type": "integer" } },
+            "substitutions_1nt": { "type": "array", "items": { "type": "integer" } },
+            "substitutions_2nt": { "type": "array", "items": { "type": "integer" } },
+            "substitutions_3nt": { "type": "array", "items": { "type": "integer" } },
+            "mean_substitution_surprise": { "type": "array", "items": { "type": "number" } },
+            "mean_substitution_branch_length": { "type": "array", "items": { "type": "number" } },
+            "substitution_history": { "type": "array", "items": { "type": "string" } }
           }
         }
       }
+    },
+    "substitutions": {
+      "type": "object"
+    },
+    "substitution_events": {
+      "type": "array"
     }
   }
 }

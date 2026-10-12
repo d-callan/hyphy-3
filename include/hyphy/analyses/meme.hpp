@@ -43,6 +43,7 @@ struct MEMESiteResult {
     Scalar fel_alpha = 0.0;
     Scalar fel_beta = 0.0;
     std::vector<Scalar> branch_ebf;
+    SiteSubstitutions subs;
 };
 
 class MEMEAnalyzer {
@@ -358,6 +359,11 @@ public:
         }
 
         res.total_branch_length = 0.0;
+
+        // Ancestral state reconstruction and substitution history
+        res.subs = fel_analyzer.reconstruct_ancestral_pattern(p_idx, leaf_to_taxon);
+        FELAnalyzer::format_substitution_strings(res.subs, false);
+
         return res;
     }
 
@@ -606,6 +612,12 @@ public:
         j["dataset"]["unique_patterns"] = aln.patterns.size();
         j["dataset"]["taxa"] = aln.taxon_names;
 
+        nlohmann::json seqs_json = nlohmann::json::object();
+        for (const auto& s : aln.sequences) {
+            seqs_json[s.name] = s.raw_seq;
+        }
+        j["dataset"]["sequences"] = seqs_json;
+
         nlohmann::json gcode;
         gcode["id"] = aln.code ? aln.code->name : "Universal";
         gcode["name"] = aln.code ? aln.code->name : "Universal";
@@ -725,13 +737,22 @@ public:
             {"total_branch_length", {{"type", "float"}, {"unit", "substitutions/site"}, {"description", "Total length of branches contributing to inference at this site"}}},
             {"log_l_meme", {{"type", "float"}, {"description", "Site log-likelihood under MEME model"}}},
             {"log_l_fel", {{"type", "float"}, {"description", "Site log-likelihood under FEL model"}}},
-            {"classification", {{"type", "string"}, {"description", "Selection classification at threshold (diversifying, neutral)"}}}
+            {"classification", {{"type", "string"}, {"description", "Selection classification at threshold (diversifying, neutral)"}}},
+            {"substitution_history", {{"type", "string"}, {"description", "Formatted string of observed substitution events at this site"}}},
+            {"mean_substitution_surprise", {{"type", "float"}, {"unit", "bits"}, {"description", "Mean Shannon perplexity surprise across substitution events at this site"}}},
+            {"site_perplexity", {{"type", "float"}, {"description", "Empirical site perplexity metric"}}},
+            {"synonymous_substitutions", {{"type", "integer"}, {"description", "Count of synonymous substitutions at this site"}}},
+            {"nonsynonymous_substitutions", {{"type", "integer"}, {"description", "Count of non-synonymous substitutions at this site"}}},
+            {"branch_ebf", {{"type", "object"}, {"description", "Map of branch names to Empirical Bayes Factors (EBF >= 1.0) under positive selection"}}}
         };
 
         std::vector<int> col_site, col_branches;
         std::vector<double> col_alpha, col_beta1, col_p1, col_beta_plus, col_p_plus;
         std::vector<double> col_lrt, col_pval, col_tbl, col_ll_meme, col_ll_fel;
-        std::vector<std::string> col_class;
+        std::vector<std::string> col_class, col_history;
+        std::vector<double> col_surprise, col_perplexity;
+        std::vector<int> col_syn, col_nonsyn;
+        nlohmann::json col_branch_ebf = nlohmann::json::array();
 
         col_site.reserve(site_results.size());
         col_alpha.reserve(site_results.size());
@@ -746,6 +767,11 @@ public:
         col_ll_meme.reserve(site_results.size());
         col_ll_fel.reserve(site_results.size());
         col_class.reserve(site_results.size());
+        col_history.reserve(site_results.size());
+        col_surprise.reserve(site_results.size());
+        col_perplexity.reserve(site_results.size());
+        col_syn.reserve(site_results.size());
+        col_nonsyn.reserve(site_results.size());
 
         for (size_t i = 0; i < site_results.size(); ++i) {
             const auto& r = site_results[i];
@@ -762,6 +788,23 @@ public:
             col_ll_meme.push_back(r.log_l_meme);
             col_ll_fel.push_back(r.log_l_fel);
             col_class.push_back((r.p_value <= p_value_threshold) ? "diversifying" : "neutral");
+
+            col_history.push_back(r.subs.summary_string);
+            col_surprise.push_back(r.subs.mean_surprise_bits);
+            col_perplexity.push_back(r.subs.site_perplexity);
+            col_syn.push_back(static_cast<int>(r.subs.syn_test + r.subs.syn_bg));
+            col_nonsyn.push_back(static_cast<int>(r.subs.nonsyn_test + r.subs.nonsyn_bg));
+
+            nlohmann::json site_ebf = nlohmann::json::object();
+            for (const auto& node : tree.nodes) {
+                if (node.id != tree.root_id && node.id >= 0 && static_cast<size_t>(node.id) < r.branch_ebf.size()) {
+                    Scalar ebf = r.branch_ebf[node.id];
+                    if (ebf >= 1.0) {
+                        site_ebf[node.name] = ebf;
+                    }
+                }
+            }
+            col_branch_ebf.push_back(site_ebf);
         }
 
         j["site_results"]["data"]["site"] = col_site;
@@ -777,6 +820,44 @@ public:
         j["site_results"]["data"]["log_l_meme"] = col_ll_meme;
         j["site_results"]["data"]["log_l_fel"] = col_ll_fel;
         j["site_results"]["data"]["classification"] = col_class;
+        j["site_results"]["data"]["substitution_history"] = col_history;
+        j["site_results"]["data"]["mean_substitution_surprise"] = col_surprise;
+        j["site_results"]["data"]["site_perplexity"] = col_perplexity;
+        j["site_results"]["data"]["synonymous_substitutions"] = col_syn;
+        j["site_results"]["data"]["nonsynonymous_substitutions"] = col_nonsyn;
+        j["site_results"]["data"]["branch_ebf"] = col_branch_ebf;
+
+        // Substitution events block (Root level)
+        nlohmann::json sub_events_arr = nlohmann::json::array();
+        for (size_t i = 0; i < site_results.size(); ++i) {
+            const auto& r = site_results[i];
+            if (r.subs.events.empty()) continue;
+
+            nlohmann::json site_entry;
+            site_entry["site"] = static_cast<int>(i + 1);
+            site_entry["root_codon"] = r.subs.root_codon;
+            site_entry["root_aa"] = std::string(1, r.subs.root_aa);
+
+            nlohmann::json ev_list = nlohmann::json::array();
+            for (const auto& ev : r.subs.events) {
+                nlohmann::json ev_j;
+                ev_j["branch"] = ev.branch_name;
+                ev_j["parent_codon"] = ev.parent_codon;
+                ev_j["child_codon"] = ev.child_codon;
+                ev_j["parent_aa"] = std::string(1, ev.parent_aa);
+                ev_j["child_aa"] = std::string(1, ev.child_aa);
+                ev_j["is_synonymous"] = ev.is_synonymous;
+                ev_j["nucleotide_differences"] = ev.nt_distance;
+                ev_j["transition_probability"] = ev.transition_prob;
+                ev_j["surprise_bits"] = ev.surprise_bits;
+                ev_j["branch_length"] = ev.branch_length;
+                ev_j["is_tested"] = ev.is_tested;
+                ev_list.push_back(ev_j);
+            }
+            site_entry["events"] = ev_list;
+            sub_events_arr.push_back(site_entry);
+        }
+        j["substitution_events"] = sub_events_arr;
 
         return j;
     }

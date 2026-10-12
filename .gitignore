@@ -38,6 +38,13 @@ Testing/
 !benchmarks/ground_truth/*.json
 !tests/data/*.json
 !schemas/**/*.json
+!viz/**/package.json
+*.cache
+*.log
+*.FEL.json
+*.FUBAR.json
+*.MEME.json
+*.BUSTED.json
 scratch/
 *.trace/
 *.trace
@@ -48,3 +55,14 @@ scratch/
 .idea/
 *.swp
 *.swo
+
+# Web and Node build
+node_modules/
+dist/
+dist-demo/
+package-lock.json
+
+# Swift Package Manager & macOS app build
+.build/
+mac/**/.build/
+mac/**/build/

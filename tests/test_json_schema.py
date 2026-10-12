@@ -244,9 +244,109 @@ def test_relax_modern_and_legacy_json_schema():
 
     print("RELAX Modern & Legacy JSON Schema tests passed successfully!")
 
+def test_fel_branch_subset_json_schema():
+    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    aln_path = os.path.join(repo_root, "..", "hyphy", "hyphy-next", "benchmarks", "data", "cd2.fna")
+    tree_path = os.path.join(repo_root, "..", "hyphy", "hyphy-next", "benchmarks", "data", "cd2_fitted.nwk")
+    schema_path = os.path.join(repo_root, "schemas", "v3", "fel.v3.schema.json")
+
+    assert os.path.exists(aln_path), f"Missing alignment: {aln_path}"
+    assert os.path.exists(tree_path), f"Missing tree: {tree_path}"
+    assert os.path.exists(schema_path), f"Missing schema: {schema_path}"
+
+    with open(schema_path) as sf:
+        schema = json.load(sf)
+
+    aln = hp.Alignment.from_fasta(aln_path)
+    tree = hp.Tree.from_newick_file(tree_path)
+
+    settings = hp.FELSettings()
+    settings.test_branches = "Leaves"
+
+    fel = hp.FELAnalyzer(tree, aln, hp.MG94Parameters(), settings)
+    assert fel.num_tested == 10
+    assert fel.num_background == 6
+    fel.run(False, False)
+
+    # 1. Test Modern JSON
+    modern = json.loads(fel.to_modern_json())
+    jsonschema.validate(instance=modern, schema=schema)
+    assert modern["analysis"]["settings"]["test_branches"] == "Leaves"
+    assert "beta_background" in modern["site_results"]["data"]
+    assert modern["statistical_tests"]["site_level_summary"]["tested_branches_count"] == 10
+    assert modern["statistical_tests"]["site_level_summary"]["background_branches_count"] == 6
+
+    # 2. Test Legacy JSON
+    legacy = json.loads(fel.to_legacy_json())
+    assert "tested" in legacy
+    assert "0" in legacy["tested"]
+    assert len(legacy["tested"]["0"]) == 16
+    assert "non-synonymous/synonymous rate ratio for *background*" in legacy["fits"]["Global MG94xREV"]["Rate Distributions"]
+
+    print("FEL Branch Subset Modern & Legacy JSON Schema tests passed successfully!")
+
+def test_fubar_modern_and_legacy_json_schema():
+    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    aln_path = os.path.join(repo_root, "..", "hyphy", "hyphy-next", "benchmarks", "data", "cd2.fna")
+    if not os.path.exists(aln_path):
+        aln_path = os.path.join(repo_root, "benchmarks", "data", "cd2.fna")
+    tree_path = os.path.join(repo_root, "..", "hyphy", "hyphy-next", "benchmarks", "data", "cd2.nwk")
+    if not os.path.exists(tree_path):
+        tree_path = os.path.join(repo_root, "benchmarks", "data", "cd2.nwk")
+    schema_path = os.path.join(repo_root, "schemas", "v3", "fubar.v3.schema.json")
+
+    assert os.path.exists(aln_path), f"Missing alignment: {aln_path}"
+    assert os.path.exists(tree_path), f"Missing tree: {tree_path}"
+    assert os.path.exists(schema_path), f"Missing schema: {schema_path}"
+
+    with open(schema_path) as sf:
+        schema = json.load(sf)
+
+    aln = hp.Alignment.from_fasta(aln_path)
+    tree = hp.Tree.from_newick_file(tree_path)
+
+    settings = hp.FUBARSettings()
+    settings.grid_points = 20
+    settings.method = hp.FUBARMethod.VariationalBayes
+    settings.concentration = 0.5
+    settings.posterior_threshold = 0.90
+
+    fubar = hp.FUBARAnalyzer.create_and_fit(tree, aln, settings)
+    result = fubar.run(False)
+
+    # 1. Test Modern JSON
+    modern_json_str = fubar.to_modern_json(result)
+    modern = json.loads(modern_json_str)
+
+    jsonschema.validate(instance=modern, schema=schema)
+    assert modern["$schema"] == "https://raw.githubusercontent.com/veg/hyphy-3/main/schemas/v3/fubar.v3.schema.json"
+    assert modern["schema_version"] == "3.0.0"
+    assert modern["analysis"]["id"] == "fubar"
+    assert modern["dataset"]["codon_sites"] == 187
+    assert len(modern["site_results"]["data"]["site"]) == 187
+    assert modern["summary"]["positive_sites_count"] == 13
+
+    # 2. Test Legacy JSON
+    legacy_json_str = fubar.to_legacy_json(result)
+    legacy = json.loads(legacy_json_str)
+
+    assert "MLE" in legacy
+    assert "headers" in legacy["MLE"]
+    assert "content" in legacy["MLE"]
+    assert "0" in legacy["MLE"]["content"]
+    assert len(legacy["MLE"]["content"]["0"]) == 187
+    assert "grid" in legacy
+    assert len(legacy["grid"]) == 400
+    assert "posterior" in legacy
+
+    print("FUBAR Modern & Legacy JSON Schema tests passed successfully!")
+
 if __name__ == "__main__":
     test_fel_modern_and_legacy_json_schema()
+    test_fel_branch_subset_json_schema()
     test_meme_modern_and_legacy_json_schema()
     test_busted_modern_and_legacy_json_schema()
     test_absrel_modern_and_legacy_json_schema()
     test_relax_modern_and_legacy_json_schema()
+    test_fubar_modern_and_legacy_json_schema()
+

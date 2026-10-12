@@ -18,6 +18,7 @@
 #include "hyphy/analyses/busted.hpp"
 #include "hyphy/analyses/absrel.hpp"
 #include "hyphy/analyses/relax.hpp"
+#include "hyphy/analyses/fubar.hpp"
 
 namespace nb = nanobind;
 using namespace nb::literals;
@@ -101,22 +102,70 @@ NB_MODULE(_hyphy3, m) {
         .def_rw("delta", &MG94Parameters::delta)
         .def_rw("psi", &MG94Parameters::psi);
 
-    // FEL Results & Analyzer
+    // FEL Settings, Results & Analyzer
+    nb::class_<FELSettings>(m, "FELSettings")
+        .def(nb::init<>())
+        .def_rw("p_value_threshold", &FELSettings::p_value_threshold)
+        .def_rw("full_model", &FELSettings::full_model)
+        .def_rw("srv", &FELSettings::srv)
+        .def_rw("test_branches", &FELSettings::test_branches)
+        .def_rw("test_branch_regex", &FELSettings::test_branch_regex)
+        .def_rw("test_branch_names", &FELSettings::test_branch_names);
+
+    nb::class_<SubstitutionEvent>(m, "SubstitutionEvent")
+        .def_ro("node_id", &SubstitutionEvent::node_id)
+        .def_ro("branch_name", &SubstitutionEvent::branch_name)
+        .def_ro("is_tested", &SubstitutionEvent::is_tested)
+        .def_ro("branch_length", &SubstitutionEvent::branch_length)
+        .def_ro("parent_codon", &SubstitutionEvent::parent_codon)
+        .def_ro("child_codon", &SubstitutionEvent::child_codon)
+        .def_prop_ro("parent_aa", [](const SubstitutionEvent& ev) { return std::string(1, ev.parent_aa); })
+        .def_prop_ro("child_aa", [](const SubstitutionEvent& ev) { return std::string(1, ev.child_aa); })
+        .def_ro("nt_distance", &SubstitutionEvent::nt_distance)
+        .def_ro("is_synonymous", &SubstitutionEvent::is_synonymous)
+        .def_ro("transition_prob", &SubstitutionEvent::transition_prob)
+        .def_ro("surprise_bits", &SubstitutionEvent::surprise_bits);
+
+    nb::class_<SiteSubstitutions>(m, "SiteSubstitutions")
+        .def_ro("site_index", &SiteSubstitutions::site_index)
+        .def_ro("root_codon", &SiteSubstitutions::root_codon)
+        .def_prop_ro("root_aa", [](const SiteSubstitutions& s) { return std::string(1, s.root_aa); })
+        .def_ro("events", &SiteSubstitutions::events)
+        .def_ro("syn_test", &SiteSubstitutions::syn_test)
+        .def_ro("nonsyn_test", &SiteSubstitutions::nonsyn_test)
+        .def_ro("syn_bg", &SiteSubstitutions::syn_bg)
+        .def_ro("nonsyn_bg", &SiteSubstitutions::nonsyn_bg)
+        .def_ro("subs_1nt", &SiteSubstitutions::subs_1nt)
+        .def_ro("subs_2nt", &SiteSubstitutions::subs_2nt)
+        .def_ro("subs_3nt", &SiteSubstitutions::subs_3nt)
+        .def_ro("mean_surprise_bits", &SiteSubstitutions::mean_surprise_bits)
+        .def_ro("total_surprise_bits", &SiteSubstitutions::total_surprise_bits)
+        .def_ro("mean_branch_length", &SiteSubstitutions::mean_branch_length)
+        .def_ro("site_perplexity", &SiteSubstitutions::site_perplexity)
+        .def_ro("summary_string", &SiteSubstitutions::summary_string)
+        .def_ro("summary_string_partitioned", &SiteSubstitutions::summary_string_partitioned);
+
     nb::class_<SiteResult>(m, "FELSiteResult")
         .def_ro("site_index", &SiteResult::site_index)
         .def_ro("alpha", &SiteResult::alpha)
         .def_ro("beta", &SiteResult::beta)
+        .def_ro("beta_nuisance", &SiteResult::beta_nuisance)
+        .def_ro("beta_background", &SiteResult::beta_nuisance)
         .def_ro("alpha_null", &SiteResult::alpha_null)
         .def_ro("lrt", &SiteResult::lrt)
         .def_ro("p_value", &SiteResult::p_value)
         .def_ro("total_branch_length", &SiteResult::total_branch_length)
         .def_ro("log_l_alt", &SiteResult::log_l_alt)
-        .def_ro("log_l_null", &SiteResult::log_l_null);
+        .def_ro("log_l_null", &SiteResult::log_l_null)
+        .def_ro("subs", &SiteResult::subs);
 
     nb::class_<FELAnalyzer>(m, "FELAnalyzer")
-        .def("__init__", [](FELAnalyzer* self, Tree tree, Alignment aln, const MG94Parameters& params) {
-            new (self) FELAnalyzer(std::move(tree), std::move(aln), params);
-        }, "tree"_a, "alignment"_a, "params"_a = MG94Parameters{})
+        .def("__init__", [](FELAnalyzer* self, Tree tree, Alignment aln, const MG94Parameters& params, const FELSettings& settings) {
+            new (self) FELAnalyzer(std::move(tree), std::move(aln), params, settings);
+        }, "tree"_a, "alignment"_a, "params"_a = MG94Parameters{}, "settings"_a = FELSettings{})
+        .def_static("create_and_fit", [](Tree tree, Alignment aln, const FELSettings& settings) {
+            return FELAnalyzer::create_and_fit(std::move(tree), std::move(aln), settings);
+        }, "tree"_a, "alignment"_a, "settings"_a = FELSettings{})
         .def_static("create_and_fit", [](Tree tree, Alignment aln, Scalar pvalue_threshold, bool full_model) {
             return FELAnalyzer::create_and_fit(std::move(tree), std::move(aln), pvalue_threshold, nullptr, full_model);
         }, "tree"_a, "alignment"_a, "pvalue_threshold"_a = 0.1, "full_model"_a = true)
@@ -133,7 +182,13 @@ NB_MODULE(_hyphy3, m) {
         })
         .def_ro("global_log_l", &FELAnalyzer::global_log_l)
         .def_ro("global_aicc", &FELAnalyzer::global_aicc)
-        .def_ro("site_results", &FELAnalyzer::site_results);
+        .def_ro("site_results", &FELAnalyzer::site_results)
+        .def_ro("num_tested", &FELAnalyzer::num_tested)
+        .def_ro("num_background", &FELAnalyzer::num_background)
+        .def_ro("test_branch_names", &FELAnalyzer::test_branch_names)
+        .def_ro("bg_branch_names", &FELAnalyzer::bg_branch_names)
+        .def_ro("is_test_branch", &FELAnalyzer::is_test_branch)
+        .def_ro("settings", &FELAnalyzer::settings);
 
     // MEME Results & Analyzer
     nb::class_<MEMESiteResult>(m, "MEMESiteResult")
@@ -371,6 +426,60 @@ NB_MODULE(_hyphy3, m) {
         .def("run", [](RELAXAnalyzer& relax, bool show_progress, bool force_progress) {
             return relax.run(nullptr, show_progress, force_progress);
         }, "show_progress"_a = false, "force_progress"_a = false);
+
+    // FUBAR
+    nb::enum_<FUBARMethod>(m, "FUBARMethod")
+        .value("VariationalBayes", FUBARMethod::VariationalBayes)
+        .value("CollapsedGibbs", FUBARMethod::CollapsedGibbs)
+        .value("MetropolisHastings", FUBARMethod::MetropolisHastings);
+
+    nb::class_<FUBARSettings>(m, "FUBARSettings")
+        .def(nb::init<>())
+        .def_rw("grid_points", &FUBARSettings::grid_points)
+        .def_rw("method", &FUBARSettings::method)
+        .def_rw("concentration", &FUBARSettings::concentration)
+        .def_rw("posterior_threshold", &FUBARSettings::posterior_threshold)
+        .def_rw("non_zero", &FUBARSettings::non_zero)
+        .def_rw("tree_scaling", &FUBARSettings::tree_scaling)
+        .def_rw("mcmc_chains", &FUBARSettings::mcmc_chains)
+        .def_rw("mcmc_chain_length", &FUBARSettings::mcmc_chain_length)
+        .def_rw("mcmc_burn_in", &FUBARSettings::mcmc_burn_in)
+        .def_rw("mcmc_samples", &FUBARSettings::mcmc_samples);
+
+    nb::class_<FUBARSiteResult>(m, "FUBARSiteResult")
+        .def_ro("site", &FUBARSiteResult::site)
+        .def_ro("alpha", &FUBARSiteResult::alpha)
+        .def_ro("beta", &FUBARSiteResult::beta)
+        .def_ro("beta_minus_alpha", &FUBARSiteResult::beta_minus_alpha)
+        .def_ro("prob_neg", &FUBARSiteResult::prob_neg)
+        .def_ro("prob_pos", &FUBARSiteResult::prob_pos)
+        .def_ro("bayes_factor", &FUBARSiteResult::bayes_factor)
+        .def_ro("classification", &FUBARSiteResult::classification)
+        .def_ro("posterior_weights", &FUBARSiteResult::posterior_weights);
+
+    nb::class_<FUBARResult>(m, "FUBARResult")
+        .def_ro("site_results", &FUBARResult::site_results)
+        .def_ro("grid", &FUBARResult::grid)
+        .def_ro("posterior_grid_weights", &FUBARResult::posterior_grid_weights)
+        .def_ro("positive_sites", &FUBARResult::positive_sites)
+        .def_ro("purifying_sites", &FUBARResult::purifying_sites)
+        .def_ro("expected_false_positives", &FUBARResult::expected_false_positives)
+        .def_ro("false_positives_ci_95", &FUBARResult::false_positives_ci_95)
+        .def_ro("weight_non_positive", &FUBARResult::weight_non_positive)
+        .def_ro("time_total_sec", &FUBARResult::time_total_sec);
+
+    nb::class_<FUBARAnalyzer>(m, "FUBARAnalyzer")
+        .def(nb::init<Tree, Alignment, MG94Parameters, FUBARSettings>(),
+             "tree"_a, "alignment"_a, "params"_a = MG94Parameters{}, "settings"_a = FUBARSettings{})
+        .def_static("create_and_fit", [](Tree tree, Alignment aln, const FUBARSettings& settings) {
+            return FUBARAnalyzer::create_and_fit(std::move(tree), std::move(aln), settings, nullptr);
+        }, "tree"_a, "alignment"_a, "settings"_a = FUBARSettings{})
+        .def("run", [](FUBARAnalyzer& fubar, bool verbose) {
+            return fubar.run(nullptr, verbose);
+        }, "verbose"_a = false)
+        .def("to_modern_json", &FUBARAnalyzer::to_modern_json, "result"_a, "cli_cmd"_a = "hyphy3 fubar", "input_filepath"_a = "")
+        .def("to_legacy_json", &FUBARAnalyzer::to_legacy_json, "result"_a, "input_filepath"_a = "")
+        .def("to_json", &FUBARAnalyzer::to_json, "result"_a, "fmt"_a = "modern", "cli_cmd"_a = "hyphy3 fubar", "input_filepath"_a = "");
 
     // Differentiable Engine: Inside-Outside Likelihood and Analytical Adjoint Gradients!
     m.def("compute_branch_length_gradients", [](

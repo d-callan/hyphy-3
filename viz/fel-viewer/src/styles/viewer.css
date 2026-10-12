@@ -1,0 +1,561 @@
+/* Dieter Rams / Braun Style Sheet for HyPhy FEL Viewer */
+/* Philosophy: "Weniger, aber besser" — pure, honest, functional, restrained */
+
+:host, .hyphy-fel-container {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  height: 100%;
+  min-height: 520px;
+  background-color: #F2F2EF; /* Warm matte off-white chassis */
+  color: #1A1A18;             /* Rich charcoal ink */
+  font-family: -apple-system, BlinkMacSystemFont, "Helvetica Neue", Helvetica, Arial, sans-serif;
+  user-select: none;
+  overflow: hidden;
+  box-sizing: border-box;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* 1. Toolbar: Precision Switchboard */
+.hyphy-toolbar {
+  display: flex;
+  align-items: center;
+  padding: 8px 18px;
+  background-color: #FFFFFF;
+  border-bottom: 1px solid #D1D1CB;
+  gap: 14px;
+  flex-wrap: wrap;
+  z-index: 10;
+}
+
+.toolbar-group {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.toolbar-label {
+  font-size: 9px;
+  font-weight: 700;
+  color: #767672;
+  text-transform: uppercase;
+  letter-spacing: 1.2px;
+}
+
+.toolbar-select, .toolbar-input {
+  background-color: #FFFFFF;
+  border: 1px solid #D1D1CB;
+  color: #1A1A18;
+  border-radius: 3px;
+  padding: 4px 8px;
+  font-size: 11px;
+  font-weight: 500;
+  outline: none;
+  transition: border-color 0.15s;
+}
+
+.toolbar-select:focus, .toolbar-input:focus {
+  border-color: #1A1A18;
+}
+
+.toolbar-divider {
+  width: 1px;
+  height: 18px;
+  background-color: #D1D1CB;
+}
+
+.toolbar-spacer {
+  flex-grow: 1;
+}
+
+/* Recessed Segmented Rocker Switches */
+.segmented-control {
+  display: flex;
+  background-color: #EDEDE9;
+  border: 1px solid #D1D1CB;
+  border-radius: 3px;
+  padding: 2px;
+  gap: 1px;
+}
+
+.seg-btn {
+  background: none;
+  border: none;
+  color: #767672;
+  padding: 3px 10px;
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  border-radius: 2px;
+  cursor: pointer;
+  transition: all 0.12s ease;
+}
+
+.seg-btn:hover {
+  color: #1A1A18;
+}
+
+.seg-btn.active {
+  background-color: #FFFFFF;
+  color: #1A1A18;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.08);
+}
+
+.site-jump-box {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.toolbar-input {
+  width: 60px;
+  font-family: "SF Mono", Monaco, monospace;
+  text-align: center;
+}
+
+.btn-jump, .toolbar-btn {
+  background-color: #EDEDE9;
+  border: 1px solid #D1D1CB;
+  color: #1A1A18;
+  border-radius: 3px;
+  padding: 4px 10px;
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+
+.btn-jump:hover, .toolbar-btn:hover {
+  background-color: #1A1A18;
+  color: #FFFFFF;
+  border-color: #1A1A18;
+}
+
+/* 2. Main Stage (Split View) */
+.hyphy-main-stage {
+  display: flex;
+  flex: 1 1 0%;
+  min-height: 0;
+  position: relative;
+  overflow: hidden;
+  background-color: #FFFFFF;
+}
+
+/* Left Pane: Tree View */
+.hyphy-tree-pane {
+  flex: 0 0 310px;
+  min-width: 180px;
+  max-width: 600px;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  background-color: #FFFFFF;
+  border-right: 1px solid #D1D1CB;
+  position: relative;
+}
+
+.hyphy-tree-header {
+  height: 105px;
+  border-bottom: 1px solid #D1D1CB;
+  background-color: #F8F8F6;
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+  padding: 10px 14px;
+  box-sizing: border-box;
+}
+
+.tree-header-title {
+  font-size: 11px;
+  font-weight: 700;
+  color: #1A1A18;
+  text-transform: uppercase;
+  letter-spacing: 1.2px;
+}
+
+.tree-header-sub {
+  font-size: 10px;
+  color: #767672;
+  margin-top: 3px;
+  font-family: "SF Mono", Monaco, monospace;
+}
+
+.tree-canvas-container {
+  flex: 1;
+  overflow: hidden;
+  position: relative;
+  background-color: #FFFFFF;
+}
+
+/* Draggable Machined Splitter */
+.hyphy-splitter {
+  width: 5px;
+  cursor: col-resize;
+  background-color: #EDEDE9;
+  border-left: 1px solid #D1D1CB;
+  border-right: 1px solid #D1D1CB;
+  position: relative;
+  z-index: 20;
+  transition: background-color 0.15s;
+}
+
+.hyphy-splitter:hover, .hyphy-splitter.dragging {
+  background-color: #EB5E28; /* Iconic Braun Orange on focus */
+}
+
+/* Right Pane: Alignment & Tracks View */
+.hyphy-alignment-pane {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  height: 100%;
+  background-color: #FFFFFF;
+  position: relative;
+}
+
+.hyphy-tracks-container {
+  height: 105px;
+  flex-shrink: 0;
+  border-bottom: 1px solid #D1D1CB;
+  background-color: #F8F8F6;
+  overflow: hidden;
+  position: relative;
+}
+
+.hyphy-alignment-container {
+  flex: 1;
+  overflow: hidden;
+  position: relative;
+  background-color: #FFFFFF;
+}
+
+/* 3. Detail Inspector Panel (Apparatus Specification Sheet) */
+.hyphy-inspector {
+  flex: 0 0 auto;
+  max-height: 250px;
+  min-height: 120px;
+  background-color: #FFFFFF;
+  border-top: 1px solid #D1D1CB;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  z-index: 10;
+}
+
+.hyphy-inspector-empty {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  color: #767672;
+  font-size: 12px;
+  letter-spacing: 0.3px;
+  gap: 8px;
+}
+
+.hyphy-inspector-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 8px 18px;
+  border-bottom: 1px solid #E5E5E0;
+  background-color: #F8F8F6;
+}
+
+.inspector-title-group {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.inspector-site-tag {
+  font-size: 13px;
+  font-weight: 700;
+  color: #1A1A18;
+  letter-spacing: 0.8px;
+  text-transform: uppercase;
+}
+
+.inspector-consensus {
+  font-size: 11px;
+  color: #767672;
+  font-family: "SF Mono", Monaco, monospace;
+}
+
+.inspector-badge {
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.8px;
+  padding: 2px 7px;
+  border-radius: 2px;
+}
+
+.badge-diversifying {
+  background-color: rgba(235, 94, 40, 0.12);
+  color: #EB5E28;
+  border: 1px solid #EB5E28;
+}
+
+.badge-purifying {
+  background-color: rgba(30, 64, 175, 0.08);
+  color: #1E40AF;
+  border: 1px solid #1E40AF;
+}
+
+.badge-neutral {
+  background-color: #EDEDE9;
+  color: #767672;
+  border: 1px solid #D1D1CB;
+}
+
+.inspector-quick-stats {
+  display: flex;
+  gap: 14px;
+  font-size: 11px;
+  font-family: "SF Mono", Monaco, monospace;
+}
+
+.stat-pill {
+  color: #1A1A18;
+}
+
+.stat-label {
+  color: #767672;
+  font-size: 10px;
+  text-transform: uppercase;
+  margin-right: 4px;
+}
+
+.spark-code {
+  color: #1A1A18;
+}
+
+.hyphy-inspector-body {
+  padding: 8px 18px;
+  overflow-y: auto;
+  flex: 1;
+}
+
+.inspector-section-title {
+  display: flex;
+  justify-content: space-between;
+  font-size: 9px;
+  font-weight: 700;
+  color: #767672;
+  text-transform: uppercase;
+  letter-spacing: 1.2px;
+  margin-bottom: 6px;
+}
+
+.title-hint {
+  font-weight: 500;
+  text-transform: none;
+  font-size: 10px;
+  color: #9CA3AF;
+}
+
+/* Events Table: Architectural Ruled Sheet */
+.events-table-wrapper {
+  overflow-x: auto;
+}
+
+.events-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 11px;
+  font-family: "SF Mono", Monaco, monospace;
+}
+
+.events-table th {
+  text-align: left;
+  padding: 5px 8px;
+  border-bottom: 1px solid #D1D1CB;
+  color: #767672;
+  font-size: 9px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 1.0px;
+  font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+}
+
+.events-table td {
+  padding: 5px 8px;
+  border-bottom: 1px solid #EAEAE6;
+  color: #1A1A18;
+}
+
+.event-row {
+  cursor: pointer;
+  transition: background-color 0.1s;
+}
+
+.event-row:hover {
+  background-color: #F4F4F1;
+}
+
+.event-badge {
+  display: inline-block;
+  font-size: 9px;
+  font-weight: 600;
+  padding: 1px 5px;
+  border-radius: 2px;
+  text-transform: uppercase;
+}
+
+.badge-syn {
+  background-color: rgba(30, 64, 175, 0.08);
+  color: #1E40AF;
+  border: 1px solid rgba(30, 64, 175, 0.2);
+}
+
+.badge-nonsyn {
+  background-color: rgba(235, 94, 40, 0.10);
+  color: #EB5E28;
+  border: 1px solid rgba(235, 94, 40, 0.25);
+}
+
+.hit-badge {
+  font-size: 9px;
+  color: #B45309;
+  font-weight: 700;
+  margin-left: 4px;
+}
+
+.surprise-high {
+  color: #B45309;
+  font-weight: 700;
+}
+
+.tag-tested {
+  font-size: 9px;
+  color: #1E40AF;
+  font-weight: 600;
+}
+
+.tag-bg {
+  font-size: 9px;
+  color: #767672;
+}
+
+/* 4. Bird's Eye Overview: Whole-Gene Selection Landscape & Minimap */
+.hyphy-overview-panel {
+  display: flex;
+  flex-direction: column;
+  background-color: #FFFFFF;
+  border-bottom: 1px solid #D1D1CB;
+  flex-shrink: 0;
+  z-index: 15;
+  transition: all 0.15s ease;
+}
+
+.hyphy-overview-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 4px 18px;
+  background-color: #F8F8F6;
+  border-bottom: 1px solid #EAEAE6;
+  height: 28px;
+  box-sizing: border-box;
+}
+
+.overview-left-group {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.overview-title {
+  font-size: 9px;
+  font-weight: 700;
+  color: #1A1A18;
+  text-transform: uppercase;
+  letter-spacing: 1.2px;
+}
+
+.overview-status {
+  font-size: 10px;
+  color: #767672;
+  font-family: "SF Mono", Monaco, monospace;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.status-range {
+  font-weight: 600;
+  color: #1A1A18;
+}
+
+.status-div {
+  color: #EB5E28;
+  font-weight: 700;
+}
+
+.status-pur {
+  color: #1E40AF;
+  font-weight: 700;
+}
+
+.status-divider {
+  color: #D1D1CB;
+}
+
+.overview-right-group {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.overview-nav-btns {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.ov-btn {
+  background-color: #FFFFFF;
+  border: 1px solid #D1D1CB;
+  color: #1A1A18;
+  border-radius: 2px;
+  padding: 2px 7px;
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.5px;
+  cursor: pointer;
+  transition: all 0.12s;
+}
+
+.ov-btn:hover {
+  background-color: #1A1A18;
+  color: #FFFFFF;
+  border-color: #1A1A18;
+}
+
+.ov-mode-toggle {
+  padding: 1px;
+}
+
+.ov-mode-toggle .seg-btn {
+  padding: 2px 7px;
+  font-size: 9px;
+}
+
+.hyphy-overview-canvas-container {
+  width: 100%;
+  position: relative;
+  overflow: hidden;
+  background-color: #FFFFFF;
+}
+
+.hyphy-overview-canvas {
+  display: block;
+  cursor: crosshair;
+}
+

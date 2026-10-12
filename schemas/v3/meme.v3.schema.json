@@ -62,7 +62,14 @@
         "unique_patterns": { "type": "integer" },
         "taxa": { "type": "array", "items": { "type": "string" } },
         "genetic_code": { "type": "object" },
-        "partitions": { "type": "array" }
+        "partitions": { "type": "array" },
+        "sequences": {
+          "type": "object",
+          "description": "Mapping from taxon name to aligned nucleotide sequence string",
+          "additionalProperties": {
+            "type": "string"
+          }
+        }
       }
     },
     "phylogeny": {
@@ -127,7 +134,46 @@
             "total_branch_length": { "type": "array", "items": { "type": "number" } },
             "log_l_meme": { "type": "array", "items": { "type": "number" } },
             "log_l_fel": { "type": "array", "items": { "type": "number" } },
-            "classification": { "type": "array", "items": { "type": "string" } }
+            "classification": { "type": "array", "items": { "type": "string" } },
+            "substitution_history": { "type": "array", "items": { "type": "string" } },
+            "mean_substitution_surprise": { "type": "array", "items": { "type": "number" } },
+            "site_perplexity": { "type": "array", "items": { "type": "number" } },
+            "synonymous_substitutions": { "type": "array", "items": { "type": "integer" } },
+            "nonsynonymous_substitutions": { "type": "array", "items": { "type": "integer" } },
+            "branch_ebf": { "type": "array", "items": { "type": "object" } }
+          }
+        }
+      }
+    },
+    "substitution_events": {
+      "type": "array",
+      "description": "Ancestral state transitions and substitution events inferred across the phylogeny",
+      "items": {
+        "type": "object",
+        "required": ["site", "root_codon", "root_aa", "events"],
+        "properties": {
+          "site": { "type": "integer" },
+          "root_codon": { "type": "string" },
+          "root_aa": { "type": "string" },
+          "events": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["branch", "parent_codon", "child_codon", "parent_aa", "child_aa", "is_synonymous", "nucleotide_differences", "transition_probability", "surprise_bits", "branch_length"],
+              "properties": {
+                "branch": { "type": "string" },
+                "parent_codon": { "type": "string" },
+                "child_codon": { "type": "string" },
+                "parent_aa": { "type": "string" },
+                "child_aa": { "type": "string" },
+                "is_synonymous": { "type": "boolean" },
+                "nucleotide_differences": { "type": "integer" },
+                "transition_probability": { "type": "number" },
+                "surprise_bits": { "type": "number" },
+                "branch_length": { "type": "number" },
+                "is_tested": { "type": "boolean" }
+              }
+            }
           }
         }
       }

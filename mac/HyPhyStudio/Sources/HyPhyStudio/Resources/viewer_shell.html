@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>HyPhy Studio Viewer</title>
+  <link rel="stylesheet" href="fel-viewer.css" />
+  <style>
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+    html, body {
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background-color: #F2F2EF;
+      color: #1A1A18;
+      font-family: -apple-system, BlinkMacSystemFont, "Helvetica Neue", Helvetica, Arial, sans-serif;
+      -webkit-font-smoothing: antialiased;
+    }
+    #viewer-mount {
+      width: 100vw;
+      height: 100vh;
+      display: flex;
+    }
+    hyphy-fel-viewer {
+      width: 100%;
+      height: 100%;
+    }
+  </style>
+</head>
+<body>
+  <div id="viewer-mount">
+    <hyphy-fel-viewer id="hyphy-viewer" theme="light"></hyphy-fel-viewer>
+  </div>
+
+  <script src="hyphy-fel-viewer.umd.cjs"></script>
+  <script>
+    window.hyphyViewerInstance = null;
+
+    window.addEventListener('DOMContentLoaded', () => {
+      const el = document.getElementById('hyphy-viewer');
+      window.hyphyViewerInstance = el;
+      if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.hyphyBridge) {
+        window.webkit.messageHandlers.hyphyBridge.postMessage({ action: 'viewerReady' });
+      }
+    });
+
+    window.loadHyPhyResult = function(dataOrJsonStr) {
+      try {
+        const payload = typeof dataOrJsonStr === 'string' ? JSON.parse(dataOrJsonStr) : dataOrJsonStr;
+        const el = document.getElementById('hyphy-viewer');
+        if (el && el.load) {
+          el.load(payload);
+        } else {
+          // Fallback to class constructor
+          const mount = document.getElementById('viewer-mount');
+          mount.innerHTML = '';
+          const v = new HyPhyFELViewer.HyPhyFELViewer(mount, { theme: 'light' });
+          v.load(payload);
+          window.hyphyViewerInstance = v;
+        }
+      } catch (err) {
+        console.error('Failed to parse and load HyPhy payload:', err);
+      }
+    };
+
+    window.selectSite = function(siteNum) {
+      if (window.hyphyViewerInstance && window.hyphyViewerInstance.selectSite) {
+        window.hyphyViewerInstance.selectSite(siteNum);
+      }
+    };
+  </script>
+</body>
+</html>

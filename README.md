@@ -111,6 +111,8 @@ HyPhy 3 computes exact analytical branch gradients in **one single combined pass
 | Method | Biological Question | Selection Type | Statistical Model | Rate Variation | Multi-Hit | Parity Status |
 |:---|:---|:---|:---|:---:|:---:|:---:|
 | **FEL** | Which codon sites are under pervasive selection? | Site-level ($dN \gtrless dS$) | Profile likelihood, $\chi^2_1$ LRT | None | — | 100% Verified |
+| **Contrast-FEL** | Do selective pressures differ across designated branch sets? | Site-level multi-group | Empirical Bayes Ridge Likelihood, LRT | Group-specific $\beta$ | — | 100% Verified |
+| **FUBAR** | Which sites are under selection via fast Bayesian approximation? | Site-level ($dN \gtrless dS$) | Bivariate $(\alpha, \beta)$ rate grid, VB0 / Gibbs | Bivariate 20x20 grid | — | 100% Verified |
 | **MEME** | Which codon sites are under episodic selection? | Site-level & Lineage | 2-rate mixture, $\frac{1}{2}\chi^2_0 + \frac{1}{2}\chi^2_2$ LRT | Site mixture | — | 100% Verified |
 | **BUSTED** | Has the gene evolved under episodic selection? | Gene-wide (all branches) | 3-category $\omega$ mixture, $\frac{1}{2}\chi^2_0 + \frac{1}{2}\chi^2_2$ | Site mixture | Optional | 100% Verified |
 | **BUSTED-S** | Gene-wide selection robust to synonymous variation? | Gene-wide with SRV | Discrete site-to-site $\alpha$ and $\omega$ mixture | Site $\alpha$ & $\omega$ | Optional | 100% Verified |
@@ -188,12 +190,35 @@ HyPhy 3 computes exact analytical branch gradients in **one single combined pass
      - $K > 1$ with $p \le 0.05$: Significant **intensification of selection** (rates diverge from neutrality).
 - **Branch Set Specification**: Automatically detects `{T}` or `{Test}` annotations in Newick trees, or accepts user-specified branch names / regular expressions (`--test`).
 
-#### 6. **Continuous-Time Markov Chain Baselines (GTR & MG94xREV)**
+#### 6. **Contrast-FEL (Comparing Selection Pressures Between Branch Sets)**
+- **Scope**: Tests whether selective pressures (non-synonymous rates $\beta$) differ between two or more designated sets of branches (e.g. Host 1 vs Host 2, Internal vs Leaves, or Phenotype A vs B) across individual codon sites.
+- **Workflow**:
+  1. Partitions phylogenetic tree branches into user-specified groups via branch tags (e.g. `{Set1}`, `{Set2}`) or branch sets (`--branches "Internal,Leaves"`).
+  2. Fits baseline GTR nucleotide and MG94xREV codon models to establish global tree topology and exchangeabilities.
+  3. At every codon site $s$, estimates synonymous rate $\alpha_s$ and separate group-specific non-synonymous rates $\beta_{g, s}$.
+  4. **Empirical Bayes Ridge Shrinkage**: Applies an $L_2$ quadratic penalty $\frac{\lambda}{2} \sum_{g} (\beta_{g, s} - \bar{\beta}_s)^2$ toward the site-mean rate, stabilizing group rate estimates against small-branch sampling noise and avoiding costly permutation tests.
+  5. Evaluates hypothesis tests:
+     - Null: $\beta_1 = \beta_2 = \dots = \beta_G$ (equal selection across groups).
+     - Alt: Group-specific rates $\beta_g$.
+     - Computes Likelihood Ratio Test (LRT) with $\chi^2_{G-1}$ distribution and Benjamini-Hochberg FDR correction.
+- **Outputs**: Group-specific $\alpha, \beta_g, dN/dS_g$, LRT statistics, raw $p$-values, $q$-values, and standardized JSON export.
+
+#### 7. **FUBAR (Fast, Unconstrained Bayesian AppRoximation)**
+- **Scope**: Fast Bayesian inference of site-level positive diversifying and purifying selection using a pre-computed bivariate substitution rate grid.
+- **Workflow**:
+  1. Constructs a $D \times D$ bivariate $(\alpha, \beta)$ rate grid (default $20 \times 20 = 400$ rate pairs) spanning $[0, 50] \times [0, 50]$ with cubic spacing for positive selection and linear spacing for purifying selection.
+  2. Evaluates conditional site log-likelihoods $\ln \mathcal{L}(s \mid \alpha_g, \beta_g)$ across all alignment patterns and grid points in parallel using SIMD Felsenstein pruning.
+  3. **0-th Order Variational Bayes (`VB0`)**: Optimizes Dirichlet posterior weights $\boldsymbol{\theta}$ over the 400 grid points via mean-field variational iteration, converging in $< 3$ ms. Alternatively supports Collapsed Gibbs sampling and Metropolis-Hastings MCMC.
+  4. Computes site-specific posterior distributions, posterior mean rates $\mathbb{E}[\alpha \mid D]$, $\mathbb{E}[\beta \mid D]$, credibility probabilities $P(\beta > \alpha \mid D)$, $P(\alpha > \beta \mid D)$, and Empirical Bayes Factors.
+  5. **Exact False Positive CI**: Computes Expected Number of False Positives (ENFP) and exact 95% confidence intervals via Poisson-binomial dynamic programming convolution.
+- **Outputs**: Posterior grid weights, per-site posterior probabilities, ENFP with 95% CI, modern columnar JSON schema, and legacy HyPhy 2.5 compatibility blocks.
+
+#### 8. **Continuous-Time Markov Chain Baselines (GTR & MG94xREV)**
 - **Nucleotide GTR**: General Time Reversible continuous-time substitution model with 5 independent exchangeabilities ($\theta_{AC}, \theta_{AT}, \theta_{CG}, \theta_{CT}, \theta_{GT}$), analytical eigensolver, and empirical base frequencies.
 - **Global MG94xREV**: Codon substitution model combining GTR nucleotide exchangeabilities with positional F3x4 codon equilibrium frequencies and global non-synonymous/synonymous rate ratio $\omega$.
 - **Multi-Hit MG94xREV**: Simultaneous evaluation of 1-hit, 2-hit ($\delta$), and 3-hit ($\psi$) codon substitution transitions while strictly preserving detailed balance $\pi_i Q_{ij} = \pi_j Q_{ji}$.
 
-#### 7. **Differentiable Phylogenetics Engine & Autograd**
+#### 9. **Differentiable Phylogenetics Engine & Autograd**
 - **Analytical Inside-Outside Adjoints**: Evaluates exact tree log-likelihood gradients $\frac{\partial \ln L}{\partial t_b}$ for all $B$ branches simultaneously in a single $\mathcal{O}(B)$ tree traversal.
 - **Native C++ Autograd Graph**: Reverse-mode automatic differentiation supporting custom evolutionary models and continuous rate distributions.
 - **PyTorch & JAX Bridge**: Zero-copy bindings via Nanobind allowing phylogenetic likelihood calculations to serve directly as differentiable loss functions within machine learning pipelines.
@@ -241,6 +266,8 @@ HyPhy 3 provides both a unified driver (`hyphy3 <analysis>`) and dedicated stand
 | Analysis | Command | Key Options | Description |
 |:---|:---|:---|:---|
 | **FEL** | `hyphy3 fel` | `--alignment`, `--tree`, `--pvalue 0.1`, `--threads N`, `--output` | Site-by-site pervasive selection |
+| **Contrast-FEL** | `hyphy3 contrast-fel` | `--alignment`, `--tree`, `--branches <groups>`, `--shrinkage <lambda>`, `--output` | Multi-group selection comparison with Ridge shrinkage |
+| **FUBAR** | `hyphy3 fubar` | `--alignment`, `--tree`, `--grid 20`, `--method [VB0|Gibbs|MH]`, `--posterior 0.9`, `--output` | Fast Bayesian rate-grid selection inference |
 | **MEME** | `hyphy3 meme` | `--alignment`, `--tree`, `--pvalue 0.1`, `--threads N`, `--output` | Site-by-site episodic selection across lineages |
 | **BUSTED** | `hyphy3 busted` | `--alignment`, `--tree`, `--rates 3`, `--threads N`, `--output` | Standard gene-wide episodic selection |
 | **BUSTED-S** | `hyphy3 busted` | `--srv`, `--syn-rates 3` | Synonymous rate variation across sites |
@@ -258,25 +285,31 @@ hyphy3 --help
 # 1. Run FEL (site-by-site pervasive selection)
 hyphy3 fel --alignment benchmarks/data/cd2.fna --tree benchmarks/data/cd2.nwk --pvalue 0.1 --threads 8
 
-# 2. Run MEME (site-by-site episodic selection across lineages)
+# 2. Run Contrast-FEL (test for differential selection between branch sets)
+hyphy3 contrast-fel --alignment benchmarks/data/cd2.fna --tree benchmarks/data/cd2.nwk --branches "Internal,Leaves" --shrinkage 1.0 --threads 8
+
+# 3. Run FUBAR (fast Bayesian selection analysis via Variational Bayes)
+hyphy3 fubar --alignment benchmarks/data/cd2.fna --tree benchmarks/data/cd2.nwk --grid 20 --method Variational-Bayes --output cd2.fubar.json
+
+# 4. Run MEME (site-by-site episodic selection across lineages)
 hyphy3 meme --alignment benchmarks/data/adh.fna --tree benchmarks/data/adh.nwk --pvalue 0.1 --threads 8
 
-# 3. Run BUSTED (standard gene-wide selection)
+# 5. Run BUSTED (standard gene-wide selection)
 hyphy3 busted --alignment benchmarks/data/adh.fna --tree benchmarks/data/adh.nwk --threads 8
 
-# 4. Run BUSTED-S (with Synonymous Rate Variation across sites)
+# 6. Run BUSTED-S (with Synonymous Rate Variation across sites)
 hyphy3 busted --alignment benchmarks/data/adh.fna --tree benchmarks/data/adh.nwk --srv --syn-rates 3 --threads 8
 
-# 5. Run BUSTED-MH (with Multi-Nucleotide Substitutions: Double & Triple Hits)
+# 7. Run BUSTED-MH (with Multi-Nucleotide Substitutions: Double & Triple Hits)
 hyphy3 busted --alignment benchmarks/data/adh.fna --tree benchmarks/data/adh.nwk --multiple-hits Double+Triple --threads 8
 
-# 6. Run BUSTED with Automatic Model Selection (Auto-K via AICc step-up)
+# 8. Run BUSTED with Automatic Model Selection (Auto-K via AICc step-up)
 hyphy3 busted --alignment benchmarks/data/adh.fna --tree benchmarks/data/adh.nwk --auto-k --threads 8
 
-# 7. Run aBSREL (adaptive lineage-specific selection)
+# 9. Run aBSREL (adaptive lineage-specific selection)
 hyphy3 absrel --alignment benchmarks/data/bglobin.nex --tree benchmarks/data/bglobin.nex --output bglobin.absrel.json --threads 8
 
-# 8. Run RELAX (test for relaxed or intensified selection across branch sets)
+# 10. Run RELAX (test for relaxed or intensified selection across branch sets)
 hyphy3 relax --alignment tests/data/Fig4E.nex --output Fig4E.RELAX.json --threads 8
 ```
 
@@ -360,6 +393,34 @@ print(f"RELAX LRT = {relax_res.lrt:.2f}, p-value = {relax_res.p_value:.3e}, K = 
 if relax_res.is_significant:
     mode = "Relaxation" if relax_res.is_relaxed else "Intensification"
     print(f"Significant {mode} detected on Test branches (p <= {relax_res.settings.p_value_threshold})")
+# -------------------------------------------------------------
+# 6. Contrast-FEL: Differential Selection Between Branch Sets
+# -------------------------------------------------------------
+cfel_aln = hp.Alignment.load("benchmarks/data/cd2.fna")
+cfel_tree = hp.Tree.from_newick_file("benchmarks/data/cd2.nwk")
+cfel_settings = hp.ContrastFELSettings()
+cfel_settings.branch_specs = "Internal,Leaves"
+cfel_settings.shrinkage_lambda = 1.0
+
+cfel = hp.ContrastFELAnalyzer.create_and_fit(cfel_tree, cfel_aln, cfel_settings)
+cfel_res = cfel.run()
+sig_sites = [r.site for r in cfel_res if r.p_value <= 0.05]
+print(f"Contrast-FEL significant sites: {sig_sites}")
+
+# -------------------------------------------------------------
+# 7. FUBAR: Fast Unconstrained Bayesian AppRoximation
+# -------------------------------------------------------------
+fubar_aln = hp.Alignment.load("benchmarks/data/cd2.fna")
+fubar_tree = hp.Tree.from_newick_file("benchmarks/data/cd2.nwk")
+fubar_settings = hp.FUBARSettings()
+fubar_settings.grid_points = 20
+fubar_settings.method = hp.FUBARMethod.VariationalBayes
+fubar_settings.posterior_threshold = 0.90
+
+fubar = hp.FUBARAnalyzer.create_and_fit(fubar_tree, fubar_aln, fubar_settings)
+fubar_res = fubar.run()
+print(f"FUBAR positive selection sites: {fubar_res.positive_sites}")
+print(f"Expected false positives: {fubar_res.expected_false_positives:.2f} (95% CI: {fubar_res.false_positives_ci_95})")
 ```
 
 ### PyTorch End-to-End Optimization
@@ -399,6 +460,69 @@ for step in range(50):
 
 ---
 
+## 🎨 Interactive Visualizations & Standalone HTML Reports
+
+HyPhy 3 features a modern, interactive visualization engine designed according to **Dieter Rams' Braun Industrial Design System** (*"Less, but better"* — *Weniger, aber besser*). It eliminates clutter, presenting dense phylogenetic and selection data with clarity, tactile elegance, and instant responsiveness.
+
+```
+┌────────────────────────────────────────────────────────────────────────────────────────┐
+│  HYPHY 3 • FEL VIEWER                CD2.FNA • 10 TAXA • 187 SITES            [EXPORT] │
+├────────────────────────────────────────────────────────────────────────────────────────┤
+│  [BIRD'S-EYE OVERVIEW TRACK]                                                           │
+│  LRT ▅▅▅▅▆▇█▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅  │
+│  [  BRUSH / ZOOM WINDOW  ]                                                             │
+├────────────────────────────────┬───────────────────────────────────────┬───────────────┤
+│  PHYLOGENETIC TREE CANVAS      │ MULTIPLE SEQUENCE ALIGNMENT (CANVAS)  │ SITE INSPECTOR│
+│  ├─ Human                      │ K E I T N A L E T W G A L G Q D I N L │ Site: 34      │
+│  ├─ Chimp                      │ K E I T N A L E T W G A L G Q D I N L │ α (dS): 0.482 │
+│  ├─ Gorilla                    │ K E I T N A L E T W G A L G Q D I N L │ β (dN): 2.132 │
+│  ├─ Orangutan                  │ K E I T N A L E T W G A L G Q D I N L │ ω: 4.42       │
+│  ├─ Macaque                    │ K E I T N A L E T W G A L G Q D I N L │ LRT: 8.64     │
+│  └─ Baboon                     │ K E I T N A L E T W G A L G Q D I N L │ p-value: 0.003│
+│   ▲ Synchronized Y-Scrolling ▲ │ 60 FPS Virtualized Codon Viewport     │ Diversifying  │
+└────────────────────────────────┴───────────────────────────────────────┴───────────────┘
+```
+
+### 1. Visualization Architecture (`viz/fel-viewer`)
+
+- **Synchronized Dual-Axis Exploration**:
+  - **Vertical Synchronization**: The phylogenetic tree leaf nodes and alignment sequence rows are locked in a strict 1:1 vertical mapping, scrolling and zooming together synchronously.
+  - **Horizontal Navigation**: Smooth multi-scale panning across thousands of codon positions without lag.
+- **Virtualized High-Performance HTML5 Canvas**:
+  - Employs off-screen virtualized canvas rendering, delivering fluid 60 FPS scrolling on large sequence alignments containing hundreds of taxa and thousands of sites.
+  - Supports amino acid translation, codon triplets, biochemical property coloring schemes (Hydrophobicity, Charge, Zappo, Taylor), and reference-difference highlighting.
+- **Bird's-Eye Panoramic Overview Track**:
+  - Full-gene selection landscape profile plotting test statistics across all sites (FEL/Contrast-FEL LRT, MEME episodic $p$-values, FUBAR posterior probabilities).
+  - Interactive brush-to-zoom scrubber allowing instant macro-to-micro transitions from gene overview to individual residue resolution.
+- **Real-Time Site Inspector**:
+  - Real-time side panel presenting complete site-level inference statistics upon click or hover:
+    - Point estimates of synonymous ($\alpha$) and non-synonymous ($\beta$) substitution rates.
+    - Likelihood ratio test statistics, $p$-values, and Benjamini-Hochberg $q$-values.
+    - Group-specific rate partitions and shrinkage parameters (Contrast-FEL).
+    - Branch attribution with Empirical Bayes Factor (EBF) rankings (MEME).
+    - Bivariate posterior mass distribution across the $20 \times 20$ rate grid (FUBAR).
+
+### 2. Standalone Single-File HTML Reports (`build_standalone_html.py`)
+
+HyPhy 3 includes a standalone bundler that produces **100% self-contained, single-file HTML reports**:
+
+```bash
+# Generate a self-contained interactive report from any HyPhy 3 JSON output
+python3 viz/fel-viewer/build_standalone_html.py results.FEL.json results.html
+```
+
+- **Zero Network Dependencies**: Inlines the complete JavaScript runtime, CSS styling, and JSON dataset directly into the HTML document.
+- **Universal Portability**: Double-click to open in Safari, Chrome, Firefox, or Edge. Works directly via `file://` URLs, in air-gapped laboratory environments, HPC clusters, and email attachments.
+- **Publication Ready**: Includes one-click SVG/PNG export for publication-quality figures.
+
+### 3. Native macOS Desktop Application (`mac/HyPhyStudio`)
+
+For macOS users, HyPhy 3 includes **HyPhyStudio** — a native desktop application built with Swift 6 and SwiftUI:
+- **Swift-C++ Interoperability**: Direct zero-overhead bridging to the `hyphy::core` and `hyphy::analyses` C++20 engine (`.interoperabilityMode(.Cxx)`).
+- **Embedded WebKit Viewer**: Hosts the interactive visualization engine inside an optimized Cocoa `WKWebView`, providing native file drop, menu bar integration, and multi-core computation.
+
+---
+
 ## 📂 Repository Structure
 
 ```
@@ -412,12 +536,16 @@ hyphy-3/
 │       ├── core/               # Alignment, Tree, GeneticCode, RateMatrix, LikelihoodEngine
 │       ├── opt/                # Brent, NelderMead, SQUAREM, L-BFGS, Adam
 │       ├── autograd/           # Dynamic computational graph, Var, TreeLikelihoodNode
-│       └── analyses/           # GTR, MG94, FEL, MEME, BUSTED (SRV & MH), aBSREL
+│       └── analyses/           # GTR, MG94, FEL, Contrast-FEL, MEME, BUSTED (SRV & MH), aBSREL, RELAX, FUBAR
 ├── src/
-│   ├── apps/                   # CLI drivers: hyphy3, hyphy_fel, hyphy_meme, hyphy_busted, hyphy_absrel
+│   ├── apps/                   # CLI drivers: hyphy3, hyphy_fel, hyphy_contrast_fel, hyphy_fubar, hyphy_meme, hyphy_busted, hyphy_absrel, hyphy_relax
 │   └── python/                 # Nanobind C++ Python bridge (bindings.cpp)
 ├── python/
 │   └── hyphy3/                 # Pure Python high-level API & wrappers
+├── viz/                        # Interactive browser visualizers & standalone HTML generator
+│   └── fel-viewer/             # Braun-inspired synchronized Tree/Alignment/Overview viewer
+├── mac/                        # Native macOS applications
+│   └── HyPhyStudio/            # Swift 6 / SwiftUI macOS desktop studio
 ├── examples/
 │   ├── cli/                    # Shell scripts: run_fel.sh, run_meme.sh, run_busted.sh, run_absrel.sh
 │   └── python/                 # Python examples (FEL, MEME, BUSTED, aBSREL, Autograd, PyTorch)
@@ -433,6 +561,8 @@ hyphy-3/
 If you use HyPhy 3 in your research, please cite:
 
 - **HyPhy 3 Modern Core**: Kosakovsky Pond SL, et al. *HyPhy 3: A Modern Differentiable Engine for Molecular Evolution*. (In preparation).
+- **Contrast-FEL**: Kosakovsky Pond SL, et al. *Contrast-FEL: A test for differences in selective pressures at individual sites among clades and sets of branches*. Mol Biol Evol. 38(3):1184–1198 (2021).
+- **FUBAR**: Murrell B, et al. *FUBAR: a fast, unconstrained bayesian approximation for inferring selection*. Mol Biol Evol. 30(5):1196–1205 (2013).
 - **aBSREL**: Smith MD, et al. *Less Is More: An Adaptive Branch-Site Random Effects Model for Efficient Detection of Episodic Diversifying Selection*. Mol Biol Evol. 32(5):1342–1353 (2015).
 - **BUSTED**: Murrell B, et al. *Gene-wide identification of episodic selection*. Mol Biol Evol. 32(5):1365–1371 (2015).
 - **BUSTED-S**: Wisotsky SR, et al. *Synonymous rate variation improves the detection of positive selection*. Mol Biol Evol. 37(8):2430–2439 (2020).

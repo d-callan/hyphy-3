@@ -203,14 +203,44 @@ int run_meme(int argc, char* argv[]) {
     auto results = analyzer.run(show_progress, force_progress);
 
     // 5. Report Sites
+    auto render_rate_spark = [](double alpha, double beta_plus) -> std::string {
+        auto segs = [](double v) -> int {
+            if (v <= 1e-4) return 0;
+            if (v < 0.5) return 1;
+            if (v < 3.0) return 2;
+            return 3;
+        };
+        int na = segs(alpha);
+        int nb = segs(beta_plus);
+
+        std::string sa_filled, sa_empty, sb_filled, sb_empty;
+        for (int i = 0; i < na; ++i) sa_filled += "▰";
+        for (int i = 0; i < 3 - na; ++i) sa_empty += "▱";
+        for (int i = 0; i < nb; ++i) sb_filled += "▰";
+        for (int i = 0; i < 3 - nb; ++i) sb_empty += "▱";
+
+        if (Console::color_enabled()) {
+            return "\033[38;5;75m" + sa_filled + "\033[0m" +
+                   "\033[2m" + sa_empty + "\033[0m" +
+                   "\033[38;5;244m:\033[0m" +
+                   "\033[38;5;208m" + sb_filled + "\033[0m" +
+                   "\033[2m" + sb_empty + "\033[0m";
+        } else {
+            return sa_filled + sa_empty + ":" + sb_filled + sb_empty;
+        }
+    };
+
     Table table;
     table.add_column("Codon", Table::Align::Right, 6);
-    table.add_column("alpha (dS)", Table::Align::Right, 10);
-    table.add_column("beta1 (p1)", Table::Align::Right, 14);
-    table.add_column("beta+ (p+)", Table::Align::Right, 14);
-    table.add_column("LRT", Table::Align::Right, 8);
+    table.add_column("alpha", Table::Align::Right, 8);
+    table.add_column("beta1 (p1)", Table::Align::Right, 15);
+    table.add_column("beta+ (p+)", Table::Align::Right, 16);
+    table.add_column("Rates", Table::Align::Right, 9);
+    table.add_column("LRT", Table::Align::Right, 7);
     table.add_column("p-value", Table::Align::Right, 9);
-    table.add_column("# Branches", Table::Align::Right, 10);
+    table.add_column("# Branches", Table::Align::Right, 11);
+    table.add_column("Selection", Table::Align::Left, 14);
+    table.add_column("Substitutions", Table::Align::Left, 40);
 
     std::vector<const MEMESiteResult*> positive_sites;
     for (const auto& r : results) {
@@ -236,25 +266,34 @@ int run_meme(int argc, char* argv[]) {
 
     for (const auto* r : sites_to_display) {
         std::ostringstream a_ss, b1_ss, bp_ss, lrt_ss, p_ss;
-        a_ss << std::fixed << std::setprecision(3) << r->alpha;
+        a_ss << std::fixed << std::setprecision(2) << r->alpha;
         b1_ss << std::fixed << std::setprecision(2) << r->beta1 << " (" << std::setprecision(2) << r->p1 << ")";
         bp_ss << std::fixed << std::setprecision(2) << r->beta_plus << " (" << std::setprecision(2) << r->p_plus << ")";
-        lrt_ss << std::fixed << std::setprecision(3) << r->lrt;
-        p_ss << std::fixed << std::setprecision(4) << r->p_value;
+        lrt_ss << std::fixed << std::setprecision(2) << r->lrt;
 
-        std::string row_color = "";
-        if (r->p_value <= pvalue_threshold && r->beta_plus > r->alpha) {
-            row_color = "\033[38;5;48m"; // Emerald highlight
+        if (r->p_value < 0.0001) {
+            p_ss << "<0.0001";
+        } else {
+            p_ss << std::fixed << std::setprecision(4) << r->p_value;
         }
+
+        bool is_episodic = (r->p_value <= pvalue_threshold && r->beta_plus > r->alpha);
+        std::string sel_label = is_episodic ? Console::brand("▲ Episodic") : Console::muted("-");
+        std::string row_color = is_episodic ? "\033[38;5;208m" : ""; // Braun Signal Orange highlight
+
+        std::string subs_str = r->subs.summary_string.empty() ? "Conserved" : r->subs.summary_string;
 
         table.add_row({
             std::to_string(r->site_index + 1),
             a_ss.str(),
             b1_ss.str(),
             bp_ss.str(),
+            render_rate_spark(r->alpha, r->beta_plus),
             lrt_ss.str(),
             p_ss.str(),
-            std::to_string(r->branches_under_selection)
+            std::to_string(r->branches_under_selection),
+            sel_label,
+            subs_str
         }, row_color);
     }
 
@@ -276,6 +315,16 @@ int run_meme(int argc, char* argv[]) {
     } else {
         std::cout << "\n";
     }
+
+    std::cout << Console::bold("  Table Legend:\n")
+              << Console::muted("  • alpha : beta1 (p1) : beta+ (p+) : Synonymous (alpha), constrained/neutral non-synonymous (beta1 with weight p1),\n"
+                                "                                      and episodic non-synonymous (beta+ with weight p+ = 1 - p1)\n"
+                                "  • Rates Sparkline                 : α (cyan) : β+ (orange), scaled by rate magnitude:\n"
+                                "                                      ▱▱▱ zero (0.0) | ▰▱▱ low (<0.5) | ▰▰▱ moderate (0.5..3.0) | ▰▰▰ elevated (>=3.0)\n"
+                                "  • Selection                       : ▲ Episodic diversifying selection (beta+ > alpha, p <= " + std::to_string(pvalue_threshold) + ")\n"
+                                "  • # Branches                      : Number of branches with Empirical Bayes Factor (EBF) >= 100 for beta+\n"
+                                "  • Substitutions                   : A ↔ B (undirected exchange), (k×) recurrence, [2nt/3nt] multiple hits\n"
+                                "                                      ⚡ high perplexity substitution (Shannon surprise >= 10.0 bits; rare jump / short branch)\n\n");
 
     auto end_time = std::chrono::high_resolution_clock::now();
     double total_sec = std::chrono::duration<double>(end_time - start_time).count();

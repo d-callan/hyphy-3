@@ -39,6 +39,8 @@ static void print_usage(const char* prog) {
               << Console::bold("Optional arguments:") << "\n"
               << "  " << Console::brand("--tree") << " <file>        Path to Newick tree file (optional if embedded in NEXUS)\n"
               << "  " << Console::brand("--code") << " <name>        Genetic code (default: Universal; e.g. Vertebrate-mtDNA)\n"
+              << "  " << Console::brand("--branches") << " <set>     Branches to test: 'All' (default), 'Internal', 'Leaves', 'Unlabeled', tag name, or comma-separated names\n"
+              << "  " << Console::brand("--branch-regex") << " <reg> Regular expression to match branch names to test\n"
               << "  " << Console::brand("--threads") << " <N>        Number of OpenMP worker threads\n"
               << "  " << Console::brand("--output") << " <file>      Path to output JSON file (default: <alignment>.FEL.json)\n"
               << "  " << Console::brand("--pvalue") << " <float>     P-value significance threshold (default: 0.1)\n"
@@ -53,6 +55,7 @@ static void print_usage(const char* prog) {
               << "  " << Console::brand("--help, -h") << "           Show this help message\n\n"
               << Console::bold("Examples:") << "\n"
               << "  " << prog << " --alignment data/cd2.fna --tree data/cd2.nwk --output cd2.FEL.json\n"
+              << "  " << prog << " --alignment data/cd2.fna --branches Leaves --output cd2.FEL.json\n"
               << "  " << prog << " --alignment tests/data/COXI.nex --code Vertebrate-mtDNA --legacy-json\n\n";
 }
 
@@ -61,6 +64,8 @@ int run_fel(int argc, char* argv[]) {
     std::string tree_file;
     std::string output_file;
     std::string code_name = "Universal";
+    std::string test_branches = "All";
+    std::string test_branch_regex = "";
     int num_threads = 0;
     Scalar pvalue_threshold = 0.1;
     bool show_progress = ProgressBar::is_terminal();
@@ -77,6 +82,10 @@ int run_fel(int argc, char* argv[]) {
             tree_file = argv[++i];
         } else if (arg == "--code" && i + 1 < argc) {
             code_name = argv[++i];
+        } else if ((arg == "--branches" || arg == "--test-branches") && i + 1 < argc) {
+            test_branches = argv[++i];
+        } else if ((arg == "--branch-regex" || arg == "--test-branch-regex") && i + 1 < argc) {
+            test_branch_regex = argv[++i];
         } else if (arg == "--threads" && i + 1 < argc) {
             num_threads = std::stoi(argv[++i]);
         } else if (arg == "--output" && i + 1 < argc) {
@@ -237,8 +246,13 @@ int run_fel(int argc, char* argv[]) {
 
     // Step 3: Site-by-Site Testing Phase
     Panel::print_step(3, 3, "Testing Codon Sites for Selection", "OpenMP parallel");
-    FELAnalyzer fel(mg_res.tree, aln, base_p);
-    fel.p_value_threshold = pvalue_threshold;
+    FELSettings fel_settings;
+    fel_settings.p_value_threshold = pvalue_threshold;
+    fel_settings.full_model = full_model;
+    fel_settings.test_branches = test_branches;
+    fel_settings.test_branch_regex = test_branch_regex;
+
+    FELAnalyzer fel(mg_res.tree, aln, base_p, fel_settings);
     fel.global_log_l = mg_res.log_likelihood;
     size_t K_mg = 5 + 1 + (mg_res.tree.num_nodes() - 1);
     size_t N_codons = aln.num_codons;
@@ -254,17 +268,53 @@ int run_fel(int argc, char* argv[]) {
         }
     }
 
+    if (fel.num_background > 0) {
+        std::cout << "  " << Console::muted("Tested branches : ") 
+                  << Console::bold(std::to_string(fel.num_tested)) << Console::muted(" test, ") 
+                  << Console::bold(std::to_string(fel.num_background)) << Console::muted(" background\n\n");
+    }
+
     auto site_results = fel.run(show_progress, force_progress);
+
+    auto render_rate_spark = [](double alpha, double beta) -> std::string {
+        auto segs = [](double v) -> int {
+            if (v <= 1e-4) return 0;
+            if (v < 0.5) return 1;
+            if (v < 3.0) return 2;
+            return 3;
+        };
+        int na = segs(alpha);
+        int nb = segs(beta);
+
+        std::string sa_filled, sa_empty, sb_filled, sb_empty;
+        for (int i = 0; i < na; ++i) sa_filled += "▰";
+        for (int i = 0; i < 3 - na; ++i) sa_empty += "▱";
+        for (int i = 0; i < nb; ++i) sb_filled += "▰";
+        for (int i = 0; i < 3 - nb; ++i) sb_empty += "▱";
+
+        if (Console::color_enabled()) {
+            return "\033[38;5;75m" + sa_filled + "\033[0m" +
+                   "\033[2m" + sa_empty + "\033[0m" +
+                   "\033[38;5;244m:\033[0m" +
+                   "\033[38;5;48m" + sb_filled + "\033[0m" +
+                   "\033[2m" + sb_empty + "\033[0m";
+        } else {
+            return sa_filled + sa_empty + ":" + sb_filled + sb_empty;
+        }
+    };
 
     // Site results table
     Table table;
     table.add_column("Codon", Table::Align::Right, 6);
-    table.add_column("alpha (dS)", Table::Align::Right, 10);
-    table.add_column("beta (dN)", Table::Align::Right, 10);
-    table.add_column("alpha=beta", Table::Align::Right, 10);
-    table.add_column("LRT", Table::Align::Right, 8);
+    if (fel.num_background > 0) {
+        table.add_column("alpha : beta (test rates)", Table::Align::Right, 26);
+        table.add_column("beta (bg)", Table::Align::Right, 10);
+    } else {
+        table.add_column("alpha : beta (rates)", Table::Align::Right, 24);
+    }
     table.add_column("p-value", Table::Align::Right, 9);
     table.add_column("Selection", Table::Align::Left, 14);
+    table.add_column("Substitutions", Table::Align::Left, 40);
 
     std::vector<size_t> sig_indices;
     for (size_t c = 0; c < site_results.size(); ++c) {
@@ -280,11 +330,11 @@ int run_fel(int argc, char* argv[]) {
     } else if (!sig_indices.empty()) {
         sites_to_display = sig_indices;
     } else {
-        // Top 5 by LRT
+        // Top 5 by p-value
         std::vector<size_t> sorted_by_lrt(site_results.size());
         std::iota(sorted_by_lrt.begin(), sorted_by_lrt.end(), 0);
         std::sort(sorted_by_lrt.begin(), sorted_by_lrt.end(), [&](size_t i, size_t j) {
-            return site_results[i].lrt > site_results[j].lrt;
+            return site_results[i].p_value < site_results[j].p_value;
         });
         size_t n_top = std::min(sorted_by_lrt.size(), size_t(5));
         sites_to_display.assign(sorted_by_lrt.begin(), sorted_by_lrt.begin() + n_top);
@@ -293,33 +343,48 @@ int run_fel(int argc, char* argv[]) {
     for (size_t c : sites_to_display) {
         const auto& r = site_results[c];
         std::string sel_label = Console::muted("-");
-        std::string row_color = "";
         if (r.p_value <= pvalue_threshold) {
             if (r.beta > r.alpha) {
                 sel_label = Console::success("▲ Diversifying");
-                row_color = "\033[38;5;48m";
             } else if (r.alpha > r.beta) {
                 sel_label = Console::info("▼ Purifying");
-                row_color = "\033[38;5;75m";
             }
         }
 
-        std::ostringstream a_ss, b_ss, n_ss, lrt_ss, p_ss;
-        a_ss << std::fixed << std::setprecision(4) << r.alpha;
-        b_ss << std::fixed << std::setprecision(4) << r.beta;
-        n_ss << std::fixed << std::setprecision(4) << r.alpha_null;
-        lrt_ss << std::fixed << std::setprecision(4) << r.lrt;
-        p_ss << std::fixed << std::setprecision(4) << r.p_value;
+        std::ostringstream ab_ss, p_ss;
+        ab_ss << std::fixed << std::setprecision(2) << r.alpha << " : " << std::setprecision(2) << r.beta
+              << "   " << render_rate_spark(r.alpha, r.beta);
 
-        table.add_row({
-            std::to_string(c + 1),
-            a_ss.str(),
-            b_ss.str(),
-            n_ss.str(),
-            lrt_ss.str(),
-            p_ss.str(),
-            sel_label
-        }, row_color);
+        if (r.p_value < 0.0001) {
+            p_ss << "<0.0001";
+        } else {
+            p_ss << std::fixed << std::setprecision(4) << r.p_value;
+        }
+
+        std::string subs_str = (fel.num_background > 0) 
+            ? r.subs.summary_string_partitioned 
+            : r.subs.summary_string;
+
+        if (fel.num_background > 0) {
+            std::ostringstream bg_ss;
+            bg_ss << std::fixed << std::setprecision(2) << r.beta_nuisance;
+            table.add_row({
+                std::to_string(c + 1),
+                ab_ss.str(),
+                bg_ss.str(),
+                p_ss.str(),
+                sel_label,
+                subs_str
+            });
+        } else {
+            table.add_row({
+                std::to_string(c + 1),
+                ab_ss.str(),
+                p_ss.str(),
+                sel_label,
+                subs_str
+            });
+        }
     }
 
     std::cout << "\n";
@@ -334,11 +399,23 @@ int run_fel(int argc, char* argv[]) {
         } else {
             std::cout << Console::muted("  No sites reached significance threshold (p <= " + 
                                        std::to_string(pvalue_threshold) + 
-                                       "). Displaying top 5 sites by LRT. (Use --all-sites to display all)\n\n");
+                                       "). Displaying top 5 sites by p-value. (Use --all-sites to display all)\n\n");
         }
-    } else {
-        std::cout << "\n";
     }
+
+    std::string rate_desc = (fel.num_background > 0)
+        ? "alpha : beta (test rates) : Synonymous (alpha) and non-synonymous (beta) rates on tested branches\n"
+          "    beta (bg)                : Non-synonymous rate on background branches"
+        : "alpha : beta (rates)      : Synonymous (alpha) and non-synonymous (beta) substitution rates";
+
+    std::cout << Console::bold("  Table Legend:\n")
+              << Console::muted("  • " + rate_desc + "\n"
+                                "  • Rates Sparkline     : α (cyan) : β (green), scaled by rate magnitude:\n"
+                                "                          ▱▱▱ zero (0.0) | ▰▱▱ low (<0.5) | ▰▰▱ moderate (0.5..3.0) | ▰▰▰ elevated (>=3.0)\n"
+                                "  • Selection           : ▲ Diversifying (beta > alpha, p <= " + std::to_string(pvalue_threshold) + ") | "
+                                "▼ Purifying (beta < alpha, p <= " + std::to_string(pvalue_threshold) + ")\n"
+                                "  • Substitutions       : A ↔ B (undirected exchange), (k×) recurrence, [2nt/3nt] multiple hits\n"
+                                "                          ⚡ high perplexity substitution (Shannon surprise >= 10.0 bits; rare jump / short branch)\n\n");
 
     auto summary = fel.get_summary();
     auto end_time = std::chrono::high_resolution_clock::now();
@@ -359,7 +436,12 @@ int run_fel(int argc, char* argv[]) {
     omega_ss << std::fixed << std::setprecision(4) << base_p.beta;
 
     std::string json_desc = (json_format == JSONFormat::Legacy) ? " [Legacy]" : " [Modern v3.0]";
+    std::string branch_summary = (fel.num_background > 0) 
+        ? (std::to_string(fel.num_tested) + " test, " + std::to_string(fel.num_background) + " background")
+        : ("All (" + std::to_string(fel.num_tested) + " branches)");
+
     std::vector<std::pair<std::string, std::string>> sum_items = {
+        {"Branch Set", branch_summary},
         {"Tested Codon Sites", std::to_string(summary.tested_sites)},
         {"Diversifying Selection (Positive)", 
          Console::success(std::to_string(summary.positively_selected)) + " sites (" + 
@@ -387,6 +469,10 @@ int run_fel(int argc, char* argv[]) {
     prov.invocation.arguments["alignment"] = alignment_file;
     if (!tree_file.empty()) prov.invocation.arguments["tree"] = tree_file;
     prov.invocation.arguments["code"] = code_name;
+    prov.invocation.arguments["branches"] = test_branches;
+    if (!test_branch_regex.empty()) {
+        prov.invocation.arguments["branch_regex"] = test_branch_regex;
+    }
     prov.invocation.arguments["pvalue_threshold"] = std::to_string(pvalue_threshold);
     prov.invocation.arguments["full_model"] = full_model ? "true" : "false";
     prov.invocation.arguments["json_format"] = (json_format == JSONFormat::Legacy) ? "legacy" : "modern_v3";
