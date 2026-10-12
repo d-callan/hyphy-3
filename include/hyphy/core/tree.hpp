@@ -206,7 +206,6 @@ public:
         return write_node(write_node, root_id) + ";";
     }
 
-private:
     void compute_post_order() {
         post_order.clear();
         if (root_id == INVALID_INDEX) return;

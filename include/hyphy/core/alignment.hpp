@@ -57,7 +57,7 @@ public:
     Vector codon_frequencies_f1x4;
     Vector codon_frequencies_f3x4;
 
-    static Alignment from_fasta(const std::string& filepath, std::shared_ptr<const GeneticCode> gcode = nullptr) {
+    static Alignment from_fasta(const std::string& filepath, std::shared_ptr<const GeneticCode> gcode = nullptr, bool as_nucleotide = false) {
         Alignment aln;
         std::ifstream file(filepath);
         if (!file.is_open()) {
@@ -94,11 +94,15 @@ public:
             aln.add_sequence(current_name, current_seq);
         }
 
-        aln.finalize(gcode);
+        if (as_nucleotide) {
+            aln.finalize_nucleotide();
+        } else {
+            aln.finalize(gcode);
+        }
         return aln;
     }
 
-    static Alignment from_nexus(const std::string& filepath, std::shared_ptr<const GeneticCode> gcode = nullptr) {
+    static Alignment from_nexus(const std::string& filepath, std::shared_ptr<const GeneticCode> gcode = nullptr, bool as_nucleotide = false) {
         Alignment aln;
         std::ifstream file(filepath);
         if (!file.is_open()) {
@@ -233,8 +237,20 @@ public:
             }
         }
 
-        aln.finalize(gcode);
+        if (as_nucleotide) {
+            aln.finalize_nucleotide();
+        } else {
+            aln.finalize(gcode);
+        }
         return aln;
+    }
+
+    static Alignment from_fasta_nucleotide(const std::string& filepath) {
+        return from_fasta(filepath, nullptr, true);
+    }
+
+    static Alignment from_nexus_nucleotide(const std::string& filepath) {
+        return from_nexus(filepath, nullptr, true);
     }
 
     static Alignment load(const std::string& filepath, std::shared_ptr<const GeneticCode> gcode = nullptr) {
@@ -259,6 +275,30 @@ public:
             }
         }
         return from_fasta(filepath, gcode);
+    }
+
+    static Alignment load_nucleotide(const std::string& filepath) {
+        std::ifstream file(filepath);
+        if (!file.is_open()) {
+            throw std::runtime_error("Could not open alignment file: " + filepath);
+        }
+        std::string line;
+        while (std::getline(file, line)) {
+            while (!line.empty() && std::isspace(static_cast<unsigned char>(line.front()))) line.erase(line.begin());
+            if (line.empty()) continue;
+            if (line[0] == '#') {
+                return from_nexus(filepath, nullptr, true);
+            }
+            if (line[0] == '>') {
+                return from_fasta(filepath, nullptr, true);
+            }
+            std::string upper = line;
+            for (auto& c : upper) c = std::toupper(static_cast<unsigned char>(c));
+            if (upper.find("BEGIN") != std::string::npos) {
+                return from_nexus(filepath, nullptr, true);
+            }
+        }
+        return from_fasta(filepath, nullptr, true);
     }
 
     void add_sequence(const std::string& name, const std::string& seq) {
@@ -312,7 +352,99 @@ public:
         compress_patterns();
     }
 
+    void finalize_nucleotide() {
+        if (sequences.empty()) {
+            throw std::runtime_error("Empty alignment");
+        }
+        num_taxa = sequences.size();
+        num_nucleotides = sequences[0].raw_seq.size();
+
+        for (const auto& s : sequences) {
+            if (s.raw_seq.size() != num_nucleotides) {
+                throw std::runtime_error("Sequences have unequal lengths in alignment");
+            }
+        }
+        num_codons = 0;
+
+        Vector4 nuc_counts = Vector4::Zero();
+        for (const auto& s : sequences) {
+            for (size_t i = 0; i < num_nucleotides; ++i) {
+                int8_t n = char_to_nuc(s.raw_seq[i]);
+                if (n >= 0 && n < 4) {
+                    nuc_counts(n) += 1.0;
+                }
+            }
+        }
+        Scalar total_nucs = nuc_counts.sum();
+        if (total_nucs > 0.0) {
+            nuc_frequencies = nuc_counts / total_nucs;
+        } else {
+            nuc_frequencies.setConstant(0.25);
+        }
+
+        patterns.clear();
+        site_to_pattern.resize(num_nucleotides);
+        std::unordered_map<std::string, size_t> pattern_map;
+
+        for (size_t site = 0; site < num_nucleotides; ++site) {
+            std::string col(num_taxa, 'N');
+            std::vector<int8_t> states(num_taxa, -1);
+
+            for (size_t t = 0; t < num_taxa; ++t) {
+                char nuc = sequences[t].raw_seq[site];
+                col[t] = nuc;
+                states[t] = char_to_nuc(nuc);
+            }
+
+            auto it = pattern_map.find(col);
+            if (it != pattern_map.end()) {
+                size_t p_idx = it->second;
+                patterns[p_idx].weight++;
+                patterns[p_idx].sites.push_back(site);
+                site_to_pattern[site] = p_idx;
+            } else {
+                size_t p_idx = patterns.size();
+                pattern_map[col] = p_idx;
+
+                SitePattern p;
+                p.states = std::move(states);
+                p.weight = 1;
+                p.sites.push_back(site);
+                patterns.push_back(std::move(p));
+                site_to_pattern[site] = p_idx;
+            }
+        }
+    }
+
+    Alignment slice_nucleotide(size_t start, size_t end) const {
+        if (start >= end || end > num_nucleotides) {
+            throw std::runtime_error("Invalid nucleotide slice range: [" +
+                                     std::to_string(start) + ", " + std::to_string(end) +
+                                     ") for alignment of length " + std::to_string(num_nucleotides));
+        }
+
+        Alignment slice;
+        slice.taxon_names = taxon_names;
+        slice.taxon_to_index = taxon_to_index;
+        slice.lower_taxon_to_index = lower_taxon_to_index;
+        slice.embedded_tree_newick = embedded_tree_newick;
+        slice.code = code;
+
+        size_t len = end - start;
+        slice.sequences.resize(num_taxa);
+        for (size_t t = 0; t < num_taxa; ++t) {
+            slice.sequences[t].name = sequences[t].name;
+            slice.sequences[t].raw_seq = sequences[t].raw_seq.substr(start, len);
+        }
+
+        slice.finalize_nucleotide();
+        return slice;
+    }
+
     Alignment to_nucleotide_alignment() const {
+        if (num_codons == 0 && !patterns.empty()) {
+            return *this;
+        }
         Alignment nuc_aln;
         nuc_aln.taxon_names = taxon_names;
         nuc_aln.taxon_to_index = taxon_to_index;

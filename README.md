@@ -121,6 +121,7 @@ HyPhy 3 computes exact analytical branch gradients in **one single combined pass
 | **aBSREL** | Which specific lineages/branches evolved under selection? | Lineage-specific | Adaptive complexity selection (AICc Step-Up) | Branch-site $\omega$ | — | $|\Delta \ln L| < 2.0$ |
 | **RELAX** | Has selection relaxed ($K<1$) or intensified ($K>1$) on test branches? | Branch-set contrast | 3-rate mixture with exponent $K$, $\chi^2_1$ LRT | Site mixture | — | 100% Verified |
 | **GTR / MG94** | What are baseline nucleotide biases & global $dN/dS$? | Alignment-wide | Reversible CTMC with F3x4 equilibrium | Global $\omega$ | Supported | 100% Verified |
+| **GARD** | Where are recombination breakpoints located? | Recombination & Topology | Segmented GTR + Neighbor-Joining, AICc selection | Independent segment rates | — | 100% Verified |
 | **Adjoint Core** | Differentiable tree likelihoods for custom ML models | Arbitrary parameters | Inside-Outside analytical $\mathcal{O}(B)$ gradients | User-defined | User-defined | Exact Analytical |
 
 ---
@@ -234,6 +235,18 @@ HyPhy 3 computes exact analytical branch gradients in **one single combined pass
 - **Native C++ Autograd Graph**: Reverse-mode automatic differentiation supporting custom evolutionary models and continuous rate distributions.
 - **PyTorch & JAX Bridge**: Zero-copy bindings via Nanobind allowing phylogenetic likelihood calculations to serve directly as differentiable loss functions within machine learning pipelines.
 
+#### 11. **GARD (Genetic Algorithm for Recombination Detection)**
+- **Scope**: Screens multiple sequence alignments (arbitrary length nucleotide alignments) for evidence of phylogenetic mosaicism and identifies recombination breakpoints.
+- **Workflow**:
+  1. Fits baseline GTR nucleotide substitution model to estimate global exchangeabilities and empirical base frequencies across the full alignment.
+  2. Divides alignment into candidate partition segments $[s_0, s_1), [s_1, s_2), \dots, [s_B, s_{B+1})$.
+  3. For each partition segment, infers a dedicated Saitou-Nei Neighbor-Joining (NJ) phylogenetic tree from TN93 / Jukes-Cantor pairwise distances, and optimizes branch lengths via fast decoupled GTR optimization (`GTRBranchLengthFitter`).
+  4. Evaluates small-sample Akaike Information Criterion ($\text{AIC}_c$) with parameter penalty $K = 5 + (B+1)(2N_{\text{taxa}} - 3)$ and minimum partition constraint $\Delta_{\min} = 2N_{\text{taxa}} - 3$.
+  5. Multi-breakpoint CHC Genetic Algorithm (and exhaustive single-breakpoint scan) searches the combinatorial space of partition placements with thread-safe segment caching (`PartitionCache`).
+  6. **Post-Hoc Topological Incongruence Test**: Evaluates whether partition-specific tree topologies provide a statistically significant improvement over a single shared topology constrained to the baseline NJ tree (`singleTreeAICc`).
+  7. Computes model-averaged site breakpoint support across all explored models via normalized Akaike weights.
+- **Outputs**: Best partition breakpoints, segment AICc scores, $\Delta\text{AIC}_c$ improvement, topological incongruence test, per-site breakpoint support weights, and dual modern v3 / legacy HyPhy 2.5 JSON export.
+
 ---
 
 ## 🛠️ Quickstart & Installation
@@ -287,6 +300,7 @@ HyPhy 3 provides both a unified driver (`hyphy3 <analysis>`) and dedicated stand
 | **BUSTED Auto-K**| `hyphy3 busted` | `--auto-k` | Automatic selection of rate categories via AICc step-up |
 | **aBSREL** | `hyphy3 absrel`| `--alignment`, `--tree`, `--rates 3`, `--threads N`, `--output` | Lineage-specific adaptive selection |
 | **RELAX** | `hyphy3 relax` | `--alignment`, `--tree`, `--test <regex|names>`, `--pvalue 0.05`, `--output` | Test for selection relaxation/intensification across branch sets |
+| **GARD** | `hyphy3 gard` | `--alignment`, `--max-breakpoints N`, `--rate-classes 1`, `--threads N`, `--output` | Recombination breakpoint detection via Genetic Algorithm and AICc |
 
 ### CLI Examples
 
@@ -326,6 +340,9 @@ hyphy3 absrel --alignment benchmarks/data/bglobin.nex --tree benchmarks/data/bgl
 
 # 11. Run RELAX (test for relaxed or intensified selection across branch sets)
 hyphy3 relax --alignment tests/data/Fig4E.nex --output Fig4E.RELAX.json --threads 8
+
+# 12. Run GARD (recombination detection with AICc model selection)
+hyphy3 gard --alignment tests/data/adh.nex --max-breakpoints 3 --output adh.GARD.json --threads 8
 ```
 
 All analyses output standardized, Datamonkey-compatible JSON files ready for direct visualization on [HyPhy Vision](https://vision.hyphy.org).
@@ -450,6 +467,22 @@ prime = hp.PRIMEAnalyzer.create_and_fit(prime_tree, prime_aln, prime_settings)
 prime_res = prime.run()
 sig_prime = [sr.site_index + 1 for sr in prime_res.site_results if sr.is_significant(0.10)]
 print(f"PRIME significant sites (q <= 0.10): {sig_prime}")
+
+# -------------------------------------------------------------
+# 9. GARD: Genetic Algorithm for Recombination Detection
+# -------------------------------------------------------------
+gard_aln = hp.Alignment.load_nucleotide("tests/data/adh.nex")
+gard_settings = hp.GARDSettings()
+gard_settings.max_breakpoints = 2
+
+gard = hp.GARDAnalyzer(gard_aln, gard_settings)
+gard_res = gard.run()
+
+print(f"GARD optimal breakpoints: {gard_res.best_breakpoints}")
+print(f"Baseline AICc: {gard_res.baseline_aicc:.2f}, Best AICc: {gard_res.best_aicc:.2f} (Delta = {gard_res.delta_aicc:.2f})")
+print(f"Topological incongruence: {gard_res.topological_incongruence}")
+for p in gard_res.partitions:
+    print(f"  Partition [{p.start_site}, {p.end_site}): length = {p.site_count} bp, tree = {p.tree_newick[:35]}...")
 ```
 
 ### PyTorch End-to-End Optimization

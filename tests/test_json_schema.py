@@ -390,6 +390,58 @@ def test_prime_modern_and_legacy_json_schema():
 
     print("PRIME Modern & Legacy JSON Schema tests passed successfully!")
 
+def test_gard_modern_and_legacy_json_schema():
+    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    aln_path = os.path.join(repo_root, "tests", "data", "adh.nex")
+    schema_path = os.path.join(repo_root, "schemas", "v3", "gard.v3.schema.json")
+
+    assert os.path.exists(aln_path), f"Missing alignment: {aln_path}"
+    assert os.path.exists(schema_path), f"Missing schema: {schema_path}"
+
+    with open(schema_path) as sf:
+        schema = json.load(sf)
+
+    aln = hp.Alignment.load_nucleotide(aln_path)
+    assert aln.num_taxa == 23
+    assert aln.num_nucleotides == 762
+
+    settings = hp.GARDSettings()
+    settings.input_file = aln_path
+    settings.run_mode = "Faster"
+    settings.max_breakpoints = 2
+    settings.quiet = True
+
+    analyzer = hp.GARDAnalyzer(aln, settings)
+    result = analyzer.run()
+
+    # 1. Test Modern JSON
+    modern_json_str = result.to_modern_json()
+    modern = json.loads(modern_json_str)
+
+    jsonschema.validate(instance=modern, schema=schema)
+    assert modern["$schema"] == "https://raw.githubusercontent.com/veg/hyphy-3/main/schemas/v3/gard.v3.schema.json"
+    assert modern["schema_version"] == "3.0.0"
+    assert modern["analysis"]["id"] == "gard"
+    assert modern["dataset"]["taxa_count"] == 23
+    assert modern["dataset"]["sites_count"] == 762
+    assert len(modern["model_selection"]["best_model_breakpoints"]) >= 1
+    assert modern["topology_test"]["topological_incongruence_supported"] is True
+
+    # 2. Test Legacy JSON
+    legacy_json_str = result.to_legacy_json()
+    legacy = json.loads(legacy_json_str)
+
+    assert "baselineScore" in legacy
+    assert "bestModelAICc" in legacy
+    assert "breakpointData" in legacy
+    assert "trees" in legacy
+    assert "improvements" in legacy
+    assert "singleTreeAICc" in legacy
+    assert "siteBreakPointSupport" in legacy
+    assert len(legacy["breakpointData"]) >= 2
+
+    print("GARD Modern & Legacy JSON Schema tests passed successfully!")
+
 if __name__ == "__main__":
     test_fel_modern_and_legacy_json_schema()
     test_fel_branch_subset_json_schema()
@@ -399,5 +451,6 @@ if __name__ == "__main__":
     test_relax_modern_and_legacy_json_schema()
     test_fubar_modern_and_legacy_json_schema()
     test_prime_modern_and_legacy_json_schema()
+    test_gard_modern_and_legacy_json_schema()
 
 

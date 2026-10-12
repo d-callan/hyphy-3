@@ -143,6 +143,79 @@ public:
     }
 };
 
+// Optimizes branch lengths on a fixed GTR model
+class GTRBranchLengthFitter {
+public:
+    static std::pair<Tree, Scalar> fit(
+        Tree tree,
+        const Alignment& aln,
+        const GTRParameters& params,
+        const Vector4& freqs,
+        int passes = 1
+    ) {
+        std::vector<int32_t> branch_node_ids;
+        for (const auto& node : tree.nodes) {
+            if (node.id != tree.root_id) {
+                branch_node_ids.push_back(node.id);
+            }
+        }
+        size_t num_branches = branch_node_ids.size();
+
+        Tree curr_tree = std::move(tree);
+        for (size_t b = 0; b < num_branches; ++b) {
+            int32_t nid = branch_node_ids[b];
+            if (curr_tree.nodes[nid].branch_length < 1e-6) {
+                curr_tree.nodes[nid].branch_length = 0.01;
+            }
+        }
+
+        std::vector<size_t> leaf_to_taxon = LikelihoodEngine::build_leaf_to_taxon_map(curr_tree, aln);
+
+        GTRMatrix gtr;
+        gtr.update(params, freqs);
+
+        auto eval_tree_lnl = [&](const Tree& t) -> Scalar {
+            return LikelihoodEngine::compute_gtr_log_likelihood(t, aln, gtr, &leaf_to_taxon);
+        };
+
+        // Stage 1: Scale factor optimization
+        auto scale_obj = [&](Scalar s) -> Scalar {
+            Tree t_scale = curr_tree;
+            for (size_t b = 0; b < num_branches; ++b) {
+                int32_t nid = branch_node_ids[b];
+                t_scale.nodes[nid].branch_length *= s;
+            }
+            return -eval_tree_lnl(t_scale);
+        };
+
+        auto [opt_s, _] = Brent1D::minimize(scale_obj, 0.01, 1.0, 50.0, 1e-3, 20);
+        for (size_t b = 0; b < num_branches; ++b) {
+            int32_t nid = branch_node_ids[b];
+            curr_tree.nodes[nid].branch_length *= opt_s;
+        }
+
+        // Stage 2: Coordinate sweeps
+        for (int p = 0; p < passes; ++p) {
+            for (size_t b = 0; b < num_branches; ++b) {
+                int32_t nid = branch_node_ids[b];
+                Scalar init_bl = curr_tree.nodes[nid].branch_length;
+                auto bl_obj = [&](Scalar bl) -> Scalar {
+                    Scalar old_bl = curr_tree.nodes[nid].branch_length;
+                    curr_tree.nodes[nid].branch_length = bl;
+                    Scalar lnl = eval_tree_lnl(curr_tree);
+                    curr_tree.nodes[nid].branch_length = old_bl;
+                    return -lnl;
+                };
+                auto [best_bl, _] = Brent1D::minimize(bl_obj, 1e-6, std::max(init_bl, static_cast<Scalar>(1e-4)), 5.0, 1e-3, 15);
+                curr_tree.nodes[nid].branch_length = best_bl;
+            }
+        }
+
+        Scalar final_lnl = eval_tree_lnl(curr_tree);
+        return {curr_tree, final_lnl};
+    }
+};
+
 struct FitResult {
     Scalar log_likelihood = 0.0;
     Vector x_opt;

@@ -94,8 +94,12 @@ add_executable(hyphy_prime_test tests/test_prime.cpp)
 target_link_libraries(hyphy_prime_test PRIVATE hyphy3_core)
 add_test(NAME PRIMETest COMMAND hyphy_prime_test)
 
+add_executable(hyphy_gard_test tests/test_gard.cpp)
+target_link_libraries(hyphy_gard_test PRIVATE hyphy3_core)
+add_test(NAME GARDTest COMMAND hyphy_gard_test)
 
-# Unified HyPhy 3 CLI Driver (hyphy3 fel ..., hyphy3 meme ..., hyphy3 busted ..., hyphy3 absrel ..., hyphy3 relax ..., hyphy3 fubar ..., hyphy3 prime ...)
+
+# Unified HyPhy 3 CLI Driver (hyphy3 fel ..., hyphy3 meme ..., hyphy3 busted ..., hyphy3 absrel ..., hyphy3 relax ..., hyphy3 fubar ..., hyphy3 prime ..., hyphy3 gard ...)
 add_executable(hyphy3
     src/apps/hyphy3.cpp
     src/apps/hyphy_fel.cpp
@@ -106,6 +110,7 @@ add_executable(hyphy3
     src/apps/hyphy_relax.cpp
     src/apps/hyphy_fubar.cpp
     src/apps/hyphy_prime.cpp
+    src/apps/hyphy_gard.cpp
 )
 target_compile_definitions(hyphy3 PRIVATE HYPHY3_COMBINED_DRIVER)
 target_link_libraries(hyphy3 PRIVATE hyphy3_core)
@@ -135,6 +140,9 @@ target_link_libraries(hyphy3-fubar PRIVATE hyphy3_core)
 add_executable(hyphy3-prime src/apps/hyphy_prime.cpp)
 target_link_libraries(hyphy3-prime PRIVATE hyphy3_core)
 
+add_executable(hyphy3-gard src/apps/hyphy_gard.cpp)
+target_link_libraries(hyphy3-gard PRIVATE hyphy3_core)
+
 # Backward-compatible aliases
 add_executable(hyphy-fel ALIAS hyphy3-fel)
 add_executable(hyphy-contrast-fel ALIAS hyphy3-contrast-fel)
@@ -144,6 +152,7 @@ add_executable(hyphy-absrel ALIAS hyphy3-absrel)
 add_executable(hyphy-relax ALIAS hyphy3-relax)
 add_executable(hyphy-fubar ALIAS hyphy3-fubar)
 add_executable(hyphy-prime ALIAS hyphy3-prime)
+add_executable(hyphy-gard ALIAS hyphy3-gard)
 
 # Python & nanobind bindings
 find_package(Python 3.8 COMPONENTS Interpreter Development.Module)

@@ -15,6 +15,7 @@ int run_absrel(int argc, char* argv[]);
 int run_relax(int argc, char* argv[]);
 int run_fubar(int argc, char* argv[]);
 int run_prime(int argc, char* argv[]);
+int run_gard(int argc, char* argv[]);
 
 void print_hyphy3_banner() {
     Panel::print_banner(
@@ -39,7 +40,8 @@ void print_hyphy3_usage(const char* prog) {
               << "  " << Console::brand("absrel       ") << "  Adaptive Branch-Site Random Effects Likelihood (lineage selection)\n"
               << "  " << Console::brand("relax        ") << "  Test for Selection Relaxation (branch set contrast)\n"
               << "  " << Console::brand("fubar        ") << "  Fast, Unconstrained Bayesian AppRoximation (Bayesian site selection)\n"
-              << "  " << Console::brand("prime        ") << "  PRoperty Informed Models of Evolution (biophysical property selection)\n\n";
+              << "  " << Console::brand("prime        ") << "  PRoperty Informed Models of Evolution (biophysical property selection)\n"
+              << "  " << Console::brand("gard         ") << "  Genetic Algorithm for Recombination Detection (breakpoint screening)\n\n";
 
     std::cout << Console::bold("General Options:") << "\n"
               << "  " << Console::brand("--help, -h   ") << "  Show this help message\n"
@@ -97,6 +99,8 @@ int main(int argc, char* argv[]) {
         return run_fubar(sub_argc, sub_argv.data());
     } else if (cmd == "prime" || cmd == "PRIME") {
         return run_prime(sub_argc, sub_argv.data());
+    } else if (cmd == "gard" || cmd == "GARD") {
+        return run_gard(sub_argc, sub_argv.data());
     } else {
         std::cerr << "Error: Unknown analysis '" << cmd << "'.\n\n";
         print_hyphy3_usage(argv[0]);
