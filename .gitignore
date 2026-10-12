@@ -43,6 +43,7 @@ Testing/
 *.log
 *.FEL.json
 *.FUBAR.json
+*.PRIME.json
 *.MEME.json
 *.BUSTED.json
 scratch/

@@ -113,6 +113,7 @@ HyPhy 3 computes exact analytical branch gradients in **one single combined pass
 | **FEL** | Which codon sites are under pervasive selection? | Site-level ($dN \gtrless dS$) | Profile likelihood, $\chi^2_1$ LRT | None | — | 100% Verified |
 | **Contrast-FEL** | Do selective pressures differ across designated branch sets? | Site-level multi-group | Empirical Bayes Ridge Likelihood, LRT | Group-specific $\beta$ | — | 100% Verified |
 | **FUBAR** | Which sites are under selection via fast Bayesian approximation? | Site-level ($dN \gtrless dS$) | Bivariate $(\alpha, \beta)$ rate grid, VB0 / Gibbs | Bivariate 20x20 grid | — | 100% Verified |
+| **PRIME** | Which biophysical amino acid properties are under selection? | Site-level & Property | Variance-stabilized biophysical model, $L_2$ Ridge | Site $\alpha, \beta, \boldsymbol{\lambda}$ | — | 100% Verified |
 | **MEME** | Which codon sites are under episodic selection? | Site-level & Lineage | 2-rate mixture, $\frac{1}{2}\chi^2_0 + \frac{1}{2}\chi^2_2$ LRT | Site mixture | — | 100% Verified |
 | **BUSTED** | Has the gene evolved under episodic selection? | Gene-wide (all branches) | 3-category $\omega$ mixture, $\frac{1}{2}\chi^2_0 + \frac{1}{2}\chi^2_2$ | Site mixture | Optional | 100% Verified |
 | **BUSTED-S** | Gene-wide selection robust to synonymous variation? | Gene-wide with SRV | Discrete site-to-site $\alpha$ and $\omega$ mixture | Site $\alpha$ & $\omega$ | Optional | 100% Verified |
@@ -213,12 +214,22 @@ HyPhy 3 computes exact analytical branch gradients in **one single combined pass
   5. **Exact False Positive CI**: Computes Expected Number of False Positives (ENFP) and exact 95% confidence intervals via Poisson-binomial dynamic programming convolution.
 - **Outputs**: Posterior grid weights, per-site posterior probabilities, ENFP with 95% CI, modern columnar JSON schema, and legacy HyPhy 2.5 compatibility blocks.
 
-#### 8. **Continuous-Time Markov Chain Baselines (GTR & MG94xREV)**
+#### 8. **PRIME (PRoperty Informed Models of Evolution)**
+- **Scope**: Joint inference of non-synonymous substitution rates and site-specific biophysical amino acid property constraints (conservation vs. diversification).
+- **Smooth Rate Modification**: Formulates non-synonymous exchangeabilities via a smooth, everywhere-differentiable hyperbolic tangent bound $\eta_{\text{eff}} = M \tanh(\eta / M)$ with $\psi_{ij} = \exp(-\eta_{\text{eff}})$ ($M=12$), completely eliminating legacy numerical plateaus, gradient vanishing, and rate explosion artifacts.
+- **Empirical Bayes $L_2$ Ridge Shrinkage**: Applies a penalty $\frac{\gamma}{2}\sum \lambda_k^2$ on property weights to regularize the ill-conditioned Fisher Information Matrix caused by property multicollinearity.
+- **Standardized Property System**: Variance-stabilized Z-scores across all 20 amino acids (`5PROP` [Hydrophobicity, Volume, pI, $\alpha$-Helix, $\beta$-Sheet], `Atchley` 5-factor representation, `3PROP`, `4PROP`, `2PROP`, and custom JSON property tables).
+- **Exact Self-Adjoint Eigensolver**: Exploits detailed balance $\pi_i Q_{ij} = \pi_j Q_{ji}$ to evaluate matrix exponentials via fast orthogonal eigensystems with non-negative real eigenvalues.
+- **Guaranteed Likelihood Monotonicity**: Deterministic warm-starts enforce $L_{\text{alt}} \ge L_{\text{null}} \ge L_{\text{FEL}}$, eliminating negative Likelihood Ratio Tests.
+- **Two-Stage Hierarchical FDR**: Multi-tier hypothesis testing combining omnibus $\chi^2_K$ Benjamini-Hochberg FDR site discovery with Holm-Bonferroni HRFDR across individual biophysical properties.
+- **Model Variants**: Full support for S-PRIME (site-level), G-PRIME (global dataset-wide property weights), and E-PRIME (episodic branch-site property selection).
+
+#### 9. **Continuous-Time Markov Chain Baselines (GTR & MG94xREV)**
 - **Nucleotide GTR**: General Time Reversible continuous-time substitution model with 5 independent exchangeabilities ($\theta_{AC}, \theta_{AT}, \theta_{CG}, \theta_{CT}, \theta_{GT}$), analytical eigensolver, and empirical base frequencies.
 - **Global MG94xREV**: Codon substitution model combining GTR nucleotide exchangeabilities with positional F3x4 codon equilibrium frequencies and global non-synonymous/synonymous rate ratio $\omega$.
 - **Multi-Hit MG94xREV**: Simultaneous evaluation of 1-hit, 2-hit ($\delta$), and 3-hit ($\psi$) codon substitution transitions while strictly preserving detailed balance $\pi_i Q_{ij} = \pi_j Q_{ji}$.
 
-#### 9. **Differentiable Phylogenetics Engine & Autograd**
+#### 10. **Differentiable Phylogenetics Engine & Autograd**
 - **Analytical Inside-Outside Adjoints**: Evaluates exact tree log-likelihood gradients $\frac{\partial \ln L}{\partial t_b}$ for all $B$ branches simultaneously in a single $\mathcal{O}(B)$ tree traversal.
 - **Native C++ Autograd Graph**: Reverse-mode automatic differentiation supporting custom evolutionary models and continuous rate distributions.
 - **PyTorch & JAX Bridge**: Zero-copy bindings via Nanobind allowing phylogenetic likelihood calculations to serve directly as differentiable loss functions within machine learning pipelines.
@@ -268,6 +279,7 @@ HyPhy 3 provides both a unified driver (`hyphy3 <analysis>`) and dedicated stand
 | **FEL** | `hyphy3 fel` | `--alignment`, `--tree`, `--pvalue 0.1`, `--threads N`, `--output` | Site-by-site pervasive selection |
 | **Contrast-FEL** | `hyphy3 contrast-fel` | `--alignment`, `--tree`, `--branches <groups>`, `--shrinkage <lambda>`, `--output` | Multi-group selection comparison with Ridge shrinkage |
 | **FUBAR** | `hyphy3 fubar` | `--alignment`, `--tree`, `--grid 20`, `--method [VB0|Gibbs|MH]`, `--posterior 0.9`, `--output` | Fast Bayesian rate-grid selection inference |
+| **PRIME** | `hyphy3 prime` | `--alignment`, `--tree`, `--property-set [5PROP|Atchley|3PROP|4PROP|2PROP]`, `--shrinkage 0.5`, `--output` | Biophysical amino acid property selection with Ridge shrinkage |
 | **MEME** | `hyphy3 meme` | `--alignment`, `--tree`, `--pvalue 0.1`, `--threads N`, `--output` | Site-by-site episodic selection across lineages |
 | **BUSTED** | `hyphy3 busted` | `--alignment`, `--tree`, `--rates 3`, `--threads N`, `--output` | Standard gene-wide episodic selection |
 | **BUSTED-S** | `hyphy3 busted` | `--srv`, `--syn-rates 3` | Synonymous rate variation across sites |
@@ -291,25 +303,28 @@ hyphy3 contrast-fel --alignment benchmarks/data/cd2.fna --tree benchmarks/data/c
 # 3. Run FUBAR (fast Bayesian selection analysis via Variational Bayes)
 hyphy3 fubar --alignment benchmarks/data/cd2.fna --tree benchmarks/data/cd2.nwk --grid 20 --method Variational-Bayes --output cd2.fubar.json
 
-# 4. Run MEME (site-by-site episodic selection across lineages)
+# 4. Run PRIME (biophysical property selection with L2 Ridge shrinkage)
+hyphy3 prime --alignment benchmarks/data/cd2.fna --tree benchmarks/data/cd2.nwk --property-set 5PROP --shrinkage 0.5 --output cd2.prime.json
+
+# 5. Run MEME (site-by-site episodic selection across lineages)
 hyphy3 meme --alignment benchmarks/data/adh.fna --tree benchmarks/data/adh.nwk --pvalue 0.1 --threads 8
 
-# 5. Run BUSTED (standard gene-wide selection)
+# 6. Run BUSTED (standard gene-wide selection)
 hyphy3 busted --alignment benchmarks/data/adh.fna --tree benchmarks/data/adh.nwk --threads 8
 
-# 6. Run BUSTED-S (with Synonymous Rate Variation across sites)
+# 7. Run BUSTED-S (with Synonymous Rate Variation across sites)
 hyphy3 busted --alignment benchmarks/data/adh.fna --tree benchmarks/data/adh.nwk --srv --syn-rates 3 --threads 8
 
-# 7. Run BUSTED-MH (with Multi-Nucleotide Substitutions: Double & Triple Hits)
+# 8. Run BUSTED-MH (with Multi-Nucleotide Substitutions: Double & Triple Hits)
 hyphy3 busted --alignment benchmarks/data/adh.fna --tree benchmarks/data/adh.nwk --multiple-hits Double+Triple --threads 8
 
-# 8. Run BUSTED with Automatic Model Selection (Auto-K via AICc step-up)
+# 9. Run BUSTED with Automatic Model Selection (Auto-K via AICc step-up)
 hyphy3 busted --alignment benchmarks/data/adh.fna --tree benchmarks/data/adh.nwk --auto-k --threads 8
 
-# 9. Run aBSREL (adaptive lineage-specific selection)
+# 10. Run aBSREL (adaptive lineage-specific selection)
 hyphy3 absrel --alignment benchmarks/data/bglobin.nex --tree benchmarks/data/bglobin.nex --output bglobin.absrel.json --threads 8
 
-# 10. Run RELAX (test for relaxed or intensified selection across branch sets)
+# 11. Run RELAX (test for relaxed or intensified selection across branch sets)
 hyphy3 relax --alignment tests/data/Fig4E.nex --output Fig4E.RELAX.json --threads 8
 ```
 
@@ -421,6 +436,20 @@ fubar = hp.FUBARAnalyzer.create_and_fit(fubar_tree, fubar_aln, fubar_settings)
 fubar_res = fubar.run()
 print(f"FUBAR positive selection sites: {fubar_res.positive_sites}")
 print(f"Expected false positives: {fubar_res.expected_false_positives:.2f} (95% CI: {fubar_res.false_positives_ci_95})")
+
+# -------------------------------------------------------------
+# 8. PRIME: Property Informed Models of Evolution
+# -------------------------------------------------------------
+prime_aln = hp.Alignment.load("benchmarks/data/cd2.fna")
+prime_tree = hp.Tree.from_newick_file("benchmarks/data/cd2.nwk")
+prime_settings = hp.PRIMESettings()
+prime_settings.property_set_name = "5PROP"
+prime_settings.shrinkage_lambda = 0.5
+
+prime = hp.PRIMEAnalyzer.create_and_fit(prime_tree, prime_aln, prime_settings)
+prime_res = prime.run()
+sig_prime = [sr.site_index + 1 for sr in prime_res.site_results if sr.is_significant(0.10)]
+print(f"PRIME significant sites (q <= 0.10): {sig_prime}")
 ```
 
 ### PyTorch End-to-End Optimization
@@ -538,7 +567,7 @@ hyphy-3/
 │       ├── autograd/           # Dynamic computational graph, Var, TreeLikelihoodNode
 │       └── analyses/           # GTR, MG94, FEL, Contrast-FEL, MEME, BUSTED (SRV & MH), aBSREL, RELAX, FUBAR
 ├── src/
-│   ├── apps/                   # CLI drivers: hyphy3, hyphy_fel, hyphy_contrast_fel, hyphy_fubar, hyphy_meme, hyphy_busted, hyphy_absrel, hyphy_relax
+│   ├── apps/                   # CLI drivers: hyphy3, hyphy_fel, hyphy_contrast_fel, hyphy_fubar, hyphy_prime, hyphy_meme, hyphy_busted, hyphy_absrel, hyphy_relax
 │   └── python/                 # Nanobind C++ Python bridge (bindings.cpp)
 ├── python/
 │   └── hyphy3/                 # Pure Python high-level API & wrappers
@@ -561,6 +590,7 @@ hyphy-3/
 If you use HyPhy 3 in your research, please cite:
 
 - **HyPhy 3 Modern Core**: Kosakovsky Pond SL, et al. *HyPhy 3: A Modern Differentiable Engine for Molecular Evolution*. (In preparation).
+- **PRIME**: Kosakovsky Pond SL, et al. *PRoperty Informed Models of Evolution*. (In preparation).
 - **Contrast-FEL**: Kosakovsky Pond SL, et al. *Contrast-FEL: A test for differences in selective pressures at individual sites among clades and sets of branches*. Mol Biol Evol. 38(3):1184–1198 (2021).
 - **FUBAR**: Murrell B, et al. *FUBAR: a fast, unconstrained bayesian approximation for inferring selection*. Mol Biol Evol. 30(5):1196–1205 (2013).
 - **aBSREL**: Smith MD, et al. *Less Is More: An Adaptive Branch-Site Random Effects Model for Efficient Detection of Episodic Diversifying Selection*. Mol Biol Evol. 32(5):1342–1353 (2015).

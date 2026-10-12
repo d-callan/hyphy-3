@@ -341,6 +341,55 @@ def test_fubar_modern_and_legacy_json_schema():
 
     print("FUBAR Modern & Legacy JSON Schema tests passed successfully!")
 
+def test_prime_modern_and_legacy_json_schema():
+    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    aln_path = os.path.join(repo_root, "..", "hyphy", "hyphy-next", "benchmarks", "data", "cd2.fna")
+    tree_path = os.path.join(repo_root, "..", "hyphy", "hyphy-next", "benchmarks", "data", "cd2_fitted.nwk")
+    schema_path = os.path.join(repo_root, "schemas", "v3", "prime.v3.schema.json")
+
+    assert os.path.exists(aln_path), f"Missing alignment: {aln_path}"
+    assert os.path.exists(tree_path), f"Missing tree: {tree_path}"
+    assert os.path.exists(schema_path), f"Missing schema: {schema_path}"
+
+    with open(schema_path) as sf:
+        schema = json.load(sf)
+
+    aln = hp.Alignment.from_fasta(aln_path)
+    tree = hp.Tree.from_newick_file(tree_path)
+
+    settings = hp.PRIMESettings()
+    settings.property_set = "5PROP"
+    settings.shrinkage_lambda = 0.5
+    settings.fit_global = False
+
+    prime_analyzer = hp.PRIMEAnalyzer.create_and_fit(tree, aln, settings)
+    result = prime_analyzer.run(False, False)
+
+    # 1. Test Modern JSON
+    modern_json_str = result.to_modern_json(tree, aln, "hyphy3 prime", aln_path)
+    modern = json.loads(modern_json_str)
+
+    jsonschema.validate(instance=modern, schema=schema)
+    assert modern["$schema"] == "https://raw.githubusercontent.com/veg/hyphy-3/main/schemas/v3/prime.v3.schema.json"
+    assert modern["schema_version"] == "3.0.0"
+    assert modern["analysis"]["id"] == "prime"
+    assert modern["dataset"]["codon_sites"] == 187
+    assert len(modern["site_results"]["data"]["site"]) == 187
+    assert len(modern["properties"]) == 5
+
+    # 2. Test Legacy JSON
+    legacy_json_str = result.to_legacy_json(tree, aln, aln_path)
+    legacy = json.loads(legacy_json_str)
+
+    assert "MLE" in legacy
+    assert "headers" in legacy["MLE"]
+    assert "content" in legacy["MLE"]
+    assert "0" in legacy["MLE"]["content"]
+    assert len(legacy["MLE"]["content"]["0"]) == 187
+    assert "test results" in legacy
+
+    print("PRIME Modern & Legacy JSON Schema tests passed successfully!")
+
 if __name__ == "__main__":
     test_fel_modern_and_legacy_json_schema()
     test_fel_branch_subset_json_schema()
@@ -349,4 +398,6 @@ if __name__ == "__main__":
     test_absrel_modern_and_legacy_json_schema()
     test_relax_modern_and_legacy_json_schema()
     test_fubar_modern_and_legacy_json_schema()
+    test_prime_modern_and_legacy_json_schema()
+
 
