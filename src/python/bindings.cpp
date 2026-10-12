@@ -6,6 +6,7 @@
 #include <nanobind/stl/shared_ptr.h>
 #include <nanobind/stl/unordered_map.h>
 #include <nanobind/stl/map.h>
+#include <nanobind/stl/function.h>
 #include <nanobind/eigen/dense.h>
 
 #include "hyphy/core/types.hpp"
@@ -564,9 +565,16 @@ NB_MODULE(_hyphy3, m) {
         .def_static("create_and_fit", [](Tree tree, Alignment aln, const PRIMESettings& settings) {
             return PRIMEAnalyzer::create_and_fit(std::move(tree), std::move(aln), settings);
         }, "tree"_a, "alignment"_a, "settings"_a = PRIMESettings{})
-        .def("run", [](PRIMEAnalyzer& prime, bool show_progress, bool force_progress) {
-            return prime.run(nullptr, show_progress, force_progress);
-        }, "show_progress"_a = false, "force_progress"_a = false);
+        .def("run", [](
+            PRIMEAnalyzer& prime,
+            bool show_progress,
+            bool force_progress,
+            std::function<void(size_t, const PRIMESiteResult&)> site_cb,
+            std::function<void(size_t, size_t, size_t, const PRIMESiteResult&)> live_site_cb
+        ) {
+            return prime.run(nullptr, show_progress, force_progress, site_cb, live_site_cb);
+        }, "show_progress"_a = false, "force_progress"_a = false,
+           "site_callback"_a = nb::none(), "live_site_callback"_a = nb::none());
 
     // Differentiable Engine: Inside-Outside Likelihood and Analytical Adjoint Gradients!
     m.def("compute_branch_length_gradients", [](

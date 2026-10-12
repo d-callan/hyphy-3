@@ -93,6 +93,14 @@ public:
         }
     }
 
+    size_t completed() const {
+        return completed_.load(std::memory_order_relaxed);
+    }
+
+    size_t total() const {
+        return total_;
+    }
+
     // Conclude progress bar with an optional completion summary line
     void finish(const std::string& summary_message = "") {
         if (is_finished_.exchange(true)) return;

@@ -238,3 +238,37 @@ TEST_CASE("PRIME: Full S-PRIME Inference on cd2.fna with Guaranteed Nesting Mono
     CHECK(legacy_json["MLE"]["content"]["0"].size() == aln.num_codons);
     CHECK(legacy_json["MLE"]["headers"].size() == 12 + 3 * 5); // 12 standard + 3*5 property columns = 27
 }
+
+TEST_CASE("PRIME site-level progress callbacks") {
+    std::string aln_path = "benchmarks/data/cd2.fna";
+    std::string tree_path = "benchmarks/data/cd2.nwk";
+    Alignment aln = Alignment::from_fasta(aln_path);
+    Tree tree = Tree::from_newick_file(tree_path);
+
+    PRIMESettings settings;
+    settings.property_set = "5PROP";
+    settings.fit_global = false;
+
+    auto analyzer = PRIMEAnalyzer::create_and_fit(tree, aln, settings);
+
+    std::atomic<size_t> live_cb_count{0};
+    size_t final_cb_count = 0;
+
+    auto live_cb = [&](size_t site_idx, size_t cur_done, size_t total, const PRIMESiteResult& res) {
+        live_cb_count.fetch_add(1, std::memory_order_relaxed);
+        CHECK(site_idx < aln.num_codons);
+        CHECK(cur_done <= total);
+        CHECK(total == aln.num_codons);
+        CHECK(res.omnibus_p_value >= 0.0);
+    };
+
+    auto final_cb = [&](size_t site_idx, const PRIMESiteResult& res) {
+        final_cb_count++;
+        CHECK(site_idx < aln.num_codons);
+        CHECK(res.omnibus_q_value >= 0.0);
+    };
+
+    auto results = analyzer.run(nullptr, false, false, final_cb, live_cb);
+    CHECK(live_cb_count.load() == aln.num_codons);
+    CHECK(final_cb_count == aln.num_codons);
+}

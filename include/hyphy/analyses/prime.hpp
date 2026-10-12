@@ -778,8 +778,17 @@ public:
         }
     }
 
+    using SiteProgressCallback = std::function<void(size_t site_idx, const PRIMESiteResult& res)>;
+    using LiveSiteProgressCallback = std::function<void(size_t site_idx, size_t completed_sites, size_t total_sites, const PRIMESiteResult& res)>;
+
     // Runs Site-Level Property Inference (S-PRIME)
-    PRIMEResult run(ProgressBar* progress = nullptr, bool show_progress = true, bool force_progress = false) {
+    PRIMEResult run(
+        ProgressBar* progress = nullptr,
+        bool show_progress = true,
+        bool force_progress = false,
+        SiteProgressCallback site_callback = nullptr,
+        LiveSiteProgressCallback live_site_callback = nullptr
+    ) {
         auto start_time = std::chrono::high_resolution_clock::now();
         size_t num_patterns = aln.patterns.size();
         size_t num_codons = aln.num_codons;
@@ -810,12 +819,23 @@ public:
 
         std::unique_ptr<ProgressBar> pb_owned;
         ProgressBar* pb = progress;
-        if (!pb && show_progress) {
-            pb_owned = std::make_unique<ProgressBar>(num_patterns, "S-PRIME site patterns", "patterns", force_progress);
+        if (!pb && show_progress && (force_progress || ProgressBar::is_terminal())) {
+            pb_owned = std::make_unique<ProgressBar>(
+                num_codons,
+                "[S-PRIME] Codon Sites",
+                "codons",
+                force_progress,
+                ProgressBar::Style::SmoothBlocks
+            );
             pb = pb_owned.get();
         }
 
         std::vector<PRIMESiteResult> pattern_prime_results(num_patterns);
+        std::atomic<size_t> num_sig_sites{0};
+        std::atomic<size_t> num_cons_props{0};
+        std::atomic<size_t> num_chg_props{0};
+        std::atomic<size_t> completed_sites{0};
+        std::mutex callback_mutex;
 
         #pragma omp parallel
         {
@@ -830,8 +850,39 @@ public:
                     thread_node_L, thread_node_scale, P_branches
                 );
 
+                const auto& pat_res = pattern_prime_results[p];
+                size_t w = aln.patterns[p].weight;
+                size_t cur_done = completed_sites.fetch_add(w, std::memory_order_relaxed) + w;
+
+                if (pat_res.omnibus_p_value <= settings.p_value_threshold) {
+                    num_sig_sites.fetch_add(w, std::memory_order_relaxed);
+                }
+                for (const auto& pr : pat_res.properties) {
+                    if (pr.p_value <= settings.stage2_p_value) {
+                        if (pr.lambda > 0.0) {
+                            num_cons_props.fetch_add(w, std::memory_order_relaxed);
+                        } else if (pr.lambda < 0.0) {
+                            num_chg_props.fetch_add(w, std::memory_order_relaxed);
+                        }
+                    }
+                }
+
+                if (live_site_callback) {
+                    std::lock_guard<std::mutex> lock(callback_mutex);
+                    for (size_t site : aln.patterns[p].sites) {
+                        PRIMESiteResult site_res = pat_res;
+                        site_res.site_index = site;
+                        live_site_callback(site, cur_done, num_codons, site_res);
+                    }
+                }
+
                 if (pb) {
-                    pb->tick();
+                    pb->set_status(
+                        "sig: " + std::to_string(num_sig_sites.load(std::memory_order_relaxed)) +
+                        " (cons: " + std::to_string(num_cons_props.load(std::memory_order_relaxed)) +
+                        ", chg: " + std::to_string(num_chg_props.load(std::memory_order_relaxed)) + ")"
+                    );
+                    pb->tick(w);
                 }
             }
         }
@@ -928,6 +979,13 @@ public:
                 } else {
                     p_inf.classification = "Neutral";
                 }
+            }
+        }
+
+        // Invoke site_callback with finalized site results
+        if (site_callback) {
+            for (size_t site = 0; site < num_codons; ++site) {
+                site_callback(site, site_results[site]);
             }
         }
 
