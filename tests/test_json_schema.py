@@ -442,6 +442,102 @@ def test_gard_modern_and_legacy_json_schema():
 
     print("GARD Modern & Legacy JSON Schema tests passed successfully!")
 
+def test_slac_modern_and_legacy_json_schema():
+    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    aln_path = os.path.join(repo_root, "..", "hyphy", "hyphy-next", "benchmarks", "data", "cd2.fna")
+    if not os.path.exists(aln_path):
+        aln_path = os.path.join(repo_root, "benchmarks", "data", "cd2.fna")
+    tree_path = os.path.join(repo_root, "..", "hyphy", "hyphy-next", "benchmarks", "data", "cd2_fitted.nwk")
+    if not os.path.exists(tree_path):
+        tree_path = os.path.join(repo_root, "benchmarks", "data", "cd2.nwk")
+    schema_path = os.path.join(repo_root, "schemas", "v3", "slac.v3.schema.json")
+
+    assert os.path.exists(aln_path), f"Missing alignment: {aln_path}"
+    assert os.path.exists(tree_path), f"Missing tree: {tree_path}"
+    assert os.path.exists(schema_path), f"Missing schema: {schema_path}"
+
+    with open(schema_path) as sf:
+        schema = json.load(sf)
+
+    aln = hp.Alignment.from_fasta(aln_path)
+    tree = hp.Tree.from_newick_file(tree_path)
+
+    settings = hp.SLACSettings()
+    settings.samples = 20
+    settings.p_value_threshold = 0.1
+    settings.full_model = False
+
+    slac = hp.SLACAnalyzer.create_and_fit(tree, aln, settings)
+    result = slac.run(False, False)
+
+    # 1. Test Modern JSON
+    modern_json_str = result.to_modern_json(aln_path, tree_path)
+    modern = json.loads(modern_json_str)
+
+    jsonschema.validate(instance=modern, schema=schema)
+    assert modern["$schema"] == "https://raw.githubusercontent.com/veg/hyphy-3/main/schemas/v3/slac.v3.schema.json"
+    assert modern["schema_version"] == "3.0.0"
+    assert modern["analysis"]["id"] == "slac"
+    assert modern["software"]["name"] == "hyphy"
+    assert modern["dataset"]["codon_sites"] == 187
+    assert len(modern["site_results"]["data"]["site"]) == 187
+    assert len(modern["site_results"]["data"]["ES"]) == 187
+    assert len(modern["site_results"]["data"]["S"]) == 187
+    assert len(modern["site_results"]["data"]["p_positive"]) == 187
+
+    # 2. Test Legacy JSON
+    legacy_json_str = result.to_legacy_json(aln_path, tree_path)
+    legacy = json.loads(legacy_json_str)
+
+    assert "MLE" in legacy
+    assert "headers" in legacy["MLE"]
+    assert len(legacy["MLE"]["headers"]) == 11
+    assert "content" in legacy["MLE"]
+    assert "0" in legacy["MLE"]["content"]
+    assert "by-site" in legacy["MLE"]["content"]["0"]
+    assert "RESOLVED" in legacy["MLE"]["content"]["0"]["by-site"]
+    assert "AVERAGED" in legacy["MLE"]["content"]["0"]["by-site"]
+    assert len(legacy["MLE"]["content"]["0"]["by-site"]["RESOLVED"]) == 187
+    assert "by-branch" in legacy["MLE"]["content"]["0"]
+    assert "branch attributes" in legacy
+    assert "fits" in legacy
+    assert "sample-median" in legacy
+
+    # 3. Check Numerical Parity between Modern Columnar and Legacy Array-of-Arrays
+    site_data = modern["site_results"]["data"]
+    for i in range(187):
+        leg_row = legacy["MLE"]["content"]["0"]["by-site"]["RESOLVED"][i]
+        assert abs(site_data["ES"][i] - leg_row[0]) < 1e-9
+        assert abs(site_data["EN"][i] - leg_row[1]) < 1e-9
+        assert abs(site_data["S"][i] - leg_row[2]) < 1e-9
+        assert abs(site_data["N"][i] - leg_row[3]) < 1e-9
+        assert abs(site_data["P_S"][i] - leg_row[4]) < 1e-9
+        assert abs(site_data["p_positive"][i] - leg_row[8]) < 1e-9
+        assert abs(site_data["p_negative"][i] - leg_row[9]) < 1e-9
+
+    print("SLAC Modern & Legacy JSON Schema tests passed successfully!")
+
+def test_dfel_json_schema():
+    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    json_path = os.path.join(repo_root, "tests", "data", "adh.nex.dFEL.json")
+    schema_path = os.path.join(repo_root, "schemas", "v3", "dfel.v3.schema.json")
+
+    assert os.path.exists(json_path), f"Missing dFEL json: {json_path}"
+    assert os.path.exists(schema_path), f"Missing schema: {schema_path}"
+
+    with open(schema_path) as sf:
+        schema = json.load(sf)
+
+    with open(json_path) as jf:
+        instance = json.load(jf)
+
+    jsonschema.validate(instance=instance, schema=schema)
+    assert instance["analysis"]["id"] == "dfel"
+    assert instance["compositional_heterogeneity"]["is_heterogeneous"] is True
+    assert len(instance["root_selection"]["candidates"]) > 0
+    assert len(instance["site_results"]["data"]["site"]) == 254
+    print("dFEL Modern JSON Schema validation passed successfully!")
+
 if __name__ == "__main__":
     test_fel_modern_and_legacy_json_schema()
     test_fel_branch_subset_json_schema()
@@ -452,5 +548,8 @@ if __name__ == "__main__":
     test_fubar_modern_and_legacy_json_schema()
     test_prime_modern_and_legacy_json_schema()
     test_gard_modern_and_legacy_json_schema()
+    test_slac_modern_and_legacy_json_schema()
+    test_dfel_json_schema()
+
 
 

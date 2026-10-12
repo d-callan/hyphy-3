@@ -8,6 +8,7 @@ Zero network access required; works directly via file://, double-click in Finder
 import sys
 import os
 import json
+import re
 
 def build_standalone_html(json_path, output_html_path, title=None):
     dir_path = os.path.dirname(os.path.abspath(__file__))
@@ -23,13 +24,23 @@ def build_standalone_html(json_path, output_html_path, title=None):
     with open(dist_css_path, "r", encoding="utf-8") as f:
         css_code = f.read()
 
+    # Strip sourcemaps so browser doesn't try to fetch local file:// sourcemap URLs
+    js_code = re.sub(r'//# sourceMappingURL=.*', '', js_code)
+    css_code = re.sub(r'/\*# sourceMappingURL=.* \*/', '', css_code)
+
     with open(json_path, "r", encoding="utf-8") as f:
         data_json_str = f.read()
 
     data_obj = json.loads(data_json_str)
     a_id = (data_obj.get("analysis", {}).get("id") or "").lower()
-    is_meme = a_id == "meme" or "beta_plus" in data_obj.get("site_results", {}).get("data", {})
+    a_info = (data_obj.get("analysis", {}).get("info") or "").lower()
+    has_beta_plus = "beta_plus" in data_obj.get("site_results", {}).get("data", {})
+    headers = [str(h[0]).lower() for h in data_obj.get("MLE", {}).get("headers", [])]
+    has_meme_header = any(("beta" in h and ("+" in h or "plus" in h or "2" in h)) for h in headers)
+    is_meme = a_id == "meme" or "meme" in a_info or has_beta_plus or has_meme_header
+
     method_badge = "MEME • Episodic Selection" if is_meme else "FEL • Pervasive Selection"
+    viewer_tag = "hyphy-meme-viewer" if is_meme else "hyphy-fel-viewer"
 
     doc_title = title or f"HyPhy {method_badge} — {os.path.basename(json_path)}"
 
@@ -108,10 +119,13 @@ def build_standalone_html(json_path, output_html_path, title=None):
       min-height: 0;
       display: flex;
       position: relative;
+      overflow-y: auto;
+      overflow-x: hidden;
     }}
-    hyphy-fel-viewer {{
+    hyphy-fel-viewer, hyphy-meme-viewer {{
       width: 100%;
       height: 100%;
+      display: block;
     }}
     /* Inlined Component Styles */
     {css_code}
@@ -130,7 +144,7 @@ def build_standalone_html(json_path, output_html_path, title=None):
       </div>
     </nav>
     <div id="viewer-mount">
-      <hyphy-fel-viewer id="fel-viewer" theme="light"></hyphy-fel-viewer>
+      <{viewer_tag} id="fel-viewer" theme="light"></{viewer_tag}>
     </div>
   </div>
 
@@ -140,18 +154,29 @@ def build_standalone_html(json_path, output_html_path, title=None):
 
     const payload = {data_json_str};
 
-    window.addEventListener('DOMContentLoaded', function() {{
+    function startViewer() {{
       const viewer = document.getElementById('fel-viewer');
-      if (viewer && viewer.load) {{
+      if (window.customElements && customElements.whenDefined) {{
+        customElements.whenDefined('{viewer_tag}').then(function() {{
+          if (viewer && typeof viewer.load === 'function') {{
+            viewer.load(payload);
+          }}
+        }});
+      }} else if (viewer && typeof viewer.load === 'function') {{
         viewer.load(payload);
-      }} else {{
-        // Direct JS fallback
+      }} else if (typeof HyPhyFELViewer !== 'undefined' && HyPhyFELViewer.HyPhyFELViewer) {{
         const mount = document.getElementById('viewer-mount');
         mount.innerHTML = '';
         const v = new HyPhyFELViewer.HyPhyFELViewer(mount, {{ theme: 'light' }});
         v.load(payload);
       }}
-    }});
+    }}
+
+    if (document.readyState === 'loading') {{
+      document.addEventListener('DOMContentLoaded', startViewer);
+    }} else {{
+      startViewer();
+    }}
   </script>
 </body>
 </html>

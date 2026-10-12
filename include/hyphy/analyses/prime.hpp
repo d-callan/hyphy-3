@@ -10,6 +10,7 @@
 #include "hyphy/opt/nelder_mead.hpp"
 #include "hyphy/opt/optimizer.hpp"
 #include "hyphy/analyses/fel.hpp"
+#include "hyphy/analyses/site_visualizer.hpp"
 #include "nlohmann/json.hpp"
 
 #include <vector>
@@ -783,7 +784,7 @@ public:
 
     // Runs Site-Level Property Inference (S-PRIME)
     PRIMEResult run(
-        ProgressBar* progress = nullptr,
+        ProgressBar* /* progress */ = nullptr,
         bool show_progress = true,
         bool force_progress = false,
         SiteProgressCallback site_callback = nullptr,
@@ -817,23 +818,18 @@ public:
             fel_pattern_results[p] = fel_analyzer.analyze_pattern(p, leaf_to_taxon);
         }
 
-        std::unique_ptr<ProgressBar> pb_owned;
-        ProgressBar* pb = progress;
-        if (!pb && show_progress && (force_progress || ProgressBar::is_terminal())) {
-            pb_owned = std::make_unique<ProgressBar>(
-                num_codons,
-                "[S-PRIME] Codon Sites",
-                "codons",
-                force_progress,
-                ProgressBar::Style::SmoothBlocks
-            );
-            pb = pb_owned.get();
-        }
+        SiteVisualizer viz(num_codons, num_patterns, SiteVisualizerConfig{
+            .method_name = "S-PRIME",
+            .p_value_threshold = settings.p_value_threshold,
+            .pos_label = "changing",
+            .neg_label = "conserved",
+            .sig_label = "omnibus sig",
+            .quiet = !show_progress,
+            .force_tty = force_progress,
+            .enable_chart = true
+        });
 
         std::vector<PRIMESiteResult> pattern_prime_results(num_patterns);
-        std::atomic<size_t> num_sig_sites{0};
-        std::atomic<size_t> num_cons_props{0};
-        std::atomic<size_t> num_chg_props{0};
         std::atomic<size_t> completed_sites{0};
         std::mutex callback_mutex;
 
@@ -854,18 +850,35 @@ public:
                 size_t w = aln.patterns[p].weight;
                 size_t cur_done = completed_sites.fetch_add(w, std::memory_order_relaxed) + w;
 
+                SiteSelectionType type = SiteSelectionType::Neutral;
+                std::string detail;
                 if (pat_res.omnibus_p_value <= settings.p_value_threshold) {
-                    num_sig_sites.fetch_add(w, std::memory_order_relaxed);
-                }
-                for (const auto& pr : pat_res.properties) {
-                    if (pr.p_value <= settings.stage2_p_value) {
-                        if (pr.lambda > 0.0) {
-                            num_cons_props.fetch_add(w, std::memory_order_relaxed);
-                        } else if (pr.lambda < 0.0) {
-                            num_chg_props.fetch_add(w, std::memory_order_relaxed);
+                    std::string cons_names, chg_names;
+                    for (const auto& pr : pat_res.properties) {
+                        if (pr.p_value <= settings.stage2_p_value) {
+                            std::string short_name = pr.property_name.substr(0, std::min<size_t>(5, pr.property_name.size()));
+                            if (pr.lambda > 0.0) {
+                                cons_names += (cons_names.empty() ? "" : ",") + short_name;
+                            } else if (pr.lambda < 0.0) {
+                                chg_names += (chg_names.empty() ? "" : ",") + short_name;
+                            }
                         }
                     }
+                    if (!chg_names.empty() && cons_names.empty()) {
+                        type = SiteSelectionType::Positive;
+                        detail = "▲ Chg:" + chg_names + ", p=" + SiteVisualizer::format_pvalue(pat_res.omnibus_p_value);
+                    } else if (!cons_names.empty() && chg_names.empty()) {
+                        type = SiteSelectionType::Negative;
+                        detail = "▼ Cons:" + cons_names + ", p=" + SiteVisualizer::format_pvalue(pat_res.omnibus_p_value);
+                    } else {
+                        type = SiteSelectionType::Significant;
+                        detail = "★ p=" + SiteVisualizer::format_pvalue(pat_res.omnibus_p_value);
+                        if (!cons_names.empty()) detail += " (Cons:" + cons_names + ")";
+                        if (!chg_names.empty()) detail += " (Chg:" + chg_names + ")";
+                    }
                 }
+
+                viz.record_pattern(p, aln.patterns[p].sites, type, pat_res.omnibus_p_value, pat_res.omnibus_lrt, detail);
 
                 if (live_site_callback) {
                     std::lock_guard<std::mutex> lock(callback_mutex);
@@ -875,19 +888,10 @@ public:
                         live_site_callback(site, cur_done, num_codons, site_res);
                     }
                 }
-
-                if (pb) {
-                    pb->set_status(
-                        "sig: " + std::to_string(num_sig_sites.load(std::memory_order_relaxed)) +
-                        " (cons: " + std::to_string(num_cons_props.load(std::memory_order_relaxed)) +
-                        ", chg: " + std::to_string(num_chg_props.load(std::memory_order_relaxed)) + ")"
-                    );
-                    pb->tick(w);
-                }
             }
         }
 
-        if (pb) pb->finish();
+        viz.finish();
 
         // Map pattern results to site results
         std::vector<PRIMESiteResult> site_results(num_codons);

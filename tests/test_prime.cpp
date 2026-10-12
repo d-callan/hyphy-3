@@ -240,8 +240,8 @@ TEST_CASE("PRIME: Full S-PRIME Inference on cd2.fna with Guaranteed Nesting Mono
 }
 
 TEST_CASE("PRIME site-level progress callbacks") {
-    std::string aln_path = "benchmarks/data/cd2.fna";
-    std::string tree_path = "benchmarks/data/cd2.nwk";
+    std::string aln_path = resolve_test_path("benchmarks/data/cd2.fna");
+    std::string tree_path = resolve_test_path("benchmarks/data/cd2.nwk");
     Alignment aln = Alignment::from_fasta(aln_path);
     Tree tree = Tree::from_newick_file(tree_path);
 

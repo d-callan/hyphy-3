@@ -28,6 +28,11 @@ if [ -d ".build/release/HyPhyStudio_HyPhyStudio.bundle" ]; then
     cp -R ".build/release/HyPhyStudio_HyPhyStudio.bundle/"* "$RESOURCES/"
 fi
 
+# Copy AppIcon if available
+if [ -f "Sources/HyPhyStudio/Resources/AppIcon.icns" ]; then
+    cp "Sources/HyPhyStudio/Resources/AppIcon.icns" "$RESOURCES/AppIcon.icns"
+fi
+
 # Write Info.plist
 cat << 'EOF' > "$CONTENTS/Info.plist"
 <?xml version="1.0" encoding="UTF-8"?>
@@ -38,6 +43,10 @@ cat << 'EOF' > "$CONTENTS/Info.plist"
     <string>en</string>
     <key>CFBundleExecutable</key>
     <string>HyPhyStudio</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
+    <key>CFBundleIconName</key>
+    <string>AppIcon</string>
     <key>CFBundleIdentifier</key>
     <string>org.veg.HyPhyStudio</string>
     <key>CFBundleInfoDictionaryVersion</key>

@@ -24,6 +24,8 @@
 #include "hyphy/analyses/prime.hpp"
 #include "hyphy/core/neighbor_joining.hpp"
 #include "hyphy/analyses/gard.hpp"
+#include "hyphy/analyses/slac.hpp"
+#include "hyphy/analyses/directional_fel.hpp"
 
 namespace nb = nanobind;
 using namespace nb::literals;
@@ -648,4 +650,167 @@ NB_MODULE(_hyphy3, m) {
     nb::class_<GARDAnalyzer>(m, "GARDAnalyzer")
         .def(nb::init<const Alignment&, GARDSettings>(), "alignment"_a, "settings"_a = GARDSettings{})
         .def("run", &GARDAnalyzer::run);
+
+    // SLAC Settings, Results & Analyzer
+    nb::class_<SLACSettings>(m, "SLACSettings")
+        .def(nb::init<>())
+        .def_rw("p_value_threshold", &SLACSettings::p_value_threshold)
+        .def_rw("samples", &SLACSettings::samples)
+        .def_rw("test_branches", &SLACSettings::test_branches)
+        .def_rw("test_branch_regex", &SLACSettings::test_branch_regex)
+        .def_rw("test_branch_names", &SLACSettings::test_branch_names)
+        .def_rw("full_model", &SLACSettings::full_model)
+        .def_rw("quiet", &SLACSettings::quiet)
+        .def_rw("all_sites", &SLACSettings::all_sites)
+        .def_rw("random_seed", &SLACSettings::random_seed);
+
+    nb::class_<SLACSiteResult>(m, "SLACSiteResult")
+        .def_ro("site_index", &SLACSiteResult::site_index)
+        .def_ro("ES", &SLACSiteResult::ES)
+        .def_ro("EN", &SLACSiteResult::EN)
+        .def_ro("S", &SLACSiteResult::S)
+        .def_ro("N", &SLACSiteResult::N)
+        .def_ro("P_S", &SLACSiteResult::P_S)
+        .def_ro("dS", &SLACSiteResult::dS)
+        .def_ro("dN", &SLACSiteResult::dN)
+        .def_ro("dN_minus_dS", &SLACSiteResult::dN_minus_dS)
+        .def_ro("p_positive", &SLACSiteResult::p_positive)
+        .def_ro("p_negative", &SLACSiteResult::p_negative)
+        .def_ro("total_branch_length", &SLACSiteResult::total_branch_length)
+        .def_ro("has_dS", &SLACSiteResult::has_dS)
+        .def_ro("has_dN", &SLACSiteResult::has_dN)
+        .def_ro("has_dN_minus_dS", &SLACSiteResult::has_dN_minus_dS)
+        .def_ro("quantiles_2_5", &SLACSiteResult::quantiles_2_5)
+        .def_ro("quantiles_median", &SLACSiteResult::quantiles_median)
+        .def_ro("quantiles_97_5", &SLACSiteResult::quantiles_97_5);
+
+    nb::class_<SLACBranchResult>(m, "SLACBranchResult")
+        .def_ro("branch_name", &SLACBranchResult::branch_name)
+        .def_ro("branch_length", &SLACBranchResult::branch_length)
+        .def_ro("ES", &SLACBranchResult::ES)
+        .def_ro("EN", &SLACBranchResult::EN)
+        .def_ro("S", &SLACBranchResult::S)
+        .def_ro("N", &SLACBranchResult::N)
+        .def_ro("P_S", &SLACBranchResult::P_S)
+        .def_ro("dS", &SLACBranchResult::dS)
+        .def_ro("dN", &SLACBranchResult::dN)
+        .def_ro("dN_minus_dS", &SLACBranchResult::dN_minus_dS)
+        .def_ro("p_positive", &SLACBranchResult::p_positive)
+        .def_ro("p_negative", &SLACBranchResult::p_negative)
+        .def_ro("has_dS", &SLACBranchResult::has_dS)
+        .def_ro("has_dN", &SLACBranchResult::has_dN)
+        .def_ro("has_dN_minus_dS", &SLACBranchResult::has_dN_minus_dS);
+
+    nb::class_<SLACResult>(m, "SLACResult")
+        .def_ro("settings", &SLACResult::settings)
+        .def_ro("baseline_log_l", &SLACResult::baseline_log_l)
+        .def_ro("baseline_aicc", &SLACResult::baseline_aicc)
+        .def_ro("gtr_log_l", &SLACResult::gtr_log_l)
+        .def_ro("gtr_aicc", &SLACResult::gtr_aicc)
+        .def_ro("global_omega", &SLACResult::global_omega)
+        .def_ro("total_tree_length", &SLACResult::total_tree_length)
+        .def_ro("total_tested_tree_length", &SLACResult::total_tested_tree_length)
+        .def_ro("num_tested_branches", &SLACResult::num_tested_branches)
+        .def_ro("num_background_branches", &SLACResult::num_background_branches)
+        .def_ro("tested_branch_names", &SLACResult::tested_branch_names)
+        .def_ro("background_branch_names", &SLACResult::background_branch_names)
+        .def_ro("resolved_sites", &SLACResult::resolved_sites)
+        .def_ro("averaged_sites", &SLACResult::averaged_sites)
+        .def_ro("resolved_branches", &SLACResult::resolved_branches)
+        .def_ro("averaged_branches", &SLACResult::averaged_branches)
+        .def_ro("total_sites", &SLACResult::total_sites)
+        .def_ro("diversifying_sites", &SLACResult::diversifying_sites)
+        .def_ro("purifying_sites", &SLACResult::purifying_sites)
+        .def_ro("neutral_sites", &SLACResult::neutral_sites)
+        .def_ro("runtime_seconds", &SLACResult::runtime_seconds)
+        .def("to_modern_json", [](const SLACResult& res, const std::string& input_filepath, const std::string& tree_string) {
+            return res.to_modern_json(input_filepath, tree_string).dump();
+        }, "input_filepath"_a = "", "tree_string"_a = "")
+        .def("to_legacy_json", [](const SLACResult& res, const std::string& input_filepath, const std::string& tree_string) {
+            return res.to_legacy_json(input_filepath, tree_string).dump();
+        }, "input_filepath"_a = "", "tree_string"_a = "");
+
+    nb::class_<SLACAnalyzer>(m, "SLACAnalyzer")
+        .def(nb::init<Tree, Alignment, MG94Parameters, SLACSettings>(),
+             "tree"_a, "alignment"_a, "params"_a = MG94Parameters{}, "settings"_a = SLACSettings{})
+        .def_static("create_and_fit", [](Tree tree, Alignment aln, const SLACSettings& settings) {
+            return SLACAnalyzer::create_and_fit(std::move(tree), std::move(aln), settings);
+        }, "tree"_a, "alignment"_a, "settings"_a = SLACSettings{})
+        .def("run", [](SLACAnalyzer& slac, bool show_progress, bool force_progress) {
+            return slac.run(nullptr, show_progress, force_progress);
+        }, "show_progress"_a = false, "force_progress"_a = false);
+
+    // Directional FEL Results & Analyzer
+    nb::class_<DirectionalFELSettings>(m, "DirectionalFELSettings")
+        .def(nb::init<>())
+        .def_rw("p_value_threshold", &DirectionalFELSettings::p_value_threshold)
+        .def_rw("heterogeneity_threshold", &DirectionalFELSettings::heterogeneity_threshold)
+        .def_rw("root_strategy", &DirectionalFELSettings::root_strategy)
+        .def_rw("num_regimes", &DirectionalFELSettings::num_regimes)
+        .def_rw("full_model", &DirectionalFELSettings::full_model);
+
+    nb::class_<TaxonComposition>(m, "TaxonComposition")
+        .def_ro("name", &TaxonComposition::name)
+        .def_ro("total_codons", &TaxonComposition::total_codons)
+        .def_ro("gc_overall", &TaxonComposition::gc_overall)
+        .def_ro("gc_cp3", &TaxonComposition::gc_cp3);
+
+    nb::class_<CompositionTestResult>(m, "CompositionTestResult")
+        .def_ro("chi2_overall", &CompositionTestResult::chi2_overall)
+        .def_ro("df_overall", &CompositionTestResult::df_overall)
+        .def_ro("p_value_overall", &CompositionTestResult::p_value_overall)
+        .def_ro("chi2_cp3", &CompositionTestResult::chi2_cp3)
+        .def_ro("df_cp3", &CompositionTestResult::df_cp3)
+        .def_ro("p_value_cp3", &CompositionTestResult::p_value_cp3)
+        .def_ro("is_heterogeneous", &CompositionTestResult::is_heterogeneous)
+        .def_ro("taxa", &CompositionTestResult::taxa);
+
+    nb::class_<RootCandidate>(m, "RootCandidate")
+        .def_ro("rank", &RootCandidate::rank)
+        .def_ro("branch_name", &RootCandidate::branch_name)
+        .def_ro("is_terminal", &RootCandidate::is_terminal)
+        .def_ro("log_l", &RootCandidate::log_l)
+        .def_ro("delta_log_l", &RootCandidate::delta_log_l)
+        .def_ro("weight", &RootCandidate::weight);
+
+    nb::class_<AutoRootResult>(m, "AutoRootResult")
+        .def_ro("chosen_branch_name", &AutoRootResult::chosen_branch_name)
+        .def_ro("chosen_log_l", &AutoRootResult::chosen_log_l)
+        .def_ro("chosen_weight", &AutoRootResult::chosen_weight)
+        .def_ro("candidates", &AutoRootResult::candidates);
+
+    nb::class_<DirectionalRegime>(m, "DirectionalRegime")
+        .def_ro("id", &DirectionalRegime::id)
+        .def_ro("name", &DirectionalRegime::name)
+        .def_ro("psi", &DirectionalRegime::psi)
+        .def_ro("mean_gc", &DirectionalRegime::mean_gc)
+        .def_ro("branch_count", &DirectionalRegime::branch_count);
+
+    nb::class_<DirectionalSiteResult>(m, "DirectionalSiteResult")
+        .def_ro("site_index", &DirectionalSiteResult::site_index)
+        .def_ro("alpha", &DirectionalSiteResult::alpha)
+        .def_ro("beta", &DirectionalSiteResult::beta)
+        .def_ro("alpha_null", &DirectionalSiteResult::alpha_null)
+        .def_ro("lrt", &DirectionalSiteResult::lrt)
+        .def_ro("p_value", &DirectionalSiteResult::p_value)
+        .def_ro("total_branch_length", &DirectionalSiteResult::total_branch_length);
+
+    nb::class_<DirectionalFELAnalyzer>(m, "DirectionalFELAnalyzer")
+        .def(nb::init<Tree, Alignment, MG94Parameters, DirectionalFELSettings>(),
+             "tree"_a, "alignment"_a, "params"_a = MG94Parameters{}, "settings"_a = DirectionalFELSettings{})
+        .def_static("run_composition_test", &DirectionalFELAnalyzer::run_composition_test, "alignment"_a, "threshold"_a = 0.05)
+        .def_static("create_and_fit", [](Tree tree, Alignment aln, const DirectionalFELSettings& settings) {
+            return DirectionalFELAnalyzer::create_and_fit(std::move(tree), std::move(aln), settings);
+        }, "tree"_a, "alignment"_a, "settings"_a = DirectionalFELSettings{})
+        .def("run", &DirectionalFELAnalyzer::run, "show_progress"_a = false, "force_progress"_a = false)
+        .def("to_modern_json", [](const DirectionalFELAnalyzer& dfel, const std::string& input_filepath, const std::string& tree_string) {
+            return dfel.to_modern_json(input_filepath, tree_string).dump();
+        }, "input_filepath"_a = "", "tree_string"_a = "")
+        .def("to_legacy_json", [](const DirectionalFELAnalyzer& dfel, const std::string& input_filepath, const std::string& tree_string) {
+            return dfel.to_legacy_json(input_filepath, tree_string).dump();
+        }, "input_filepath"_a = "", "tree_string"_a = "")
+        .def_ro("comp_test", &DirectionalFELAnalyzer::comp_test)
+        .def_ro("root_result", &DirectionalFELAnalyzer::root_result)
+        .def_ro("regimes", &DirectionalFELAnalyzer::regimes)
+        .def_ro("site_results", &DirectionalFELAnalyzer::site_results);
 }

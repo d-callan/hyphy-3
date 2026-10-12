@@ -24,6 +24,7 @@ void test_basic_graph_derivatives() {
     Var f = x * x * y + exp(x) - log(y);
 
     Scalar expected_f = x_val * x_val * y_val + std::exp(x_val) - std::log(y_val);
+    (void)expected_f;
     assert(std::abs(f.val() - expected_f) < 1e-12);
 
     f.backward();
@@ -137,6 +138,7 @@ void test_composite_regularized_loss(const std::string& filepath) {
         if (i == static_cast<size_t>(tree.root_id)) continue;
         Scalar expected_grad = -ana_grads[i] + 2.0 * lambda * branch_vars[i].val();
         Scalar err = std::abs(branch_vars[i].grad() - expected_grad);
+        (void)err;
         assert(err < 1e-10);
     }
 

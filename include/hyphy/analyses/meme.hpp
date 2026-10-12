@@ -8,6 +8,7 @@
 #include "hyphy/opt/nelder_mead.hpp"
 #include "hyphy/opt/optimizer.hpp"
 #include "hyphy/analyses/fel.hpp"
+#include "hyphy/analyses/site_visualizer.hpp"
 #include "hyphy/core/progress_bar.hpp"
 #include "nlohmann/json.hpp"
 
@@ -378,44 +379,34 @@ public:
         size_t num_patterns = aln.patterns.size();
         std::vector<MEMESiteResult> pattern_results(num_patterns);
 
-        std::unique_ptr<ProgressBar> pbar;
-        std::atomic<size_t> num_episodic{0};
-
-        if (show_progress && (force_progress || ProgressBar::is_terminal())) {
-            pbar = std::make_unique<ProgressBar>(
-                num_patterns,
-                "[MEME] Patterns",
-                "patterns",
-                force_progress,
-                ProgressBar::Style::SmoothBlocks
-            );
-        }
+        SiteVisualizer viz(aln.num_codons, num_patterns, SiteVisualizerConfig{
+            .method_name = "MEME",
+            .p_value_threshold = p_value_threshold,
+            .pos_label = "episodic",
+            .neg_label = "purifying",
+            .sig_label = "significant",
+            .quiet = !show_progress,
+            .force_tty = force_progress,
+            .enable_chart = true
+        });
 
         #pragma omp parallel for schedule(dynamic)
         for (size_t p = 0; p < num_patterns; ++p) {
             pattern_results[p] = analyze_pattern(p, leaf_to_taxon);
-            if (pbar) {
-                const auto& r = pattern_results[p];
-                size_t w = aln.patterns[p].weight;
-                if (r.p_value <= p_value_threshold && r.beta_plus > r.alpha) {
-                    num_episodic.fetch_add(w, std::memory_order_relaxed);
-                }
-                size_t epi = num_episodic.load(std::memory_order_relaxed);
-                if (epi > 0) {
-                    std::string stat = "\033[1;32m+" + std::to_string(epi) + "\033[0m episodic sites";
-                    pbar->set_status(stat);
-                }
-                pbar->tick();
+
+            const auto& r = pattern_results[p];
+            SiteSelectionType type = SiteSelectionType::Neutral;
+            Scalar metric = 0.0;
+            std::string detail;
+            if (r.p_value <= p_value_threshold && r.beta_plus > r.alpha) {
+                type = SiteSelectionType::Positive;
+                metric = r.beta_plus / std::max(r.alpha, 1e-4);
+                detail = "▲ β+ = " + SiteVisualizer::format_scalar(r.beta_plus, 2) + " (p+ = " + SiteVisualizer::format_scalar(r.p_plus, 2) + "), p = " + SiteVisualizer::format_pvalue(r.p_value);
             }
+            viz.record_pattern(p, aln.patterns[p].sites, type, r.p_value, metric, detail);
         }
 
-        if (pbar) {
-            size_t epi = num_episodic.load();
-            std::ostringstream summary;
-            summary << "\033[1;32m" << epi << " site(s) under episodic diversifying selection\033[0m (p ≤ "
-                    << std::fixed << std::setprecision(2) << p_value_threshold << ")";
-            pbar->finish(summary.str());
-        }
+        viz.finish();
 
         site_results.resize(aln.num_codons);
         for (size_t s = 0; s < aln.num_codons; ++s) {

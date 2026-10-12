@@ -98,8 +98,16 @@ add_executable(hyphy_gard_test tests/test_gard.cpp)
 target_link_libraries(hyphy_gard_test PRIVATE hyphy3_core)
 add_test(NAME GARDTest COMMAND hyphy_gard_test)
 
+add_executable(hyphy_slac_test tests/test_slac.cpp)
+target_link_libraries(hyphy_slac_test PRIVATE hyphy3_core)
+add_test(NAME SLACTest COMMAND hyphy_slac_test)
 
-# Unified HyPhy 3 CLI Driver (hyphy3 fel ..., hyphy3 meme ..., hyphy3 busted ..., hyphy3 absrel ..., hyphy3 relax ..., hyphy3 fubar ..., hyphy3 prime ..., hyphy3 gard ...)
+add_executable(hyphy_dfel_test tests/test_dfel.cpp)
+target_link_libraries(hyphy_dfel_test PRIVATE hyphy3_core)
+add_test(NAME DirectionalFELTest COMMAND hyphy_dfel_test)
+
+
+# Unified HyPhy 3 CLI Driver (hyphy3 fel ..., hyphy3 meme ..., hyphy3 busted ..., hyphy3 absrel ..., hyphy3 relax ..., hyphy3 fubar ..., hyphy3 prime ..., hyphy3 gard ..., hyphy3 slac ..., hyphy3 dfel ...)
 add_executable(hyphy3
     src/apps/hyphy3.cpp
     src/apps/hyphy_fel.cpp
@@ -111,6 +119,8 @@ add_executable(hyphy3
     src/apps/hyphy_fubar.cpp
     src/apps/hyphy_prime.cpp
     src/apps/hyphy_gard.cpp
+    src/apps/hyphy_slac.cpp
+    src/apps/hyphy_dfel.cpp
 )
 target_compile_definitions(hyphy3 PRIVATE HYPHY3_COMBINED_DRIVER)
 target_link_libraries(hyphy3 PRIVATE hyphy3_core)
@@ -143,6 +153,12 @@ target_link_libraries(hyphy3-prime PRIVATE hyphy3_core)
 add_executable(hyphy3-gard src/apps/hyphy_gard.cpp)
 target_link_libraries(hyphy3-gard PRIVATE hyphy3_core)
 
+add_executable(hyphy3-slac src/apps/hyphy_slac.cpp)
+target_link_libraries(hyphy3-slac PRIVATE hyphy3_core)
+
+add_executable(hyphy3-dfel src/apps/hyphy_dfel.cpp)
+target_link_libraries(hyphy3-dfel PRIVATE hyphy3_core)
+
 # Backward-compatible aliases
 add_executable(hyphy-fel ALIAS hyphy3-fel)
 add_executable(hyphy-contrast-fel ALIAS hyphy3-contrast-fel)
@@ -153,6 +169,8 @@ add_executable(hyphy-relax ALIAS hyphy3-relax)
 add_executable(hyphy-fubar ALIAS hyphy3-fubar)
 add_executable(hyphy-prime ALIAS hyphy3-prime)
 add_executable(hyphy-gard ALIAS hyphy3-gard)
+add_executable(hyphy-slac ALIAS hyphy3-slac)
+add_executable(hyphy-dfel ALIAS hyphy3-dfel)
 
 # Python & nanobind bindings
 find_package(Python 3.8 COMPONENTS Interpreter Development.Module)

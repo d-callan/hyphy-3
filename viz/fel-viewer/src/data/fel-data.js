@@ -35,13 +35,17 @@ export class FELData {
   parse(json) {
     // 1. Detect analysis method (FEL vs MEME vs Contrast-FEL)
     const aId = (json.analysis?.id || '').toLowerCase();
+    const aInfo = (json.analysis?.info || '').toLowerCase();
     const isContrastData = aId.includes('contrast') || !!json.site_results?.data?.penalized_lrt;
-    const isMemeData = !isContrastData && (aId === 'meme' 
-      || !!json.site_results?.data?.beta_plus 
-      || (json.MLE?.headers && json.MLE.headers.some(h => {
-          const name = (h[0] || '').toLowerCase();
-          return name.includes('beta+') || name.includes('beta<sup>+</sup>') || name.includes('beta2');
-        })));
+    const isMemeData = !isContrastData && (
+      aId === 'meme' ||
+      aInfo.includes('meme') ||
+      !!json.site_results?.data?.beta_plus ||
+      (json.MLE?.headers && json.MLE.headers.some(h => {
+        const name = (h[0] || '').toLowerCase();
+        return name.includes('beta') && (name.includes('+') || name.includes('2') || name.includes('plus'));
+      }))
+    );
     
     this.analysisType = isContrastData ? 'contrast-fel' : (isMemeData ? 'meme' : 'fel');
     this.isMEME = isMemeData;
@@ -181,6 +185,8 @@ export class FELData {
 
       if (this.siteResults[siteIdx - 1]) {
         this.siteResults[siteIdx - 1].events = events;
+        this.siteResults[siteIdx - 1].rootCodon = (item.root_codon || '---').toUpperCase();
+        this.siteResults[siteIdx - 1].rootAA = item.root_aa || translateCodon(item.root_codon);
       }
 
       for (const ev of events) {
@@ -284,23 +290,23 @@ export class FELData {
     headers.forEach((h, idx) => {
       const raw = (h[0] || '').toLowerCase();
       colIdx[raw] = idx;
-      if (raw.includes('alpha')) colIdx['alpha'] = idx;
-      if (raw.includes('beta1') || raw.includes('beta-') || raw.includes('beta<sup>1</sup>')) colIdx['beta1'] = idx;
-      if (raw.includes('p1') || raw.includes('p<sup>1</sup>')) colIdx['p1'] = idx;
-      if (raw.includes('beta+') || raw.includes('beta<sup>+</sup>') || raw.includes('beta2')) colIdx['beta_plus'] = idx;
-      if (raw.includes('p+') || raw.includes('p<sup>+</sup>') || raw.includes('p2')) colIdx['p_plus'] = idx;
-      if (raw.includes('lrt')) colIdx['lrt'] = idx;
-      if (raw.includes('p-value')) colIdx['p-value'] = idx;
-      if (raw.includes('branches under selection') || raw.includes('# branches')) colIdx['branches'] = idx;
+      if (raw.includes('alpha') && !raw.includes('fel') && colIdx['alpha'] === undefined) colIdx['alpha'] = idx;
+      if ((raw === 'lrt' || (raw.includes('lrt') && !raw.includes('fel'))) && colIdx['lrt'] === undefined) colIdx['lrt'] = idx;
+      if (raw.includes('p-value') && colIdx['p-value'] === undefined) colIdx['p-value'] = idx;
+      if (raw.includes('beta') && (raw.includes('1') || raw.includes('-')) && colIdx['beta1'] === undefined) colIdx['beta1'] = idx;
+      if (raw.startsWith('p') && (raw.includes('1') || raw.includes('-')) && colIdx['p1'] === undefined) colIdx['p1'] = idx;
+      if (raw.includes('beta') && (raw.includes('+') || raw.includes('2') || raw.includes('plus')) && colIdx['beta_plus'] === undefined) colIdx['beta_plus'] = idx;
+      if (raw.startsWith('p') && (raw.includes('+') || raw.includes('2') || raw.includes('plus')) && colIdx['p_plus'] === undefined) colIdx['p_plus'] = idx;
+      if ((raw.includes('branches under selection') || raw.includes('# branches')) && colIdx['branches'] === undefined) colIdx['branches'] = idx;
       if (raw.includes('meme logl')) colIdx['meme_logl'] = idx;
       if (raw.includes('fel logl')) colIdx['fel_logl'] = idx;
     });
 
     const aIdx = colIdx['alpha'] ?? 0;
-    const bIdx = colIdx['beta'] ?? 1;
+    const bpIdx = colIdx['beta_plus'] ?? -1;
+    const bIdx = this.isMEME ? (bpIdx >= 0 ? bpIdx : 1) : (colIdx['beta'] ?? 1);
     const b1Idx = colIdx['beta1'] ?? bIdx;
     const p1Idx = colIdx['p1'] ?? -1;
-    const bpIdx = colIdx['beta_plus'] ?? -1;
     const ppIdx = colIdx['p_plus'] ?? -1;
     const lrtIdx = colIdx['lrt'] ?? 3;
     const pIdx = colIdx['p-value'] ?? 4;
@@ -362,6 +368,8 @@ export class FELData {
         ? getRateSparkGlyphs(alpha, beta_plus)
         : getRateSparkGlyphs(alpha, beta);
 
+      const legSub = this.recoverLegacySubstitutions(j.substitutions?.['0'], i);
+
       return {
         site: i + 1,
         index: i,
@@ -381,14 +389,160 @@ export class FELData {
         negLogP,
         omega,
         classification,
-        history: '',
+        history: legSub.history,
         meanSurprise: 0,
         spark,
-        events: []
+        events: legSub.events,
+        rootCodon: legSub.rootCodon,
+        rootAA: legSub.rootAA
       };
     });
 
+    // Populate eventsBySite for legacy data
+    for (const res of this.siteResults) {
+      if (res.events && res.events.length > 0) {
+        this.eventsBySite[res.site] = res.events;
+      }
+    }
+
+    // Try extracting legacy global omega from fits if available
+    const gFit = j.fits?.['Global MG94xREV'] || j.fits?.['Nucleotide GTR'];
+    if (gFit) {
+      const omegaDist = gFit['Rate Distributions']?.['non-synonymous/synonymous rate ratio'];
+      if (omegaDist && omegaDist[0] && typeof omegaDist[0][0] === 'number') {
+        this.globalOmega = omegaDist[0][0];
+      }
+    }
+    if (this.globalOmega === 1.0 && this.siteResults.length > 0) {
+      // Compute robust median/mean omega from site rates
+      const validOmegas = this.siteResults.map(r => r.omega).filter(w => isFinite(w) && w > 0);
+      if (validOmegas.length > 0) {
+        validOmegas.sort((a, b) => a - b);
+        this.globalOmega = validOmegas[Math.floor(validOmegas.length / 2)];
+      }
+    }
+
     this.numSites = this.siteResults.length;
+  }
+
+  // Recover substitutions from HyPhy 2.5 legacy substitutions map
+  recoverLegacySubstitutions(substitutions0, siteIndex) {
+    if (!substitutions0) return { history: '', events: [], rootCodon: '---', rootAA: '-' };
+    const siteDict = substitutions0[String(siteIndex)] || substitutions0[siteIndex];
+    if (!siteDict || typeof siteDict !== 'object') {
+      return { history: '', events: [], rootCodon: '---', rootAA: '-' };
+    }
+    const root = (siteDict.root || '---').toUpperCase();
+    const rootAA = translateCodon(root);
+    const events = [];
+    const changes = {};
+    let synCount = 0;
+    let multiHitCount = 0;
+
+    for (const [node, rawCodon] of Object.entries(siteDict)) {
+      if (node === 'root' || !rawCodon || rawCodon === '---') continue;
+      const codon = rawCodon.toUpperCase();
+      const childAA = translateCodon(codon);
+      let dist = 0;
+      for (let c = 0; c < 3; ++c) {
+        if (root[c] && codon[c] && root[c] !== codon[c]) dist++;
+      }
+      const isSyn = (childAA === rootAA);
+      if (dist > 1) multiHitCount++;
+      if (isSyn) {
+        synCount++;
+      } else {
+        const pair = dist > 1 ? `${rootAA} ↔ ${childAA} [${dist}nt]⚡` : `${rootAA} ↔ ${childAA}`;
+        changes[pair] = (changes[pair] || 0) + 1;
+      }
+      events.push({
+        branch: node,
+        parent_codon: root,
+        parent_aa: rootAA,
+        child_codon: codon,
+        child_aa: childAA,
+        is_synonymous: isSyn,
+        nt_distance: dist
+      });
+    }
+
+    const parts = [];
+    for (const [pair, count] of Object.entries(changes)) {
+      parts.push(count > 1 ? `${pair} (${count}×)` : pair);
+    }
+    if (synCount > 0) parts.push(`(+${synCount} syn)`);
+    const history = parts.length > 0 ? parts.join(', ') : (events.length > 0 ? 'Conserved' : '');
+    return { history, events, rootCodon: root, rootAA, multiHitCount };
+  }
+
+  // Get dynamic selection statistics at any p-value cutoff
+  getStats(threshold = 0.1) {
+    let diversifying = 0;
+    let purifying = 0;
+    let neutral = 0;
+
+    for (const r of this.siteResults) {
+      if (r.pValue <= threshold) {
+        if (this.isMEME) {
+          diversifying++;
+        } else if (r.beta > r.alpha) {
+          diversifying++;
+        } else if (r.alpha > r.beta) {
+          purifying++;
+        } else {
+          neutral++;
+        }
+      } else {
+        neutral++;
+      }
+    }
+
+    return {
+      diversifying,
+      purifying,
+      significant: diversifying + purifying,
+      neutral,
+      totalSites: this.siteResults.length,
+      globalOmega: this.globalOmega
+    };
+  }
+
+  // Filter sites for candidate table display
+  getFilteredSites(threshold = 0.1, filterType = 'diversifying', query = '') {
+    const q = (query || '').toLowerCase().trim();
+
+    return this.siteResults.filter(r => {
+      // 1. Text Search Filter
+      if (q) {
+        const siteStr = String(r.site);
+        const histStr = (r.history || '').toLowerCase();
+        const rootStr = (r.rootAA || '').toLowerCase();
+        if (!siteStr.includes(q) && !histStr.includes(q) && !rootStr.includes(q)) {
+          return false;
+        }
+      }
+
+      const isSig = r.pValue <= threshold;
+      const isDiv = this.isMEME ? isSig : (isSig && r.beta > r.alpha);
+      const isPur = !this.isMEME && isSig && r.alpha > r.beta;
+
+      // 2. Category Tab Filter
+      if (filterType === 'diversifying') {
+        return isDiv;
+      } else if (filterType === 'purifying') {
+        return isPur;
+      } else if (filterType === 'significant') {
+        return isSig;
+      } else if (filterType === 'all') {
+        return true;
+      }
+      return true;
+    });
+  }
+
+  // Get specific site result
+  getSite(siteNumber) {
+    return this.siteResults[siteNumber - 1] || null;
   }
 
   postProcess() {
@@ -404,24 +558,58 @@ export class FELData {
       this.translated[taxon] = aaArr;
     }
 
-    // 2. Compute consensus Amino Acid per site
+    // 2. Compute consensus Codon & Amino Acid per site
+    this.consensusCodon = [];
     this.consensusAA = [];
     const taxonList = Object.keys(this.translated);
     for (let c = 0; c < this.numSites; ++c) {
-      const counts = {};
-      let maxCount = 0;
-      let topAA = '-';
+      const countsCodon = {};
+      const countsAA = {};
+      let maxCountCodon = 0, topCodon = '---';
+      let maxCountAA = 0, topAA = '-';
+
       for (const t of taxonList) {
+        const codon = this.sequences[t]?.substr(c * 3, 3).toUpperCase() || '---';
         const aa = this.translated[t]?.[c] || '-';
+
+        if (codon && codon.length === 3 && codon !== '---') {
+          countsCodon[codon] = (countsCodon[codon] || 0) + 1;
+          if (countsCodon[codon] > maxCountCodon) {
+            maxCountCodon = countsCodon[codon];
+            topCodon = codon;
+          }
+        }
+
         if (aa !== '-' && aa !== '?') {
-          counts[aa] = (counts[aa] || 0) + 1;
-          if (counts[aa] > maxCount) {
-            maxCount = counts[aa];
+          countsAA[aa] = (countsAA[aa] || 0) + 1;
+          if (countsAA[aa] > maxCountAA) {
+            maxCountAA = countsAA[aa];
             topAA = aa;
           }
         }
       }
+      this.consensusCodon.push(topCodon);
       this.consensusAA.push(topAA);
+    }
+
+    // 3. Ensure rootCodon and rootAA are populated for 100% of sites (including conserved sites)
+    this.rootCodons = [];
+    this.rootAA = [];
+    for (let c = 0; c < this.numSites; ++c) {
+      const r = this.siteResults[c];
+      if (r) {
+        if (!r.rootCodon || r.rootCodon === '---' || r.rootCodon === '') {
+          if (this.consensusCodon[c] && this.consensusCodon[c] !== '---') {
+            r.rootCodon = this.consensusCodon[c];
+            r.rootAA = translateCodon(r.rootCodon);
+          }
+        }
+        if (!r.rootAA || r.rootAA === '-' || r.rootAA === '?') {
+          r.rootAA = translateCodon(r.rootCodon);
+        }
+        this.rootCodons.push(r.rootCodon);
+        this.rootAA.push(r.rootAA);
+      }
     }
   }
 

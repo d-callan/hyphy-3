@@ -45,10 +45,35 @@ export const CODON_TABLE = {
   'GGT': 'G', 'GGC': 'G', 'GGA': 'G', 'GGG': 'G'
 };
 
+const IUPAC = {
+  'R': ['A', 'G'], 'Y': ['C', 'T'], 'S': ['G', 'C'], 'W': ['A', 'T'],
+  'K': ['G', 'T'], 'M': ['A', 'C'], 'B': ['C', 'G', 'T'], 'D': ['A', 'G', 'T'],
+  'H': ['A', 'C', 'T'], 'V': ['A', 'C', 'G'], 'N': ['A', 'C', 'G', 'T']
+};
+
 export function translateCodon(codon) {
   if (!codon || codon.length !== 3) return '-';
   const clean = codon.toUpperCase().replace(/U/g, 'T');
-  return CODON_TABLE[clean] || '?';
+  if (CODON_TABLE[clean]) return CODON_TABLE[clean];
+
+  // Resolve IUPAC ambiguities
+  const pos = [
+    IUPAC[clean[0]] || [clean[0]],
+    IUPAC[clean[1]] || [clean[1]],
+    IUPAC[clean[2]] || [clean[2]]
+  ];
+  const possibleAAs = new Set();
+  for (const b0 of pos[0]) {
+    for (const b1 of pos[1]) {
+      for (const b2 of pos[2]) {
+        const tr = CODON_TABLE[b0 + b1 + b2];
+        if (tr) possibleAAs.add(tr);
+      }
+    }
+  }
+  if (possibleAAs.size === 1) return Array.from(possibleAAs)[0];
+  if (possibleAAs.size > 1) return Array.from(possibleAAs).join('/');
+  return '?';
 }
 
 // Dieter Rams / Braun Industrial Architectural Palette

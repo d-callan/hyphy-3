@@ -7,6 +7,7 @@
 #include "hyphy/core/likelihood.hpp"
 #include "hyphy/core/progress_bar.hpp"
 #include "hyphy/core/provenance.hpp"
+#include "hyphy/analyses/site_visualizer.hpp"
 #include "hyphy/opt/nelder_mead.hpp"
 #include "hyphy/opt/optimizer.hpp"
 #include "nlohmann/json.hpp"
@@ -997,16 +998,16 @@ public:
 
     std::vector<ContrastSiteResult> run(bool show_progress = false, bool force_progress = false) {
         size_t num_patterns = aln.patterns.size();
-        std::unique_ptr<ProgressBar> pbar;
-        if (show_progress && (force_progress || ProgressBar::is_terminal())) {
-            pbar = std::make_unique<ProgressBar>(
-                num_patterns,
-                "[Contrast-FEL] Patterns",
-                "patterns",
-                force_progress,
-                ProgressBar::Style::SmoothBlocks
-            );
-        }
+        SiteVisualizer viz(aln.num_codons, num_patterns, SiteVisualizerConfig{
+            .method_name = "Contrast-FEL",
+            .p_value_threshold = p_value_threshold,
+            .pos_label = "different",
+            .neg_label = "equal",
+            .sig_label = "different",
+            .quiet = !show_progress,
+            .force_tty = force_progress,
+            .enable_chart = true
+        });
 
         std::vector<size_t> leaf_to_taxon(tree.num_nodes(), static_cast<size_t>(-1));
         for (const auto& node : tree.nodes) {
@@ -1025,12 +1026,21 @@ public:
             pattern_results[p] = analyze_pattern(p, leaf_to_taxon);
             pattern_results[p].subs = reconstruct_ancestral_pattern(p, leaf_to_taxon);
 
-            if (pbar) {
-                pbar->tick();
+            const auto& r = pattern_results[p];
+            SiteSelectionType type = SiteSelectionType::Neutral;
+            Scalar metric = r.penalized_lrt;
+            std::string detail;
+            if (r.p_value <= p_value_threshold) {
+                type = SiteSelectionType::Significant;
+                detail = "★ LRT = " + SiteVisualizer::format_scalar(metric, 2) + ", p = " + SiteVisualizer::format_pvalue(r.p_value);
+                if (!r.contrast_tag.empty() && r.contrast_tag != "Equal") {
+                    detail += " (" + r.contrast_tag + ")";
+                }
             }
+            viz.record_pattern(p, aln.patterns[p].sites, type, r.p_value, metric, detail);
         }
 
-        if (pbar) pbar->finish();
+        viz.finish();
 
         // Expand pattern results to site results
         site_results.resize(aln.num_codons);

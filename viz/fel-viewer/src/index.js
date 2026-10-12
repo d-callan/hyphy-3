@@ -1,13 +1,11 @@
 // Main Entry Point: HyPhyFELViewer Class & <hyphy-fel-viewer> Web Component
+// First-principles redesign: Hero Evidence Plot, Diversifying-Only Default, Embeddable Everywhere
 
 import { FELData } from './data/fel-data.js';
-import { TreeCanvas } from './components/tree-canvas.js';
-import { AlignmentCanvas } from './components/alignment-canvas.js';
-import { TrackHeader } from './components/track-header.js';
-import { BirdsEyeOverview } from './components/birds-eye-overview.js';
-import { Inspector } from './components/inspector.js';
-import { Toolbar } from './components/toolbar.js';
-import { NativeBridge } from './bridge/native-bridge.js';
+import { KpiBar } from './components/kpi-bar.js';
+import { EvidencePlot } from './components/evidence-plot.js';
+import { CandidatesTable } from './components/candidates-table.js';
+import { SiteDrawer } from './components/site-drawer.js';
 import './styles/viewer.css';
 
 export class HyPhyFELViewer {
@@ -15,468 +13,363 @@ export class HyPhyFELViewer {
     this.container = container;
     this.options = Object.assign({
       theme: 'light',
-      rowHeight: 22,
-      displayMode: 'amino_acid',
-      colorScheme: 'difference',
-      pThreshold: 0.1,
+      threshold: 0.1,
+      filterType: 'diversifying', // Diversifying only by default!
       onSiteSelect: null,
-      onBranchSelect: null
+      onThresholdChange: null
     }, options);
 
     this.data = null;
-    this.selectedSite = 1;
-    this.showAncestors = false;
-    this.currentTaxaOrder = [];
-    this.bridge = new NativeBridge(this.container);
+    this.threshold = this.options.threshold;
+    this.selectedSite = null;
 
     this.initDOM();
-    this.initSplitter();
-    this.initResizeObserver();
   }
 
   initDOM() {
     this.container.classList.add('hyphy-fel-container');
-    if (this.options.theme === 'light') {
-      this.container.classList.add('hyphy-theme-light');
-    } else {
+    if (this.options.theme === 'dark') {
       this.container.classList.add('hyphy-theme-dark');
     }
 
-    // 1. Toolbar
-    this.toolbar = new Toolbar(this.container, {
-      onModeChange: (mode) => this.setDisplayMode(mode),
-      onSchemeChange: (scheme) => this.setColorScheme(scheme),
-      onSiteJump: (site) => this.selectSite(site),
-      onThresholdChange: (p) => this.setPThreshold(p),
-      onFileLoad: (file) => this.loadFile(file),
-      onSampleSelect: (sampleName) => this.loadSample(sampleName),
-      onThemeToggle: () => this.toggleTheme(),
-      onAncestorsToggle: (show) => this.setAncestorsVisible(show),
-      onOverviewToggle: () => this.toggleOverview()
+    // Main layout wrapper
+    this.layout = document.createElement('div');
+    this.layout.className = 'hyphy-fel-layout';
+    this.container.appendChild(this.layout);
+
+    // 1. KPI Summary Bar & Reactive Threshold Controller
+    this.kpiBar = new KpiBar(this.layout, {
+      threshold: this.threshold,
+      onThresholdChange: (p) => this.setThreshold(p)
     });
 
-    // 2. Bird's Eye Overview: Whole-Gene Selection Landscape & Minimap
-    this.overview = new BirdsEyeOverview(this.container, {
-      pThreshold: this.options.pThreshold,
-      colorScheme: this.options.colorScheme,
-      displayMode: this.options.displayMode,
-      onModeChange: () => this.resize(),
-      onSiteSelect: (site, siteResult) => this.selectSite(site),
-      onViewportChange: (startCol, startRow) => {
-        const colW = this.alignViewer.getColWidth();
-        const rowH = this.options.rowHeight;
-        const newSl = startCol * colW;
-        const newSt = startRow * rowH;
-        this.alignViewer.setScroll(newSl, newSt);
-        this.treeViewer.setScrollTop(this.alignViewer.scrollTop);
-        this.trackHeader.setScrollLeft(this.alignViewer.scrollLeft);
-      }
-    });
-
-    // 3. Main Stage (Splitter View)
-    this.stage = document.createElement('div');
-    this.stage.className = 'hyphy-main-stage';
-    this.container.appendChild(this.stage);
-
-    // Left Pane: Tree
-    this.treePane = document.createElement('div');
-    this.treePane.className = 'hyphy-tree-pane';
-    this.stage.appendChild(this.treePane);
-
-    this.treeHeader = document.createElement('div');
-    this.treeHeader.className = 'hyphy-tree-header';
-    this.treeHeader.innerHTML = `
-      <div class="tree-header-title">Phylogeny</div>
-      <div class="tree-header-sub" id="tree-sub">Loading...</div>
-    `;
-    this.treePane.appendChild(this.treeHeader);
-
-    this.treeContainer = document.createElement('div');
-    this.treeContainer.className = 'tree-canvas-container';
-    this.treePane.appendChild(this.treeContainer);
-
-    this.treeViewer = new TreeCanvas(this.treeContainer, {
-      rowHeight: this.options.rowHeight,
-      onBranchSelect: (branch) => this.selectBranch(branch),
-      onLeafHover: (leafName, leafIdx) => {
-        // Sync row hover highlight
-      }
-    });
-
-    // Draggable Splitter
-    this.splitter = document.createElement('div');
-    this.splitter.className = 'hyphy-splitter';
-    this.stage.appendChild(this.splitter);
-
-    // Right Pane: Tracks & Alignment
-    this.alignPane = document.createElement('div');
-    this.alignPane.className = 'hyphy-alignment-pane';
-    this.stage.appendChild(this.alignPane);
-
-    // Sticky Tracks Header
-    this.tracksContainer = document.createElement('div');
-    this.tracksContainer.className = 'hyphy-tracks-container';
-    this.alignPane.appendChild(this.tracksContainer);
-
-    this.trackHeader = new TrackHeader(this.tracksContainer, {
-      pThreshold: this.options.pThreshold,
-      displayMode: this.options.displayMode,
+    // 2. Hero Visual: Selection Evidence Landscape Plot (-log10 p)
+    this.plot = new EvidencePlot(this.layout, {
+      threshold: this.threshold,
       onSiteSelect: (site, siteResult) => this.selectSite(site)
     });
 
-    // Alignment Canvas
-    this.alignContainer = document.createElement('div');
-    this.alignContainer.className = 'hyphy-alignment-container';
-    this.alignPane.appendChild(this.alignContainer);
+    // 3. Focused Candidate Sites Table (Diversifying Only by Default)
+    this.table = new CandidatesTable(this.layout, {
+      threshold: this.threshold,
+      filterType: this.options.filterType,
+      onSiteSelect: (site, siteResult, action) => this.selectSite(site, action)
+    });
 
-    this.alignViewer = new AlignmentCanvas(this.alignContainer, {
-      rowHeight: this.options.rowHeight,
-      displayMode: this.options.displayMode,
-      colorScheme: this.options.colorScheme,
-      onSiteSelect: (site, siteResult) => this.selectSite(site),
-      onScroll: (scrollLeft, scrollTop, range) => {
-        // Synchronize Tree vertically & Tracks Header horizontally
-        this.treeViewer.setScrollTop(scrollTop);
-        this.trackHeader.setScrollLeft(scrollLeft);
-        if (range && this.data) {
-          this.overview.setViewport(
-            range.startCol,
-            range.endCol,
-            range.startRow,
-            range.endRow,
-            this.data.numSites,
-            this.currentTaxaOrder.length
-          );
-        }
+    // 4. Collapsible Diagnostics Section (Model Fits & Tree)
+    this.initDiagnosticsSection();
+
+    // 5. Slide-over Site Inspector Drawer (Progressive Disclosure)
+    this.drawer = new SiteDrawer(this.container, {
+      threshold: this.threshold,
+      onClose: () => {
+        this.selectedSite = null;
+        this.plot.selectSite(null);
+        this.table.selectSite(null);
       }
     });
 
-    // Wheel listener on Tree to scroll Alignment vertically in lockstep
-    this.treeContainer.addEventListener('wheel', (e) => {
+    // Enable direct drag & drop onto the container
+    this.initDragAndDrop();
+  }
+
+  initDiagnosticsSection() {
+    this.diagWrapper = document.createElement('div');
+    this.diagWrapper.className = 'hyphy-diagnostics-card';
+    this.diagWrapper.innerHTML = `
+      <button type="button" class="diagnostics-toggle-btn" id="diag-toggle-btn">
+        <span>Model Fits &amp; Phylogeny Diagnostics</span>
+        <span id="diag-toggle-icon">▼</span>
+      </button>
+      <div class="diagnostics-content" id="diag-content">
+        <div class="diag-grid" id="diag-grid">
+          <!-- Dynamic fit metrics -->
+        </div>
+        <div class="diag-item" style="margin-top: 8px;">
+          <span class="diag-lbl">Phylogenetic Tree (Newick)</span>
+          <div class="newick-box" id="diag-newick">No tree loaded</div>
+        </div>
+      </div>
+    `;
+
+    this.layout.appendChild(this.diagWrapper);
+
+    const toggleBtn = this.diagWrapper.querySelector('#diag-toggle-btn');
+    const content = this.diagWrapper.querySelector('#diag-content');
+    const icon = this.diagWrapper.querySelector('#diag-toggle-icon');
+
+    toggleBtn.addEventListener('click', () => {
+      const isOpen = content.classList.toggle('active');
+      icon.textContent = isOpen ? '▲' : '▼';
+    });
+  }
+
+  updateDiagnostics() {
+    if (!this.data) return;
+    const grid = this.diagWrapper.querySelector('#diag-grid');
+    const newickBox = this.diagWrapper.querySelector('#diag-newick');
+
+    const isMeme = this.data.isMEME;
+    const m = this.data.analysisType ? this.data.analysisType.toUpperCase() : 'FEL';
+
+    let html = `
+      <div class="diag-item">
+        <span class="diag-lbl">Analysis Method</span>
+        <span class="diag-val">${isMeme ? 'MEME (Mixed Effects Model of Episodic Selection)' : `${m} (Fixed Effects Likelihood)`}</span>
+      </div>
+      <div class="diag-item">
+        <span class="diag-lbl">${isMeme ? 'Hypothesis Test' : 'Codon Sites'}</span>
+        <span class="diag-val font-mono">${isMeme ? 'H₀: β⁺ ≤ α vs H₁: β⁺ > α' : this.data.numSites}</span>
+      </div>
+      <div class="diag-item">
+        <span class="diag-lbl">${isMeme ? 'Codon Sites' : 'Taxa / Sequences'}</span>
+        <span class="diag-val font-mono">${isMeme ? this.data.numSites : this.data.numTaxa}</span>
+      </div>
+      <div class="diag-item">
+        <span class="diag-lbl">${isMeme ? 'Taxa / Sequences' : 'Global Mean dN/dS (ω)'}</span>
+        <span class="diag-val font-mono">${isMeme ? this.data.numTaxa : (this.data.globalOmega >= 100 ? '∞' : this.data.globalOmega.toFixed(3))}</span>
+      </div>
+    `;
+
+    // Legacy or modern fit details
+    const raw = this.data.raw || {};
+    const codonFit = raw.model_fits?.codon_mg94 || raw.fits?.['Global MG94xREV'];
+    if (codonFit) {
+      const logL = codonFit.log_likelihood ?? codonFit['Log Likelihood'];
+      const aicc = codonFit.aicc ?? codonFit['AIC-c'];
+      if (logL != null) {
+        html += `
+          <div class="diag-item">
+            <span class="diag-lbl">MG94 Log-Likelihood</span>
+            <span class="diag-val font-mono">${Number(logL).toFixed(2)}</span>
+          </div>
+        `;
+      }
+      if (aicc != null) {
+        html += `
+          <div class="diag-item">
+            <span class="diag-lbl">MG94 AICc</span>
+            <span class="diag-val font-mono">${Number(aicc).toFixed(2)}</span>
+          </div>
+        `;
+      }
+    }
+
+    grid.innerHTML = html;
+    newickBox.textContent = this.data.treeNewick || 'No Newick string available in JSON';
+  }
+
+  initDragAndDrop() {
+    this.container.addEventListener('dragover', (e) => {
       e.preventDefault();
-      const newSt = this.alignViewer.scrollTop + e.deltaY;
-      this.alignViewer.setScroll(this.alignViewer.scrollLeft, newSt);
-      this.treeViewer.setScrollTop(this.alignViewer.scrollTop);
-    }, { passive: false });
+      e.stopPropagation();
+    });
 
-    // 3. Detail Inspector Panel
-    this.inspector = new Inspector(this.container, {
-      onBranchHighlight: (branch) => {
-        this.treeViewer.highlightBranch(branch);
+    this.container.addEventListener('drop', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      const file = e.dataTransfer?.files?.[0];
+      if (file) {
+        this.loadFile(file);
       }
     });
   }
 
-  load(jsonData) {
-    this.data = new FELData(jsonData);
-
-    // Update Tree Subtitle
-    const treeSub = this.treeHeader.querySelector('#tree-sub');
-    if (treeSub) {
-      const taxaCount = this.data.taxa.length;
-      const sitesCount = this.data.numSites;
-      const methodStr = this.data.isMEME ? 'MEME (Episodic)' : 'FEL (Pervasive)';
-      const testedStr = this.data.hasBackground 
-        ? `${this.data.numTested} test, ${this.data.numBackground} bg`
-        : `All branches`;
-      treeSub.textContent = `${methodStr} • ${taxaCount} taxa • ${sitesCount} sites • ${testedStr}`;
-    }
-
-    if (this.data.isMEME) {
-      this.toolbar.setDatasetName('cd2_meme');
-    }
-
-    // 1. Pass to Tree Viewer
-    this.treeViewer.setNewick(this.data.treeNewick, this.data.treeNodes);
-
-    // 2. Reconstruct Inferred Ancestral Sequences from Tree & Events
-    this.data.reconstructAncestralSequences(this.treeViewer.root);
-
-    // 3. Compute Taxa Display Order (Extant or Extant + Ancestors)
-    this.updateTaxaOrder();
-
-    // 4. Pass Data to Alignment, Tracks & Overview
-    this.alignViewer.setData(this.data, this.currentTaxaOrder);
-    this.trackHeader.setData(this.data);
-    this.overview.setData(this.data, this.currentTaxaOrder);
-
-    // 5. Default Select First Site or First Significant Site
-    let initialSite = 1;
-    const firstSig = this.data.siteResults.find(r => r.pValue <= this.options.pThreshold);
-    if (firstSig) initialSite = firstSig.site;
-
-    this.selectSite(initialSite);
-    this.resize();
-  }
-
-  updateTaxaOrder() {
-    if (!this.data) return;
-    const leaves = this.treeViewer.leafOrder.length > 0 
-      ? this.treeViewer.leafOrder 
-      : this.data.taxa;
-
-    if (this.showAncestors && this.data.ancestralTaxa?.length > 0) {
-      this.currentTaxaOrder = [ ...leaves, ...this.data.ancestralTaxa ];
-    } else {
-      this.currentTaxaOrder = leaves;
-    }
-    this.overview?.setTaxaOrder(this.currentTaxaOrder);
-  }
-
-  setAncestorsVisible(show) {
-    this.showAncestors = show;
-    this.updateTaxaOrder();
-    this.treeViewer.setShowAncestors(show, this.data?.ancestralTaxa || []);
-    this.alignViewer.setTaxaOrder(this.currentTaxaOrder);
-    this.overview?.setTaxaOrder(this.currentTaxaOrder);
-    this.resize();
-  }
-
-  selectSite(siteIndex) {
-    if (!this.data) return;
-    const clampedSite = Math.max(1, Math.min(siteIndex, this.data.numSites));
-    this.selectedSite = clampedSite;
-
-    const siteResult = this.data.siteResults[clampedSite - 1];
-    const consensusAA = this.data.consensusAA[clampedSite - 1] || '-';
-    const siteEvents = this.data.eventsBySite[clampedSite] || [];
-
-    // 1. Update Alignment column cursor
-    this.alignViewer.setSelectedSite(clampedSite);
-
-    // 2. Update Track Header cursor
-    this.trackHeader.setSelectedSite(clampedSite);
-
-    // 3. Update Overview cursor needle
-    this.overview.setSelectedSite(clampedSite);
-
-    // 4. Highlight mutations on Phylogenetic Tree
-    this.treeViewer.setActiveSiteEvents(siteEvents);
-    this.treeViewer.setActiveSiteEBF(siteResult?.branchEBF || {});
-
-    // 5. Update Inspector panel
-    this.inspector.setSite(siteResult, consensusAA, this.data.isMEME);
-
-    // 6. Scroll Alignment into view if needed
-    const colW = this.alignViewer.getColWidth();
-    const siteX = (clampedSite - 1) * colW;
-    const curLeft = this.alignViewer.scrollLeft;
-    const viewW = this.alignViewer.width || 600;
-
-    if (siteX < curLeft) {
-      this.alignViewer.setScroll(siteX - 40, this.alignViewer.scrollTop);
-      this.trackHeader.setScrollLeft(this.alignViewer.scrollLeft);
-    } else if (siteX + colW > curLeft + viewW) {
-      this.alignViewer.setScroll(siteX - viewW + colW + 40, this.alignViewer.scrollTop);
-      this.trackHeader.setScrollLeft(this.alignViewer.scrollLeft);
-    }
-
-    // 7. Notify Bridge (macOS Cocoa / Host DOM)
-    this.bridge.notifySiteSelected(siteResult, siteEvents);
-    if (this.options.onSiteSelect) {
-      this.options.onSiteSelect(siteResult);
-    }
-  }
-
-  selectBranch(branchName) {
-    const siteEvents = (this.data?.eventsByBranch[branchName] || []).filter(
-      ev => ev.site === this.selectedSite
-    );
-    this.bridge.notifyBranchSelected(branchName, siteEvents);
-    if (this.options.onBranchSelect) {
-      this.options.onBranchSelect(branchName);
-    }
-  }
-
-  setDisplayMode(mode) {
-    this.options.displayMode = mode;
-    this.alignViewer.setDisplayMode(mode);
-    this.trackHeader.setDisplayMode(mode);
-    this.overview.setDisplayMode(mode);
-  }
-
-  setColorScheme(scheme) {
-    this.options.colorScheme = scheme;
-    this.alignViewer.setColorScheme(scheme);
-    this.overview.setColorScheme(scheme);
-  }
-
-  setPThreshold(th) {
-    this.options.pThreshold = th;
-    this.trackHeader.setPThreshold(th);
-    this.overview.setPThreshold(th);
-  }
-
-  toggleOverview() {
-    if (!this.overview) return;
-    const panel = this.overview.wrapper;
-    if (panel.style.display === 'none') {
-      panel.style.display = 'flex';
-    } else {
-      panel.style.display = 'none';
-    }
-    this.resize();
-  }
-
-  toggleTheme() {
-    if (this.container.classList.contains('hyphy-theme-light')) {
-      this.setTheme('dark');
-    } else {
-      this.setTheme('light');
-    }
-  }
-
-  setTheme(theme) {
-    this.options.theme = theme;
-    this.container.classList.remove('hyphy-theme-light', 'hyphy-theme-dark');
-    this.container.classList.add(`hyphy-theme-${theme}`);
-    this.bridge.notifyThemeChanged(theme);
-    this.resize();
-  }
-
+  // Load a File object directly
   loadFile(file) {
     const reader = new FileReader();
     reader.onload = (e) => {
-      const text = e.target.result;
-      if (file.name.endsWith('.json') || text.trim().startsWith('{')) {
-        try {
-          const json = JSON.parse(text);
-          this.load(json);
-        } catch (err) {
-          alert('Failed to parse JSON file: ' + err.message);
-        }
-      } else {
-        // External FASTA / NEXUS alignment file
-        if (this.data) {
-          const ok = this.data.loadExternalAlignment(text);
-          if (ok) {
-            this.alignViewer.setData(this.data);
-            alert(`Loaded alignment for ${this.data.numTaxa} taxa.`);
-          } else {
-            alert('Failed to parse alignment format (FASTA/NEXUS).');
-          }
-        } else {
-          alert('Please load a HyPhy FEL JSON file first before adding external alignment.');
-        }
+      try {
+        const json = JSON.parse(e.target.result);
+        this.load(json);
+      } catch (err) {
+        alert('Invalid JSON file format: ' + err.message);
       }
     };
     reader.readAsText(file);
   }
 
-  loadSample(name) {
-    let url = '/samples/bglobin.json';
-    if (name === 'fig4e') url = '/samples/fig4e.json';
-    else if (name === 'cd2_meme') url = '/samples/cd2_meme.json';
-    fetch(url)
-      .then(res => res.json())
-      .then(data => this.load(data))
-      .catch(err => console.error('Failed to load sample:', err));
+  // Load from a remote or local URL
+  async loadFromUrl(url) {
+    try {
+      const res = await fetch(url);
+      if (!res.ok) throw new Error(`HTTP ${res.status}: ${res.statusText}`);
+      const json = await res.json();
+      this.load(json);
+    } catch (err) {
+      console.error(`Failed to load FEL JSON from ${url}:`, err);
+    }
   }
 
-  initSplitter() {
-    let isDragging = false;
-    let startX = 0;
-    let startWidth = 0;
+  // Core API: Load a parsed HyPhy FEL JSON object
+  load(json) {
+    this.data = new FELData(json);
 
-    this.splitter.addEventListener('mousedown', (e) => {
-      isDragging = true;
-      startX = e.clientX;
-      startWidth = this.treePane.getBoundingClientRect().width;
-      this.splitter.classList.add('dragging');
-      document.body.style.cursor = 'col-resize';
-    });
+    // Propagate data to all subcomponents
+    this.kpiBar.setData(this.data);
+    this.plot.setData(this.data);
+    this.table.setData(this.data);
+    this.drawer.setData(this.data);
+    this.updateDiagnostics();
 
-    window.addEventListener('mousemove', (e) => {
-      if (!isDragging) return;
-      const dx = e.clientX - startX;
-      const newWidth = Math.max(160, Math.min(startWidth + dx, 600));
-      this.treePane.style.flex = `0 0 ${newWidth}px`;
-      this.resize();
-    });
-
-    window.addEventListener('mouseup', () => {
-      if (isDragging) {
-        isDragging = false;
-        this.splitter.classList.remove('dragging');
-        document.body.style.cursor = '';
+    // Notify listeners
+    this.container.dispatchEvent(new CustomEvent('data-loaded', {
+      bubbles: true,
+      composed: true,
+      detail: {
+        numSites: this.data.numSites,
+        numTaxa: this.data.numTaxa,
+        stats: this.data.getStats(this.threshold)
       }
-    });
+    }));
   }
 
-  initResizeObserver() {
-    if (window.ResizeObserver) {
-      this.ro = new ResizeObserver(() => {
-        this.resize();
-      });
-      this.ro.observe(this.container);
+  // Reactive Threshold Controller API
+  setThreshold(p) {
+    this.threshold = p;
+    this.kpiBar.setThreshold(p);
+    this.plot.setThreshold(p);
+    this.table.setThreshold(p);
+    this.drawer.setThreshold(p);
+    this.updateDiagnostics();
+
+    this.container.dispatchEvent(new CustomEvent('threshold-change', {
+      bubbles: true,
+      composed: true,
+      detail: { threshold: p }
+    }));
+
+    if (typeof this.options.onThresholdChange === 'function') {
+      this.options.onThresholdChange(p);
+    }
+  }
+
+  // Site Selection & Drawer Inspector API
+  selectSite(siteNumber, activeTab = null) {
+    this.selectedSite = siteNumber;
+    this.plot.selectSite(siteNumber);
+    this.table.selectSite(siteNumber);
+
+    if (siteNumber != null) {
+      this.drawer.inspectSite(siteNumber, activeTab);
+
+      const r = this.data ? this.data.getSite(siteNumber) : null;
+      this.container.dispatchEvent(new CustomEvent('site-select', {
+        bubbles: true,
+        composed: true,
+        detail: { site: siteNumber, raw: r, tab: activeTab }
+      }));
+
+      if (typeof this.options.onSiteSelect === 'function') {
+        this.options.onSiteSelect(siteNumber, r, activeTab);
+      }
     } else {
-      window.addEventListener('resize', () => this.resize());
+      this.drawer.close();
     }
   }
 
-  resize() {
-    const ovRect = this.container.getBoundingClientRect();
-    if (ovRect.width > 0 && this.overview) {
-      this.overview.resize(ovRect.width);
-    }
+  // Table Filter API
+  setFilter(filterType) {
+    this.table.setFilterType(filterType);
+  }
 
-    const treeRect = this.treeContainer.getBoundingClientRect();
-    if (treeRect.width > 0 && treeRect.height > 0) {
-      this.treeViewer.resize(treeRect.width, treeRect.height);
+  // Theme API
+  setTheme(theme) {
+    this.options.theme = theme;
+    if (theme === 'dark') {
+      this.container.classList.add('hyphy-theme-dark');
+    } else {
+      this.container.classList.remove('hyphy-theme-dark');
     }
-
-    const tracksRect = this.tracksContainer.getBoundingClientRect();
-    if (tracksRect.width > 0) {
-      this.trackHeader.resize(tracksRect.width);
-    }
-
-    const alignRect = this.alignContainer.getBoundingClientRect();
-    if (alignRect.width > 0 && alignRect.height > 0) {
-      this.alignViewer.resize(alignRect.width, alignRect.height);
-      const range = this.alignViewer.getVisibleRange();
-      if (range && this.data && this.overview) {
-        this.overview.setViewport(
-          range.startCol,
-          range.endCol,
-          range.startRow,
-          range.endRow,
-          this.data.numSites,
-          this.currentTaxaOrder.length
-        );
-      }
-    }
+    this.plot.render();
   }
 }
 
-// Register as Standard W3C Custom Element (<hyphy-fel-viewer>)
-if (typeof customElements !== 'undefined' && !customElements.get('hyphy-fel-viewer')) {
-  class HyPhyFELViewerElement extends HTMLElement {
-    connectedCallback() {
-      if (!this.viewer) {
-        const theme = this.getAttribute('theme') || 'dark';
-        this.viewer = new HyPhyFELViewer(this, { theme });
-        const src = this.getAttribute('src');
-        if (src) {
-          fetch(src)
-            .then(res => res.json())
-            .then(json => this.viewer.load(json))
-            .catch(err => console.error('Failed to load JSON from src:', err));
-        }
+// Custom Element / Web Component Definition: <hyphy-fel-viewer> & <hyphy-fel-widget>
+export class HyPhyFELViewerElement extends HTMLElement {
+  constructor() {
+    super();
+    this.viewer = null;
+  }
+
+  connectedCallback() {
+    if (!this.viewer) {
+      const theme = this.getAttribute('theme') || 'light';
+      const threshold = parseFloat(this.getAttribute('threshold')) || 0.1;
+      const filter = this.getAttribute('filter') || 'diversifying';
+
+      this.viewer = new HyPhyFELViewer(this, {
+        theme,
+        threshold,
+        filterType: filter
+      });
+
+      const src = this.getAttribute('src');
+      if (src) {
+        this.viewer.loadFromUrl(src);
       }
-    }
-
-    load(json) {
-      this.viewer?.load(json);
-    }
-
-    selectSite(idx) {
-      this.viewer?.selectSite(idx);
-    }
-
-    setTheme(theme) {
-      this.viewer?.setTheme(theme);
     }
   }
 
-  customElements.define('hyphy-fel-viewer', HyPhyFELViewerElement);
+  static get observedAttributes() {
+    return ['src', 'threshold', 'theme', 'filter'];
+  }
+
+  attributeChangedCallback(name, oldVal, newVal) {
+    if (!this.viewer || oldVal === newVal) return;
+    if (name === 'src' && newVal) {
+      this.viewer.loadFromUrl(newVal);
+    } else if (name === 'threshold') {
+      this.viewer.setThreshold(parseFloat(newVal) || 0.1);
+    } else if (name === 'theme') {
+      this.viewer.setTheme(newVal);
+    } else if (name === 'filter') {
+      this.viewer.setFilter(newVal);
+    }
+  }
+
+  // Passthrough methods
+  load(data) {
+    if (this.viewer) this.viewer.load(data);
+  }
+
+  loadFromUrl(url) {
+    if (this.viewer) this.viewer.loadFromUrl(url);
+  }
+
+  setThreshold(p) {
+    if (this.viewer) this.viewer.setThreshold(p);
+  }
+
+  selectSite(s) {
+    if (this.viewer) this.viewer.selectSite(s);
+  }
+
+  setFilter(f) {
+    if (this.viewer) this.viewer.setFilter(f);
+  }
+}
+
+export class HyPhyFELWidgetElement extends HyPhyFELViewerElement {}
+
+export class HyPhyMEMEViewer extends HyPhyFELViewer {}
+export class HyPhyMEMEViewerElement extends HyPhyFELViewerElement {}
+export class HyPhyMEMEWidgetElement extends HyPhyFELViewerElement {}
+
+if (typeof customElements !== 'undefined') {
+  if (!customElements.get('hyphy-fel-viewer')) {
+    customElements.define('hyphy-fel-viewer', HyPhyFELViewerElement);
+  }
+
+  if (!customElements.get('hyphy-fel-widget')) {
+    customElements.define('hyphy-fel-widget', HyPhyFELWidgetElement);
+  }
+
+  if (!customElements.get('hyphy-meme-viewer')) {
+    customElements.define('hyphy-meme-viewer', HyPhyMEMEViewerElement);
+  }
+
+  if (!customElements.get('hyphy-meme-widget')) {
+    customElements.define('hyphy-meme-widget', HyPhyMEMEWidgetElement);
+  }
 }
