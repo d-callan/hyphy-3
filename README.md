@@ -196,6 +196,8 @@ This allows joint L-BFGS optimization across all branch lengths simultaneously i
 | **BUSTED** | Has the gene evolved under episodic selection? | Gene-wide (all branches) | 3-category ω mixture, ½ χ²₀ + ½ χ²₂ | Site mixture | Optional | 100% Verified |
 | **BUSTED-S** | Gene-wide selection robust to synonymous variation? | Gene-wide with SRV | Discrete site-to-site α and ω mixture | Site α & ω | Optional | 100% Verified |
 | **BUSTED-MH** | Gene-wide selection accounting for multi-nucleotide hits? | Gene-wide with MH | Reversible 1-hit, 2-hit (δ), 3-hit (ψ) generator | Site α & ω | Double, Double+Triple | 100% Verified |
+| **BUSTED-E** | Gene-wide selection robust to alignment/sequencing errors? | Gene-wide with Error Sink | Huber ε-contaminated saturation replacement kernel | Site α & ω + P_sink | Optional | 100% Verified |
+| **BUSTED-Auto** | Principled automatic selection of Sink, MH, SRV, and K? | Gene-wide Full-Auto | 4-Gate Surprisal & Score Model Selector | Auto-selected | Auto-selected | 100% Verified |
 | **aBSREL** | Which specific lineages/branches evolved under selection? | Lineage-specific | Adaptive complexity selection (AICc Step-Up) | Branch-site ω | — | |Δ ln L| < 2.0 |
 | **RELAX** | Has selection relaxed (K < 1) or intensified (K > 1) on test branches? | Branch-set contrast | 3-rate mixture with exponent K, χ²₁ LRT | Site mixture | — | 100% Verified |
 | **GTR / MG94** | What are baseline nucleotide biases & global dN/dS? | Alignment-wide | Reversible CTMC with F3x4 equilibrium | Global ω | Supported | 100% Verified |
@@ -247,6 +249,15 @@ Q_ij = (α or β) × ψ × ∏_{p ∈ D} r_{i_p → j_p} π_{j_p}^(p)    (|D|K =
 ```
   - Strictly preserves detailed balance π_i Q_ij = π_j Q_ji, maintaining fast symmetric eigensolvers.
   - Jointly estimates δ and ψ and reports flux-weighted instantaneous substitution rates and substitution fractions (frac_δ, frac_ψ).
+- **BUSTED-E (`--error-sink`, Saturation Replacement Kernel)**:
+  - Formulates a Huber ε-contaminated transition probability model P̃_b(t_b) = (1 - ε_sink) P_bio(t_b) + ε_sink P_sink, where P_sink(i, j) = π_j / (1 - π_i) for i ≠ j and 0 for i = j.
+  - Evaluates the rank-1 + diagonal bilinear form in O(S) per branch-site, estimates ε_sink via exact EM responsibility accumulation, and flags anomalous misaligned or frameshifted branch-sites via Empirical Bayes Factors (BF ≥ 20).
+- **BUSTED-Auto (`--auto`, 4-Gate Surprisal & Score Model Selector)**:
+  - Eliminates combinatorial 36-model grid searches by diagnosing and selecting the optimal model configuration from a single fast baseline fit:
+    - **Gate 1 (Error Sink):** Evaluates branch-site surprisal gain ΔI_sink (in bits) and spatial adjacency, activating `--error-sink` only if a 3-step EM probe yields Δ ln L > 2.0.
+    - **Gate 2 (Multi-Hits):** Computes error-quarantined tangent scores for 2-hit (δ) and 3-hit (ψ) transitions weighted by (1 - Pr(sink | b, s)), preventing alignment errors from masquerading as biological multi-hits.
+    - **Gate 3 (Synonymous Rate Variation):** Evaluates the Neyman-Scott synonymous overdispersion statistic Z_SRV across sites and selects M ∈ {1, 2, 3}.
+    - **Gate 4 (Omega Rate Classes):** Compares K = 2 vs. K = 3 under the Null model and prunes collapsed or over-parameterized rate classes.
 - **BUSTED Auto-K**:
   - Automatically identifies the optimal number of selection categories K ∈ {1, 2, ..., K_max} via step-up AICc optimization, avoiding over-parameterization on simpler datasets.
 
@@ -418,6 +429,8 @@ HyPhy 3 provides both a unified driver (`hyphy3 <analysis>`) and dedicated stand
 | **BUSTED** | `hyphy3 busted` | `--alignment`, `--tree`, `--rates 3`, `--threads N`, `--output` | Standard gene-wide episodic selection |
 | **BUSTED-S** | `hyphy3 busted` | `--srv`, `--syn-rates 3` | Synonymous rate variation across sites |
 | **BUSTED-MH** | `hyphy3 busted` | `--multiple-hits [None\|Double\|Double+Triple]` | Multi-nucleotide substitutions (2-hit and 3-hit) |
+| **BUSTED-E** | `hyphy3 busted` | `--error-sink`, `--error-sink-bf 20.0` | Saturation replacement kernel for alignment/sequencing error quarantine |
+| **BUSTED-Auto**| `hyphy3 busted` | `--auto` (`--full-auto`) | 4-Gate Surprisal & Score Automatic Model Selector (Sink, MH, SRV, K) |
 | **BUSTED Auto-K**| `hyphy3 busted` | `--auto-k` | Automatic selection of rate categories via AICc step-up |
 | **aBSREL** | `hyphy3 absrel`| `--alignment`, `--tree`, `--rates 3`, `--threads N`, `--output` | Lineage-specific adaptive selection |
 | **RELAX** | `hyphy3 relax` | `--alignment`, `--tree`, `--test <regex|names>`, `--pvalue 0.05`, `--output` | Test for selection relaxation/intensification across branch sets |

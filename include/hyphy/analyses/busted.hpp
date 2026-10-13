@@ -32,11 +32,19 @@ namespace hyphy::analyses {
 using namespace hyphy::core;
 using namespace hyphy::opt;
 
+struct BUSTEDErrorEvent {
+    size_t site = 0;         // 1-based codon site
+    std::string branch_name; // Node/branch name
+    Scalar posterior = 0.0;  // Posterior probability P(sink | b, s)
+    Scalar bayes_factor = 0.0; // Empirical Bayes factor for error sink at (b, s)
+};
+
 struct BUSTEDRateDistribution {
     std::vector<Scalar> omegas;
     std::vector<Scalar> weights;
     std::vector<Scalar> syn_rates;
     std::vector<Scalar> syn_weights;
+    Scalar error_sink_weight = 0.0; // Contamination weight epsilon in [0, error_sink_max]
     std::vector<std::string> annotations; // e.g. "Collapsed rate class"
 };
 
@@ -52,9 +60,39 @@ struct BUSTEDFit {
     Scalar psi = 0.0;        // Triple-hit rate parameter
     Scalar frac_delta = 0.0;  // Fraction of 2-hit substitutions
     Scalar frac_psi = 0.0;    // Fraction of 3-hit substitutions
+    Scalar error_sink_weight = 0.0; // Fitted contamination proportion epsilon
+};
+
+struct BUSTEDAutoDiagnostics {
+    bool enabled = false;
+    // Gate 1: Error Sink (Saturation Replacement Kernel)
+    Scalar max_sink_surprisal_bits = 0.0; // max_{b,s} log2(L_sink(b,s) / L_0(s))
+    Scalar max_sink_bf = 0.0;             // max_{b,s} Empirical Bayes Factor at baseline
+    size_t sink_candidate_sites = 0;      // Branch-sites with > 8 bits saturation surprisal
+    size_t sink_adjacent_clusters = 0;    // Same-branch adjacent pairs (|s1 - s2| <= 2) with high surprisal
+    Scalar sink_delta_ll = 0.0;           // Log-likelihood gain of saturation error sink at baseline
+    bool activated_error_sink = false;
+
+    // Gate 2: Multi-Hits (Instantaneous 2-nt / 3-nt Substitutions)
+    Scalar double_hit_score = 0.0;        // Quarantined first-order tangent score for delta
+    Scalar triple_hit_score = 0.0;        // Quarantined first-order tangent score for psi
+    Scalar double_hit_delta_ll = 0.0;     // Log-likelihood gain for Double hits (conditioned on Gate 1)
+    Scalar triple_hit_delta_ll = 0.0;     // Log-likelihood gain for Triple hits (conditioned on Double)
+    std::string selected_multiple_hits = "None";
+
+    // Gate 3: Synonymous Rate Variation (SRV)
+    Scalar srv_overdispersion_z = 0.0;    // Neyman-Scott / Lindsay synonymous dispersion Z-score
+    Scalar srv_delta_ll = 0.0;            // 1-step SQUAREM SRV log-likelihood gain
+    bool activated_srv = false;
+    size_t selected_syn_rates = 1;
+
+    // Gate 4: Omega Rate Classes (K)
+    size_t selected_k = 3;
+    std::string k_rationale;
 };
 
 struct BUSTEDSettings {
+    bool full_auto = false;            // Enable 4-gate surprisal & score automatic model selector (BUSTED-Auto)
     size_t num_rate_classes = 3;       // Default K = 3
     bool srv = false;                  // Enable synonymous rate variation (BUSTED-S)
     size_t num_syn_rate_classes = 3;   // Default M = 3 for alpha
@@ -63,10 +101,14 @@ struct BUSTEDSettings {
     bool refine_branch_lengths = true; // Re-optimize individual branch lengths
     Scalar p_value_threshold = 0.05;
     std::string multiple_hits = "None"; // "None", "Double", "Double+Triple"
+    bool error_sink = false;           // Enable Option A saturation/replacement error sink
+    Scalar error_sink_max_weight = 0.01; // Upper bound on contamination proportion epsilon
+    Scalar error_sink_bf_threshold = 100.0; // Bayes factor cutoff to flag branch-site errors
 };
 
 struct BUSTEDResult {
     BUSTEDSettings settings;
+    BUSTEDAutoDiagnostics auto_diagnostics;
     size_t optimal_k = 3;
     std::vector<BUSTEDFit> k_null_fits; // Null model fits for K=1, 2, ...
     Scalar lrt = 0.0;
@@ -74,6 +116,8 @@ struct BUSTEDResult {
     BUSTEDFit unconstrained;
     BUSTEDFit constrained;
     std::vector<Scalar> evidence_ratios; // Bayes factors per site for omega_K > 1
+    std::vector<Scalar> site_error_bfs;  // Max error sink Bayes factor across branches per site
+    std::vector<BUSTEDErrorEvent> flagged_error_events; // Branch-site pairs with BF_sink >= threshold
     double runtime_seconds = 0.0;
 };
 
@@ -89,6 +133,10 @@ public:
     std::vector<bool> is_test_branch;
     std::vector<size_t> leaf_to_taxon;
     size_t num_test_branches = 0;
+
+    // Precomputed off-diagonal saturation replacement kernel P_sink(i, j) = pi_j / (1 - pi_i) for i != j, 0 for i == j
+    Matrix P_sink;
+    Vector inv_one_minus_pi;
 
     // GTR baseline results
     bool has_gtr_fit = false;
@@ -113,7 +161,35 @@ public:
         is_test_branch.assign(num_nodes, true); // Default: all branches are Test
         num_test_branches = num_nodes - 1; // Non-root branches
         leaf_to_taxon = LikelihoodEngine::build_leaf_to_taxon_map(tree, aln);
+        build_sink_kernel();
         prepare_baseline_lengths();
+    }
+
+    void build_sink_kernel() {
+        int S = code->num_sense_codons;
+        P_sink = Matrix::Zero(S, S);
+        inv_one_minus_pi = Vector::Zero(S);
+        for (int i = 0; i < S; ++i) {
+            Scalar denom = std::max(1e-12, 1.0 - aln.codon_frequencies_f3x4(i));
+            inv_one_minus_pi(i) = 1.0 / denom;
+            for (int j = 0; j < S; ++j) {
+                if (i != j) {
+                    P_sink(i, j) = aln.codon_frequencies_f3x4(j) * inv_one_minus_pi(i);
+                }
+            }
+        }
+    }
+
+    // O(S) evaluation of V^T * P_sink * D using the rank-1 off-diagonal identity
+    inline Scalar eval_sink_bilinear(const Vector& V, const Vector& D) const {
+        Scalar pi_dot_D = aln.codon_frequencies_f3x4.dot(D);
+        int S = static_cast<int>(V.size());
+        Scalar acc = 0.0;
+        for (int i = 0; i < S; ++i) {
+            Scalar p_sink_D_i = (pi_dot_D - aln.codon_frequencies_f3x4(i) * D(i)) * inv_one_minus_pi(i);
+            acc += V(i) * std::max(0.0, p_sink_D_i);
+        }
+        return acc;
     }
 
     static BUSTEDAnalyzer create_and_fit(
@@ -167,7 +243,7 @@ public:
         }
     }
 
-    // Evaluates tree log-likelihood for arbitrary K rate categories, optional SRV (M classes), and custom branch lengths
+    // Evaluates tree log-likelihood for arbitrary K rate categories, optional SRV (M classes), optional saturation error sink (eps), and custom branch lengths
     Scalar evaluate_log_l(
         Scalar s,
         const std::vector<Scalar>& omegas,
@@ -177,13 +253,15 @@ public:
         const std::vector<Scalar>* custom_branch_lengths = nullptr,
         std::vector<Scalar>* out_pattern_ll = nullptr,
         Scalar delta = 0.0,
-        Scalar psi = 0.0
+        Scalar psi = 0.0,
+        Scalar eps_sink = 0.0
     ) const {
         size_t num_nodes = tree.num_nodes();
         size_t num_patterns = aln.patterns.size();
         int S = code->num_sense_codons;
         size_t K = omegas.size();
         size_t M = syn_rates.size();
+        Scalar bio_scale = 1.0 - eps_sink;
 
         // Build K rate matrices
         std::vector<MG94Matrix> mg(K);
@@ -204,8 +282,12 @@ public:
                 if (node.id != tree.root_id) {
                     Scalar bl = custom_branch_lengths ? (*custom_branch_lengths)[node.id] : (s * branch_tau[node.id]);
                     P_mix[m][node.id] = Matrix::Zero(S, S);
+                    Scalar use_bio = (eps_sink > 0.0 && is_test_branch[node.id]) ? bio_scale : 1.0;
                     for (size_t k = 0; k < K; ++k) {
-                        P_mix[m][node.id] += weights[k] * mg[k].transition_matrix(alpha_m * bl);
+                        P_mix[m][node.id] += (use_bio * weights[k]) * mg[k].transition_matrix(alpha_m * bl);
+                    }
+                    if (eps_sink > 0.0 && is_test_branch[node.id]) {
+                        P_mix[m][node.id].noalias() += eps_sink * P_sink;
                     }
                 }
             }
@@ -262,7 +344,7 @@ public:
         return total_log_l;
     }
 
-    // Expectation Step: Computes new mixture weights via inside-outside traversal for arbitrary K >= 1 and optional SRV
+    // Expectation Step: Computes new mixture weights (and optional saturation sink weight eps_sink) via inside-outside traversal
     std::vector<Scalar> compute_expected_weights(
         Scalar s,
         const std::vector<Scalar>& omegas,
@@ -271,15 +353,19 @@ public:
         const std::vector<Scalar>& syn_weights = {1.0},
         const std::vector<Scalar>* custom_branch_lengths = nullptr,
         Scalar delta = 0.0,
-        Scalar psi = 0.0
+        Scalar psi = 0.0,
+        Scalar eps_sink = 0.0,
+        Scalar* out_new_eps_sink = nullptr,
+        Scalar max_eps_sink = 0.01
     ) const {
         size_t K = omegas.size();
-        if (K <= 1) return {1.0};
+        if (K <= 1 && !out_new_eps_sink) return {1.0};
 
         size_t M = syn_rates.size();
         size_t num_nodes = tree.num_nodes();
         size_t num_patterns = aln.patterns.size();
         int S = code->num_sense_codons;
+        Scalar bio_scale = (out_new_eps_sink != nullptr) ? (1.0 - eps_sink) : 1.0;
 
         std::vector<std::vector<std::vector<Matrix>>> P_comp(M, std::vector<std::vector<Matrix>>(K, std::vector<Matrix>(num_nodes)));
         std::vector<std::vector<Matrix>> P_mix(M, std::vector<Matrix>(num_nodes));
@@ -306,19 +392,25 @@ public:
             for (const auto& node : tree.nodes) {
                 if (node.id != tree.root_id) {
                     P_mix[m][node.id] = Matrix::Zero(S, S);
+                    Scalar use_bio = (out_new_eps_sink != nullptr && is_test_branch[node.id]) ? bio_scale : 1.0;
                     for (size_t k = 0; k < K; ++k) {
-                        P_mix[m][node.id] += weights[k] * P_comp[m][k][node.id];
+                        P_mix[m][node.id] += (use_bio * weights[k]) * P_comp[m][k][node.id];
+                    }
+                    if (out_new_eps_sink != nullptr && is_test_branch[node.id]) {
+                        P_mix[m][node.id].noalias() += eps_sink * P_sink;
                     }
                 }
             }
         }
 
         Vector weight_accum = Vector::Zero(K);
+        Scalar sink_accum = 0.0;
         Scalar total_pattern_weight = 0.0;
 
         #pragma omp parallel
         {
             Vector local_accum = Vector::Zero(K);
+            Scalar local_sink_accum = 0.0;
             Scalar local_pat_wt = 0.0;
             #pragma omp for schedule(dynamic)
             for (size_t p = 0; p < num_patterns; ++p) {
@@ -343,7 +435,14 @@ public:
                                 for (size_t m = 0; m < M; ++m) {
                                     num += syn_weights[m] * io_m[m].V[nid].dot(P_comp[m][k][nid] * io_m[m].D[nid]);
                                 }
-                                local_accum(k) += weights[k] * inv_L * num;
+                                local_accum(k) += (bio_scale * weights[k]) * inv_L * num;
+                            }
+                            if (out_new_eps_sink != nullptr) {
+                                Scalar sink_num = 0.0;
+                                for (size_t m = 0; m < M; ++m) {
+                                    sink_num += syn_weights[m] * eval_sink_bilinear(io_m[m].V[nid], io_m[m].D[nid]);
+                                }
+                                local_sink_accum += eps_sink * inv_L * sink_num;
                             }
                             local_pat_wt += pattern.weight;
                         }
@@ -353,6 +452,7 @@ public:
             #pragma omp critical
             {
                 weight_accum += local_accum;
+                sink_accum += local_sink_accum;
                 total_pattern_weight += local_pat_wt;
             }
         }
@@ -367,8 +467,15 @@ public:
             for (size_t k = 0; k < K; ++k) {
                 new_weights[k] /= sum_w;
             }
+            if (out_new_eps_sink != nullptr) {
+                Scalar raw_eps = sink_accum / total_pattern_weight;
+                *out_new_eps_sink = std::clamp(raw_eps, 1e-7, max_eps_sink);
+            }
         } else {
             new_weights = weights;
+            if (out_new_eps_sink != nullptr) {
+                *out_new_eps_sink = eps_sink;
+            }
         }
         return new_weights;
     }
@@ -382,7 +489,8 @@ public:
         const std::vector<Scalar>& syn_weights,
         const std::vector<Scalar>* custom_branch_lengths = nullptr,
         Scalar delta = 0.0,
-        Scalar psi = 0.0
+        Scalar psi = 0.0,
+        Scalar eps_sink = 0.0
     ) const {
         size_t M = syn_rates.size();
         if (M <= 1) return {1.0};
@@ -391,6 +499,7 @@ public:
         size_t num_patterns = aln.patterns.size();
         int S = code->num_sense_codons;
         size_t K = omegas.size();
+        Scalar bio_scale = 1.0 - eps_sink;
 
         std::vector<MG94Matrix> mg(K);
         for (size_t k = 0; k < K; ++k) {
@@ -409,8 +518,12 @@ public:
                 if (node.id != tree.root_id) {
                     Scalar bl = custom_branch_lengths ? (*custom_branch_lengths)[node.id] : (s * branch_tau[node.id]);
                     P_mix[m][node.id] = Matrix::Zero(S, S);
+                    Scalar use_bio = (eps_sink > 0.0 && is_test_branch[node.id]) ? bio_scale : 1.0;
                     for (size_t k = 0; k < K; ++k) {
-                        P_mix[m][node.id] += weights[k] * mg[k].transition_matrix(alpha_m * bl);
+                        P_mix[m][node.id] += (use_bio * weights[k]) * mg[k].transition_matrix(alpha_m * bl);
+                    }
+                    if (eps_sink > 0.0 && is_test_branch[node.id]) {
+                        P_mix[m][node.id].noalias() += eps_sink * P_sink;
                     }
                 }
             }
@@ -492,7 +605,7 @@ public:
     }
 
     // Evaluates log-likelihood and exact analytical branch gradients d ln L / d t_b
-    // under the BUSTED mixture model using Inside-Outside adjoints (with optional SRV)
+    // under the BUSTED mixture model using Inside-Outside adjoints (with optional SRV and error sink)
     std::pair<Scalar, std::vector<Scalar>> compute_busted_branch_gradients(
         const std::vector<Scalar>& branch_lengths,
         const std::vector<Scalar>& omegas,
@@ -500,13 +613,15 @@ public:
         const std::vector<Scalar>& syn_rates = {1.0},
         const std::vector<Scalar>& syn_weights = {1.0},
         Scalar delta = 0.0,
-        Scalar psi = 0.0
+        Scalar psi = 0.0,
+        Scalar eps_sink = 0.0
     ) const {
         size_t num_nodes = tree.num_nodes();
         size_t num_patterns = aln.patterns.size();
         int S = code->num_sense_codons;
         size_t K = omegas.size();
         size_t M = syn_rates.size();
+        Scalar bio_scale = 1.0 - eps_sink;
 
         // 1. Build K rate matrices
         std::vector<MG94Matrix> mg(K);
@@ -520,6 +635,7 @@ public:
         }
 
         // 2. Precompute P_mix[m] and dP_mix[m] for each synonymous rate category and branch
+        // Note: d/dt_b (eps_sink * P_sink) == 0 because the saturation replacement kernel is branch-length invariant!
         std::vector<std::vector<Matrix>> P_mix(M, std::vector<Matrix>(num_nodes));
         std::vector<std::vector<Matrix>> dP_mix(M, std::vector<Matrix>(num_nodes));
         for (size_t m = 0; m < M; ++m) {
@@ -530,18 +646,20 @@ public:
                     Scalar bl = branch_lengths[nid];
                     P_mix[m][nid] = Matrix::Zero(S, S);
                     dP_mix[m][nid] = Matrix::Zero(S, S);
+                    Scalar use_bio = (eps_sink > 0.0 && is_test_branch[nid]) ? bio_scale : 1.0;
                     for (size_t k = 0; k < K; ++k) {
                         Matrix P_k = mg[k].transition_matrix(alpha_m * bl);
-                        P_mix[m][nid] += weights[k] * P_k;
-                        dP_mix[m][nid] += weights[k] * alpha_m * (mg[k].Q * P_k);
+                        P_mix[m][nid] += (use_bio * weights[k]) * P_k;
+                        dP_mix[m][nid] += (use_bio * weights[k]) * alpha_m * (mg[k].Q * P_k);
+                    }
+                    if (eps_sink > 0.0 && is_test_branch[nid]) {
+                        P_mix[m][nid].noalias() += eps_sink * P_sink;
                     }
                 }
             }
         }
 
         // 3. Parallel inside-outside traversal
-
-        // 4. Parallel inside-outside traversal
         Scalar total_log_l = 0.0;
         std::vector<Scalar> grad_b(num_nodes, 0.0);
 
@@ -600,7 +718,8 @@ public:
         const std::vector<Scalar>& syn_weights = {1.0},
         Scalar delta = 0.0,
         Scalar psi = 0.0,
-        int max_iters = 10
+        int max_iters = 10,
+        Scalar eps_sink = 0.0
     ) const {
         size_t num_nodes = tree.num_nodes();
         std::vector<Scalar> bl = init_bl;
@@ -616,7 +735,7 @@ public:
         std::vector<std::vector<Scalar>> y_hist;
         std::vector<Scalar> rho_hist;
 
-        auto [curr_ll, curr_grad] = compute_busted_branch_gradients(bl, omegas, weights, syn_rates, syn_weights, delta, psi);
+        auto [curr_ll, curr_grad] = compute_busted_branch_gradients(bl, omegas, weights, syn_rates, syn_weights, delta, psi, eps_sink);
 
         Scalar best_ll = curr_ll;
         std::vector<Scalar> best_bl = bl;
@@ -718,7 +837,7 @@ public:
                         new_bl[i] = 0.0;
                     }
                 }
-                auto [test_ll, test_grad] = compute_busted_branch_gradients(new_bl, omegas, weights, syn_rates, syn_weights, delta, psi);
+                auto [test_ll, test_grad] = compute_busted_branch_gradients(new_bl, omegas, weights, syn_rates, syn_weights, delta, psi, eps_sink);
                 if (test_ll > curr_ll + 1e-4 * step_size * dir_dot_grad) {
                     new_ll = test_ll;
                     new_grad = test_grad;
@@ -766,7 +885,7 @@ public:
         return best_bl;
     }
 
-    // Fits BUSTED model for specified number of rate classes K in {1, 2, 3} and optional SRV
+    // Fits BUSTED model for specified number of rate classes K in {1, 2, 3}, optional SRV, and optional saturation error sink
     BUSTEDFit fit_model(
         bool is_constrained,
         size_t K = 3,
@@ -775,7 +894,9 @@ public:
         size_t num_syn_rates = 3,
         const std::string& multiple_hits = "None",
         ProgressBar* pbar = nullptr,
-        const std::string& model_desc = ""
+        const std::string& model_desc = "",
+        bool use_error_sink = false,
+        Scalar max_eps_sink = 0.01
     ) const {
         BUSTEDFit fit;
         fit.num_rate_classes = K;
@@ -785,6 +906,7 @@ public:
         bool allow_triple = (multiple_hits == "Double+Triple");
         Scalar delta = 0.0;
         Scalar psi = 0.0;
+        Scalar eps_sink = use_error_sink ? std::min(0.002, max_eps_sink * 0.5) : 0.0;
 
         // Initialize rates and weights
         std::vector<Scalar> omegas(K);
@@ -816,7 +938,10 @@ public:
         std::vector<Scalar> syn_rates(M, 1.0);
         std::vector<Scalar> syn_weights(M, 1.0 / M);
 
-        if (srv && M == 3) {
+        if (srv && M == 2) {
+            syn_rates = {0.35, 1.65};
+            syn_weights = {0.50, 0.50};
+        } else if (srv && M == 3) {
             syn_rates = {0.20, 0.60, 2.20};
             syn_weights = {1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0};
         }
@@ -827,7 +952,7 @@ public:
             std::vector<Scalar> p_cands = allow_triple ? std::vector<Scalar>{0.0, 0.02, 0.05} : std::vector<Scalar>{0.0};
             for (Scalar d_c : d_cands) {
                 for (Scalar p_c : p_cands) {
-                    Scalar cand_ll = evaluate_log_l(s, omegas, weights, syn_rates, syn_weights, nullptr, nullptr, d_c, p_c);
+                    Scalar cand_ll = evaluate_log_l(s, omegas, weights, syn_rates, syn_weights, nullptr, nullptr, d_c, p_c, eps_sink);
                     if (cand_ll > best_grid_ll) {
                         best_grid_ll = cand_ll;
                         delta = d_c;
@@ -838,24 +963,34 @@ public:
         }
 
         // ECM Optimization Loop
-        int max_ecm = (K == 1 && !srv && !allow_double) ? 1 : 6;
+        int max_ecm = (K == 1 && !srv && !allow_double && !use_error_sink) ? 1 : 6;
         for (int ecm_iter = 0; ecm_iter < max_ecm; ++ecm_iter) {
-            // Block 1: SQUAREM acceleration for omega weights
-            if (K == 2) {
+            Scalar* eps_ptr = use_error_sink ? &eps_sink : nullptr;
+
+            // Block 1: SQUAREM acceleration for omega weights (and penalized EM update for eps_sink)
+            if (K == 1 && use_error_sink) {
+                weights = compute_expected_weights(s, omegas, weights, syn_rates, syn_weights, nullptr, delta, psi, eps_sink, eps_ptr, max_eps_sink);
+            } else if (K == 2) {
                 for (int sq = 0; sq < 2; ++sq) {
+                    Scalar eps0 = eps_sink;
                     auto w0 = weights;
-                    auto w1 = compute_expected_weights(s, omegas, w0, syn_rates, syn_weights, nullptr, delta, psi);
-                    auto w2 = compute_expected_weights(s, omegas, w1, syn_rates, syn_weights, nullptr, delta, psi);
+                    Scalar eps1 = eps0;
+                    auto w1 = compute_expected_weights(s, omegas, w0, syn_rates, syn_weights, nullptr, delta, psi, eps0, use_error_sink ? &eps1 : nullptr, max_eps_sink);
+                    Scalar eps2 = eps1;
+                    auto w2 = compute_expected_weights(s, omegas, w1, syn_rates, syn_weights, nullptr, delta, psi, eps1, use_error_sink ? &eps2 : nullptr, max_eps_sink);
+                    eps_sink = eps2;
                     Scalar r = w1[0] - w0[0];
                     Scalar v = (w2[0] - w1[0]) - r;
                     if (std::abs(v) > 1e-12) {
                         Scalar step = -std::abs(r) / std::abs(v);
                         Scalar p_acc = std::clamp(w0[0] - 2.0 * step * r + step * step * v, 1e-5, 1.0 - 1e-5);
                         std::vector<Scalar> w_acc = {p_acc, 1.0 - p_acc};
-                        auto w_stab = compute_expected_weights(s, omegas, w_acc, syn_rates, syn_weights, nullptr, delta, psi);
-                        if (evaluate_log_l(s, omegas, w_stab, syn_rates, syn_weights, nullptr, nullptr, delta, psi) >=
-                            evaluate_log_l(s, omegas, w2, syn_rates, syn_weights, nullptr, nullptr, delta, psi)) {
+                        Scalar eps_stab = eps_sink;
+                        auto w_stab = compute_expected_weights(s, omegas, w_acc, syn_rates, syn_weights, nullptr, delta, psi, eps_sink, use_error_sink ? &eps_stab : nullptr, max_eps_sink);
+                        if (evaluate_log_l(s, omegas, w_stab, syn_rates, syn_weights, nullptr, nullptr, delta, psi, eps_stab) >=
+                            evaluate_log_l(s, omegas, w2, syn_rates, syn_weights, nullptr, nullptr, delta, psi, eps2)) {
                             weights = w_stab;
+                            eps_sink = eps_stab;
                         } else {
                             weights = w2;
                         }
@@ -865,9 +1000,13 @@ public:
                 }
             } else if (K == 3) {
                 for (int sq = 0; sq < 2; ++sq) {
+                    Scalar eps0 = eps_sink;
                     auto w0 = weights;
-                    auto w1 = compute_expected_weights(s, omegas, w0, syn_rates, syn_weights, nullptr, delta, psi);
-                    auto w2 = compute_expected_weights(s, omegas, w1, syn_rates, syn_weights, nullptr, delta, psi);
+                    Scalar eps1 = eps0;
+                    auto w1 = compute_expected_weights(s, omegas, w0, syn_rates, syn_weights, nullptr, delta, psi, eps0, use_error_sink ? &eps1 : nullptr, max_eps_sink);
+                    Scalar eps2 = eps1;
+                    auto w2 = compute_expected_weights(s, omegas, w1, syn_rates, syn_weights, nullptr, delta, psi, eps1, use_error_sink ? &eps2 : nullptr, max_eps_sink);
+                    eps_sink = eps2;
                     Scalar r0 = w1[0] - w0[0], r1 = w1[1] - w0[1];
                     Scalar v0 = (w2[0] - w1[0]) - r0, v1 = (w2[1] - w1[1]) - r1;
                     Scalar r2 = r0 * r0 + r1 * r1;
@@ -883,10 +1022,12 @@ public:
                         }
                         Scalar p3_acc = 1.0 - p1_acc - p2_acc;
                         std::vector<Scalar> w_acc = {p1_acc, p2_acc, p3_acc};
-                        auto w_stab = compute_expected_weights(s, omegas, w_acc, syn_rates, syn_weights, nullptr, delta, psi);
-                        if (evaluate_log_l(s, omegas, w_stab, syn_rates, syn_weights, nullptr, nullptr, delta, psi) >=
-                            evaluate_log_l(s, omegas, w2, syn_rates, syn_weights, nullptr, nullptr, delta, psi)) {
+                        Scalar eps_stab = eps_sink;
+                        auto w_stab = compute_expected_weights(s, omegas, w_acc, syn_rates, syn_weights, nullptr, delta, psi, eps_sink, use_error_sink ? &eps_stab : nullptr, max_eps_sink);
+                        if (evaluate_log_l(s, omegas, w_stab, syn_rates, syn_weights, nullptr, nullptr, delta, psi, eps_stab) >=
+                            evaluate_log_l(s, omegas, w2, syn_rates, syn_weights, nullptr, nullptr, delta, psi, eps2)) {
                             weights = w_stab;
+                            eps_sink = eps_stab;
                         } else {
                             weights = w2;
                         }
@@ -900,8 +1041,8 @@ public:
             if (srv && M >= 2) {
                 for (int sq = 0; sq < 2; ++sq) {
                     auto q0 = syn_weights;
-                    auto q1 = compute_expected_syn_weights(s, omegas, weights, syn_rates, q0, nullptr, delta, psi);
-                    auto q2 = compute_expected_syn_weights(s, omegas, weights, syn_rates, q1, nullptr, delta, psi);
+                    auto q1 = compute_expected_syn_weights(s, omegas, weights, syn_rates, q0, nullptr, delta, psi, eps_sink);
+                    auto q2 = compute_expected_syn_weights(s, omegas, weights, syn_rates, q1, nullptr, delta, psi, eps_sink);
                     if (M == 2) {
                         Scalar r = q1[0] - q0[0];
                         Scalar v = (q2[0] - q1[0]) - r;
@@ -909,9 +1050,9 @@ public:
                             Scalar step = -std::abs(r) / std::abs(v);
                             Scalar q_acc = std::clamp(q0[0] - 2.0 * step * r + step * step * v, 1e-5, 1.0 - 1e-5);
                             std::vector<Scalar> q_cand = {q_acc, 1.0 - q_acc};
-                            auto q_stab = compute_expected_syn_weights(s, omegas, weights, syn_rates, q_cand, nullptr, delta, psi);
-                            if (evaluate_log_l(s, omegas, weights, syn_rates, q_stab, nullptr, nullptr, delta, psi) >=
-                                evaluate_log_l(s, omegas, weights, syn_rates, q2, nullptr, nullptr, delta, psi)) {
+                            auto q_stab = compute_expected_syn_weights(s, omegas, weights, syn_rates, q_cand, nullptr, delta, psi, eps_sink);
+                            if (evaluate_log_l(s, omegas, weights, syn_rates, q_stab, nullptr, nullptr, delta, psi, eps_sink) >=
+                                evaluate_log_l(s, omegas, weights, syn_rates, q2, nullptr, nullptr, delta, psi, eps_sink)) {
                                 syn_weights = q_stab;
                             } else {
                                 syn_weights = q2;
@@ -928,16 +1069,16 @@ public:
                             Scalar step = -std::sqrt(r2 / v2);
                             Scalar q1_acc = std::clamp(q0[0] - 2.0 * step * r0 + step * step * v0, 1e-5, 1.0 - 1e-5);
                             Scalar q2_acc = std::clamp(q0[1] - 2.0 * step * r1 + step * step * v1, 1e-5, 1.0 - 1e-5);
-                            if (q1_acc + q2_acc > 1.0 - 1e-5) {
+                            if (q1_acc + q2_acc > 1.0 - 1.e-5) {
                                 Scalar sum_q = q1_acc + q2_acc;
                                 q1_acc = (q1_acc / sum_q) * 0.99;
                                 q2_acc = (q2_acc / sum_q) * 0.99;
                             }
                             Scalar q3_acc = 1.0 - q1_acc - q2_acc;
                             std::vector<Scalar> q_cand = {q1_acc, q2_acc, q3_acc};
-                            auto q_stab = compute_expected_syn_weights(s, omegas, weights, syn_rates, q_cand, nullptr, delta, psi);
-                            if (evaluate_log_l(s, omegas, weights, syn_rates, q_stab, nullptr, nullptr, delta, psi) >=
-                                evaluate_log_l(s, omegas, weights, syn_rates, q2, nullptr, nullptr, delta, psi)) {
+                            auto q_stab = compute_expected_syn_weights(s, omegas, weights, syn_rates, q_cand, nullptr, delta, psi, eps_sink);
+                            if (evaluate_log_l(s, omegas, weights, syn_rates, q_stab, nullptr, nullptr, delta, psi, eps_sink) >=
+                                evaluate_log_l(s, omegas, weights, syn_rates, q2, nullptr, nullptr, delta, psi, eps_sink)) {
                                 syn_weights = q_stab;
                             } else {
                                 syn_weights = q2;
@@ -955,13 +1096,13 @@ public:
             if (is_constrained) {
                 if (K == 1) {
                     auto opt = NelderMead2D::minimize([&](Scalar w1, Scalar s_c) {
-                        return -evaluate_log_l(s_c, {w1}, weights, syn_rates, syn_weights, nullptr, nullptr, delta, psi);
+                        return -evaluate_log_l(s_c, {w1}, weights, syn_rates, syn_weights, nullptr, nullptr, delta, psi, eps_sink);
                     }, omegas[0], s, 1e-4, 1.0, 1e-4, 40);
                     omegas[0] = opt.a;
                     s = opt.b;
                 } else if (K == 2) {
                     auto opt = NelderMead2D::minimize([&](Scalar w1, Scalar s_c) {
-                        return -evaluate_log_l(s_c, {w1, 1.0}, weights, syn_rates, syn_weights, nullptr, nullptr, delta, psi);
+                        return -evaluate_log_l(s_c, {w1, 1.0}, weights, syn_rates, syn_weights, nullptr, nullptr, delta, psi, eps_sink);
                     }, omegas[0], s, 1e-4, 1.0, 1e-4, 40);
                     omegas[0] = opt.a;
                     omegas[1] = 1.0;
@@ -969,7 +1110,7 @@ public:
                 } else if (K == 3) {
                     auto opt = NelderMeadND<3>::minimize([&](const std::array<Scalar, 3>& x) {
                         if (x[1] > x[2]) return 1e20;
-                        return -evaluate_log_l(x[0], {x[1], x[2], 1.0}, weights, syn_rates, syn_weights, nullptr, nullptr, delta, psi);
+                        return -evaluate_log_l(x[0], {x[1], x[2], 1.0}, weights, syn_rates, syn_weights, nullptr, nullptr, delta, psi, eps_sink);
                     }, {s, omegas[0], omegas[1]}, {0.01, 1e-4, 1e-4}, {50.0, 1.0, 1.0}, 1e-4, 40);
                     s = opt.x[0];
                     omegas[0] = opt.x[1];
@@ -977,24 +1118,25 @@ public:
                     omegas[2] = 1.0;
                 }
             } else {
+                Scalar max_omega = use_error_sink ? 50.0 : 2000.0;
                 if (K == 1) {
                     auto opt = NelderMead2D::minimize([&](Scalar w1, Scalar s_c) {
-                        return -evaluate_log_l(s_c, {w1}, weights, syn_rates, syn_weights, nullptr, nullptr, delta, psi);
-                    }, omegas[0], s, 1e-4, 2000.0, 1e-4, 40);
+                        return -evaluate_log_l(s_c, {w1}, weights, syn_rates, syn_weights, nullptr, nullptr, delta, psi, eps_sink);
+                    }, omegas[0], s, 1e-4, max_omega, 1e-4, 40);
                     omegas[0] = opt.a;
                     s = opt.b;
                 } else if (K == 2) {
                     auto opt = NelderMeadND<3>::minimize([&](const std::array<Scalar, 3>& x) {
-                        return -evaluate_log_l(x[0], {x[1], x[2]}, weights, syn_rates, syn_weights, nullptr, nullptr, delta, psi);
-                    }, {s, omegas[0], omegas[1]}, {0.01, 1e-4, 1.0}, {50.0, 1.0, 2000.0}, 1e-4, 50);
+                        return -evaluate_log_l(x[0], {x[1], x[2]}, weights, syn_rates, syn_weights, nullptr, nullptr, delta, psi, eps_sink);
+                    }, {s, omegas[0], omegas[1]}, {0.01, 1e-4, 1.0}, {50.0, 1.0, max_omega}, 1e-4, 50);
                     s = opt.x[0];
                     omegas[0] = opt.x[1];
                     omegas[1] = opt.x[2];
                 } else if (K == 3) {
                     auto opt = NelderMeadND<4>::minimize([&](const std::array<Scalar, 4>& x) {
                         if (x[1] > x[2]) return 1e20;
-                        return -evaluate_log_l(x[0], {x[1], x[2], x[3]}, weights, syn_rates, syn_weights, nullptr, nullptr, delta, psi);
-                    }, {s, omegas[0], omegas[1], omegas[2]}, {0.01, 1e-4, 1e-4, 1.0}, {50.0, 1.0, 1.0, 2000.0}, 1e-4, 50);
+                        return -evaluate_log_l(x[0], {x[1], x[2], x[3]}, weights, syn_rates, syn_weights, nullptr, nullptr, delta, psi, eps_sink);
+                    }, {s, omegas[0], omegas[1], omegas[2]}, {0.01, 1e-4, 1e-4, 1.0}, {50.0, 1.0, 1.0, max_omega}, 1e-4, 50);
                     s = opt.x[0];
                     omegas[0] = opt.x[1];
                     omegas[1] = opt.x[2];
@@ -1002,13 +1144,26 @@ public:
                 }
             }
 
-            // Block 2b: Continuous search on synonymous rates (if SRV && M == 3)
-            if (srv && M == 3) {
+            // Block 2b: Continuous search on synonymous rates (if SRV && M in {2, 3})
+            if (srv && M == 2) {
+                auto syn_opt = NelderMead2D::minimize([&](Scalar a1, Scalar /*unused*/) {
+                    Scalar q1 = syn_weights[0], q2 = syn_weights[1];
+                    Scalar a2 = (1.0 - q1 * a1) / q2;
+                    if (a1 < 0.01 || a2 < a1 || a2 > 50.0) return 1e20;
+                    return -evaluate_log_l(s, omegas, weights, {a1, a2}, syn_weights, nullptr, nullptr, delta, psi, eps_sink);
+                }, syn_rates[0], 0.0, 0.01, 2.0, 1e-3, 25);
+                Scalar a1 = syn_opt.a;
+                Scalar a2 = (1.0 - syn_weights[0] * a1) / syn_weights[1];
+                if (a1 >= 0.01 && a2 >= a1) {
+                    syn_rates[0] = a1;
+                    syn_rates[1] = a2;
+                }
+            } else if (srv && M == 3) {
                 auto syn_opt = NelderMead2D::minimize([&](Scalar a1, Scalar a2) {
                     Scalar q1 = syn_weights[0], q2 = syn_weights[1], q3 = syn_weights[2];
                     Scalar a3 = (1.0 - q1 * a1 - q2 * a2) / q3;
                     if (a1 < 0.01 || a2 < a1 || a3 < a2 || a3 > 50.0) return 1e20;
-                    return -evaluate_log_l(s, omegas, weights, {a1, a2, a3}, syn_weights, nullptr, nullptr, delta, psi);
+                    return -evaluate_log_l(s, omegas, weights, {a1, a2, a3}, syn_weights, nullptr, nullptr, delta, psi, eps_sink);
                 }, syn_rates[0], syn_rates[1], 0.01, 5.0, 1e-3, 30);
 
                 Scalar a1 = syn_opt.a;
@@ -1025,14 +1180,14 @@ public:
             if (allow_triple) {
                 auto mh_opt = NelderMead2D::minimize([&](Scalar d, Scalar p) {
                     if (d < 0.0 || d > 10.0 || p < 0.0 || p > 10.0) return 1e20;
-                    return -evaluate_log_l(s, omegas, weights, syn_rates, syn_weights, nullptr, nullptr, d, p);
+                    return -evaluate_log_l(s, omegas, weights, syn_rates, syn_weights, nullptr, nullptr, d, p, eps_sink);
                 }, delta, psi, 0.0, 10.0, 1e-4, 30);
                 delta = std::max(0.0, mh_opt.a);
                 psi = std::max(0.0, mh_opt.b);
             } else if (allow_double) {
                 auto d_opt = NelderMead2D::minimize([&](Scalar d, Scalar /*unused*/) {
                     if (d < 0.0 || d > 10.0) return 1e20;
-                    return -evaluate_log_l(s, omegas, weights, syn_rates, syn_weights, nullptr, nullptr, d, 0.0);
+                    return -evaluate_log_l(s, omegas, weights, syn_rates, syn_weights, nullptr, nullptr, d, 0.0, eps_sink);
                 }, delta, 0.0, 0.0, 10.0, 1e-4, 25);
                 delta = std::max(0.0, d_opt.a);
             }
@@ -1040,9 +1195,12 @@ public:
             if (pbar) {
                 std::ostringstream ss;
                 ss << model_desc << " (ECM " << (ecm_iter + 1) << "/" << max_ecm << "): lnL = "
-                   << std::fixed << std::setprecision(2) << evaluate_log_l(s, omegas, weights, syn_rates, syn_weights, nullptr, nullptr, delta, psi);
+                   << std::fixed << std::setprecision(2) << evaluate_log_l(s, omegas, weights, syn_rates, syn_weights, nullptr, nullptr, delta, psi, eps_sink);
                 if (!is_constrained && !omegas.empty()) {
                     ss << ", ω" << K << " = " << std::setprecision(2) << omegas.back();
+                }
+                if (use_error_sink) {
+                    ss << ", ε = " << std::setprecision(4) << eps_sink;
                 }
                 pbar->set_status(ss.str());
                 pbar->tick();
@@ -1058,30 +1216,30 @@ public:
         }
 
         if (refine_branches) {
-            bl = refine_branch_lengths(bl, omegas, weights, syn_rates, syn_weights, delta, psi, 1);
+            bl = refine_branch_lengths(bl, omegas, weights, syn_rates, syn_weights, delta, psi, 1, eps_sink);
             if (pbar) {
                 std::ostringstream ss;
                 ss << model_desc << ": Branch lengths refined";
                 pbar->set_status(ss.str());
                 pbar->tick();
             }
-            if (K >= 2) {
-                weights = compute_expected_weights(1.0, omegas, weights, syn_rates, syn_weights, &bl, delta, psi);
+            if (K >= 2 || use_error_sink) {
+                weights = compute_expected_weights(1.0, omegas, weights, syn_rates, syn_weights, &bl, delta, psi, eps_sink, use_error_sink ? &eps_sink : nullptr, max_eps_sink);
             }
             if (srv && M >= 2) {
-                syn_weights = compute_expected_syn_weights(1.0, omegas, weights, syn_rates, syn_weights, &bl, delta, psi);
+                syn_weights = compute_expected_syn_weights(1.0, omegas, weights, syn_rates, syn_weights, &bl, delta, psi, eps_sink);
             }
             if (allow_triple) {
                 auto mh_polish = NelderMead2D::minimize([&](Scalar d, Scalar p) {
                     if (d < 0.0 || d > 10.0 || p < 0.0 || p > 10.0) return 1e20;
-                    return -evaluate_log_l(1.0, omegas, weights, syn_rates, syn_weights, &bl, nullptr, d, p);
+                    return -evaluate_log_l(1.0, omegas, weights, syn_rates, syn_weights, &bl, nullptr, d, p, eps_sink);
                 }, delta, psi, 0.0, 10.0, 1e-4, 25);
                 delta = std::max(0.0, mh_polish.a);
                 psi = std::max(0.0, mh_polish.b);
             } else if (allow_double) {
                 auto d_polish = NelderMead2D::minimize([&](Scalar d, Scalar /*unused*/) {
                     if (d < 0.0 || d > 10.0) return 1e20;
-                    return -evaluate_log_l(1.0, omegas, weights, syn_rates, syn_weights, &bl, nullptr, d, 0.0);
+                    return -evaluate_log_l(1.0, omegas, weights, syn_rates, syn_weights, &bl, nullptr, d, 0.0, eps_sink);
                 }, delta, 0.0, 0.0, 10.0, 1e-4, 25);
                 delta = std::max(0.0, d_polish.a);
             }
@@ -1093,12 +1251,13 @@ public:
             }
         }
 
-        Scalar best_lnL = evaluate_log_l(1.0, omegas, weights, syn_rates, syn_weights, &bl, &fit.site_log_likelihoods, delta, psi);
+        Scalar best_lnL = evaluate_log_l(1.0, omegas, weights, syn_rates, syn_weights, &bl, &fit.site_log_likelihoods, delta, psi, eps_sink);
         fit.log_likelihood = best_lnL;
         fit.tree_scale = s;
         fit.branch_lengths = bl;
         fit.delta = delta;
         fit.psi = psi;
+        fit.error_sink_weight = eps_sink;
 
         // Compute substitution rates and fractions
         Scalar total_rate = 0.0;
@@ -1122,6 +1281,7 @@ public:
 
         fit.test_distribution.omegas = omegas;
         fit.test_distribution.weights = weights;
+        fit.test_distribution.error_sink_weight = eps_sink;
         if (srv) {
             fit.test_distribution.syn_rates = syn_rates;
             fit.test_distribution.syn_weights = syn_weights;
@@ -1141,13 +1301,388 @@ public:
 
         size_t N_codons = aln.num_codons;
         size_t num_branches = tree.num_nodes() - 1;
-        size_t num_mixture_params = (2 * K - 1) - (is_constrained ? 1 : 0);
+        size_t num_mixture_params = (2 * K - 1) - (is_constrained ? 1 : 0) + (use_error_sink ? 1 : 0);
         size_t num_syn_params = srv ? 2 * (M - 1) : 0;
         size_t num_mh_params = (allow_double ? 1 : 0) + (allow_triple ? 1 : 0);
         size_t K_params = 5 + (refine_branches ? num_branches : 1) + num_mixture_params + num_syn_params + num_mh_params;
         fit.aicc = -2.0 * fit.log_likelihood + 2.0 * K_params * N_codons / (N_codons - K_params - 1.0);
 
         return fit;
+    }
+
+    // Computes branch-site Error Sink Bayes Factors in a single O(patterns * branches) Inside-Outside pass
+    void compute_error_sink_diagnostics(
+        const BUSTEDFit& fit,
+        Scalar bf_threshold,
+        std::vector<Scalar>& out_site_max_bf,
+        std::vector<BUSTEDErrorEvent>& out_flagged_events
+    ) const {
+        size_t num_sites = aln.num_codons;
+        out_site_max_bf.assign(num_sites, 0.0);
+        out_flagged_events.clear();
+
+        Scalar eps = fit.error_sink_weight;
+        if (eps <= 1e-9 || eps >= 1.0 - 1e-9) return;
+        Scalar prior_odds = eps / (1.0 - eps);
+        Scalar bio_scale = 1.0 - eps;
+
+        size_t num_nodes = tree.num_nodes();
+        size_t num_patterns = aln.patterns.size();
+        int S = code->num_sense_codons;
+        size_t K = fit.test_distribution.omegas.size();
+        std::vector<Scalar> syn_rates = fit.test_distribution.syn_rates.empty() ? std::vector<Scalar>{1.0} : fit.test_distribution.syn_rates;
+        std::vector<Scalar> syn_weights = fit.test_distribution.syn_weights.empty() ? std::vector<Scalar>{1.0} : fit.test_distribution.syn_weights;
+        size_t M = syn_rates.size();
+
+        std::vector<MG94Matrix> mg(K);
+        for (size_t k = 0; k < K; ++k) {
+            MG94Parameters p = base_params;
+            p.alpha = 1.0;
+            p.beta = fit.test_distribution.omegas[k];
+            p.delta = fit.delta;
+            p.psi = fit.psi;
+            mg[k].update(p, aln.pos_nuc_frequencies, aln.codon_frequencies_f3x4, *code);
+        }
+
+        std::vector<std::vector<Matrix>> P_mix(M, std::vector<Matrix>(num_nodes));
+        for (size_t m = 0; m < M; ++m) {
+            Scalar alpha_m = syn_rates[m];
+            for (const auto& node : tree.nodes) {
+                if (node.id != tree.root_id) {
+                    Scalar bl = fit.branch_lengths[node.id];
+                    P_mix[m][node.id] = Matrix::Zero(S, S);
+                    Scalar use_bio = is_test_branch[node.id] ? bio_scale : 1.0;
+                    for (size_t k = 0; k < K; ++k) {
+                        P_mix[m][node.id] += (use_bio * fit.test_distribution.weights[k]) * mg[k].transition_matrix(alpha_m * bl);
+                    }
+                    if (is_test_branch[node.id]) {
+                        P_mix[m][node.id].noalias() += eps * P_sink;
+                    }
+                }
+            }
+        }
+
+        // Per-pattern, per-node posterior probability of the saturation sink
+        std::vector<std::vector<Scalar>> pat_node_post(num_patterns, std::vector<Scalar>(num_nodes, 0.0));
+        #pragma omp parallel for schedule(dynamic)
+        for (size_t p = 0; p < num_patterns; ++p) {
+            const auto& pattern = aln.patterns[p];
+            Scalar pat_L = 0.0;
+            std::vector<LikelihoodEngine::InsideOutsideResult> io_m(M);
+            for (size_t m = 0; m < M; ++m) {
+                io_m[m] = LikelihoodEngine::compute_inside_outside(
+                    tree, pattern, leaf_to_taxon, P_mix[m], aln.codon_frequencies_f3x4, S
+                );
+                pat_L += syn_weights[m] * io_m[m].likelihood;
+            }
+            if (pat_L > 0.0) {
+                for (const auto& node : tree.nodes) {
+                    if (node.id != tree.root_id && is_test_branch[node.id]) {
+                        int nid = node.id;
+                        Scalar sink_num = 0.0;
+                        for (size_t m = 0; m < M; ++m) {
+                            sink_num += syn_weights[m] * eval_sink_bilinear(io_m[m].V[nid], io_m[m].D[nid]);
+                        }
+                        Scalar post = std::clamp((eps * sink_num) / pat_L, 0.0, 1.0 - 1e-9);
+                        pat_node_post[p][nid] = post;
+                    }
+                }
+            }
+        }
+
+        for (size_t s_idx = 0; s_idx < num_sites; ++s_idx) {
+            size_t p_idx = aln.site_to_pattern[s_idx];
+            Scalar max_bf = 0.0;
+            for (const auto& node : tree.nodes) {
+                if (node.id != tree.root_id && is_test_branch[node.id]) {
+                    Scalar post = pat_node_post[p_idx][node.id];
+                    Scalar post_odds = post / std::max(1e-12, 1.0 - post);
+                    Scalar bf = post_odds / prior_odds;
+                    if (bf > max_bf) max_bf = bf;
+                    if (bf >= bf_threshold) {
+                        out_flagged_events.push_back({s_idx + 1, node.name, post, bf});
+                    }
+                }
+            }
+            out_site_max_bf[s_idx] = max_bf;
+        }
+    }
+
+    // Fast 4-Gate Surprisal & Score Automatic Model Selector (BUSTED-Auto)
+    // Diagnoses Error Sink (O(1) saturation + spatial adjacency), Multi-Hits (O(t_b) quarantined tangent score),
+    // Synonymous Rate Variation (Neyman-Scott overdispersion + SQUAREM probe), and Omega classes K in a single baseline pass.
+    BUSTEDAutoDiagnostics diagnose_and_select_model(BUSTEDSettings& settings) const {
+        BUSTEDAutoDiagnostics diag;
+        diag.enabled = true;
+
+        size_t num_sites = aln.num_codons;
+        size_t num_patterns = aln.patterns.size();
+        size_t num_nodes = tree.num_nodes();
+        int S = code->num_sense_codons;
+
+        // Step 0: Fast K=2 baseline warm-up (M0: M=1, delta=0, psi=0, eps=0)
+        std::vector<Scalar> omegas0 = {std::min(0.15, 0.5 * mg94_omega), 1.0};
+        std::vector<Scalar> weights0 = {0.75, 0.25};
+        for (int it = 0; it < 2; ++it) {
+            weights0 = compute_expected_weights(1.0, omegas0, weights0);
+        }
+        Scalar base_ll = evaluate_log_l(1.0, omegas0, weights0);
+        Scalar mean_omega0 = weights0[0] * omegas0[0] + weights0[1] * omegas0[1];
+
+        // Build baseline branch transition matrices P0[node_id]
+        std::vector<MG94Matrix> mg0(2);
+        for (size_t k = 0; k < 2; ++k) {
+            MG94Parameters p = base_params;
+            p.alpha = 1.0;
+            p.beta = omegas0[k];
+            mg0[k].update(p, aln.pos_nuc_frequencies, aln.codon_frequencies_f3x4, *code);
+        }
+        std::vector<Matrix> P0(num_nodes);
+        for (const auto& node : tree.nodes) {
+            if (node.id != tree.root_id) {
+                Scalar bl = branch_tau[node.id];
+                P0[node.id] = weights0[0] * mg0[0].transition_matrix(bl) + weights0[1] * mg0[1].transition_matrix(bl);
+            }
+        }
+
+        // Build pure 2-hit (Q2_off), 3-hit (Q3_off), and synonymous (Q_syn) tangent operators at mean_omega0
+        Scalar r_nuc[4][4] = {
+            {0.0, base_params.theta_AC, 1.0, base_params.theta_AT},
+            {base_params.theta_AC, 0.0, base_params.theta_CG, base_params.theta_CT},
+            {1.0, base_params.theta_CG, 0.0, base_params.theta_GT},
+            {base_params.theta_AT, base_params.theta_CT, base_params.theta_GT, 0.0}
+        };
+        Scalar q_scale = std::max(1e-6, mg0[1].scale_factor);
+        Matrix Q2_off = Matrix::Zero(S, S);
+        Matrix Q3_off = Matrix::Zero(S, S);
+        Matrix Q_syn = Matrix::Zero(S, S);
+        for (int i = 0; i < S; ++i) {
+            Scalar syn_row_sum = 0.0;
+            for (int j = 0; j < S; ++j) {
+                if (i == j) continue;
+                const auto& diff = code->diff_matrix[i][j];
+                Scalar mod = diff.synonymous ? 1.0 : mean_omega0;
+                if (diff.num_diffs == 1 && diff.synonymous) {
+                    Scalar rate1 = r_nuc[diff.diff_from[0]][diff.diff_to[0]] * aln.pos_nuc_frequencies(diff.diff_pos[0], diff.diff_to[0]) / q_scale;
+                    Q_syn(i, j) = rate1;
+                    syn_row_sum += rate1;
+                } else if (diff.num_diffs == 2) {
+                    Scalar rate2 = mod * r_nuc[diff.diff_from[0]][diff.diff_to[0]] * r_nuc[diff.diff_from[1]][diff.diff_to[1]] *
+                                   aln.pos_nuc_frequencies(diff.diff_pos[0], diff.diff_to[0]) * aln.pos_nuc_frequencies(diff.diff_pos[1], diff.diff_to[1]) / q_scale;
+                    Q2_off(i, j) = rate2;
+                } else if (diff.num_diffs == 3) {
+                    Scalar rate3 = mod * r_nuc[diff.diff_from[0]][diff.diff_to[0]] * r_nuc[diff.diff_from[1]][diff.diff_to[1]] * r_nuc[diff.diff_from[2]][diff.diff_to[2]] *
+                                   aln.pos_nuc_frequencies(diff.diff_pos[0], diff.diff_to[0]) * aln.pos_nuc_frequencies(diff.diff_pos[1], diff.diff_to[1]) * aln.pos_nuc_frequencies(diff.diff_pos[2], diff.diff_to[2]) / q_scale;
+                    Q3_off(i, j) = rate3;
+                }
+            }
+            Q_syn(i, i) = -syn_row_sum;
+        }
+
+        // Single parallel Inside-Outside pass on M0
+        std::vector<std::vector<Scalar>> pat_R_sink(num_patterns, std::vector<Scalar>(num_nodes, 0.0));
+        std::vector<std::vector<Scalar>> pat_T2(num_patterns, std::vector<Scalar>(num_nodes, 0.0));
+        std::vector<std::vector<Scalar>> pat_T3(num_patterns, std::vector<Scalar>(num_nodes, 0.0));
+        std::vector<Scalar> pat_syn_score(num_patterns, 0.0);
+        std::vector<Scalar> pat_syn_info(num_patterns, 0.0);
+
+        #pragma omp parallel for schedule(dynamic)
+        for (size_t p = 0; p < num_patterns; ++p) {
+            const auto& pattern = aln.patterns[p];
+            auto io = LikelihoodEngine::compute_inside_outside(
+                tree, pattern, leaf_to_taxon, P0, aln.codon_frequencies_f3x4, S
+            );
+            Scalar L_p = io.likelihood;
+            if (L_p > 0.0) {
+                Scalar inv_L = 1.0 / L_p;
+                Scalar u_syn = 0.0;
+                Scalar v_syn = 0.0;
+                for (const auto& node : tree.nodes) {
+                    if (node.id != tree.root_id) {
+                        int nid = node.id;
+                        Scalar bl = branch_tau[nid];
+                        if (is_test_branch[nid]) {
+                            Scalar sink_val = eval_sink_bilinear(io.V[nid], io.D[nid]);
+                            pat_R_sink[p][nid] = sink_val * inv_L;
+                            pat_T2[p][nid] = bl * io.V[nid].dot(Q2_off * io.D[nid]) * inv_L;
+                            pat_T3[p][nid] = bl * io.V[nid].dot(Q3_off * io.D[nid]) * inv_L;
+                        }
+                        Scalar branch_u = bl * io.V[nid].dot(Q_syn * (P0[nid] * io.D[nid])) * inv_L;
+                        u_syn += branch_u;
+                        v_syn += branch_u * branch_u;
+                    }
+                }
+                pat_syn_score[p] = u_syn;
+                pat_syn_info[p] = std::max(1e-6, v_syn);
+            }
+        }
+
+        // Gate 1: Evaluate Error Sink Surprisal & Spatial Adjacency
+        Scalar max_R_sink = 0.0;
+        size_t candidate_count = 0;
+        size_t adjacent_clusters = 0;
+        Scalar eps_init = 0.002;
+        Scalar sink_resp_sum = 0.0;
+        Scalar total_branch_sites = static_cast<Scalar>(num_sites * std::max<size_t>(1, num_test_branches));
+
+        for (const auto& node : tree.nodes) {
+            if (node.id != tree.root_id && is_test_branch[node.id]) {
+                int nid = node.id;
+                int prev_high_site = -10;
+                for (size_t s_idx = 0; s_idx < num_sites; ++s_idx) {
+                    size_t p_idx = aln.site_to_pattern[s_idx];
+                    Scalar r_val = pat_R_sink[p_idx][nid];
+                    if (r_val > max_R_sink) max_R_sink = r_val;
+                    Scalar bits = (r_val > 1.0) ? std::log2(r_val) : 0.0;
+                    if (bits > 8.0) {
+                        candidate_count++;
+                    }
+                    if (bits > 6.5) {
+                        if (static_cast<int>(s_idx) - prev_high_site <= 2) {
+                            adjacent_clusters++;
+                        }
+                        prev_high_site = static_cast<int>(s_idx);
+                    }
+                    Scalar resp = (eps_init * r_val) / ((1.0 - eps_init) + eps_init * r_val);
+                    sink_resp_sum += resp;
+                }
+            }
+        }
+
+        diag.max_sink_bf = max_R_sink;
+        diag.max_sink_surprisal_bits = (max_R_sink > 1.0) ? std::log2(max_R_sink) : 0.0;
+        diag.sink_candidate_sites = candidate_count;
+        diag.sink_adjacent_clusters = adjacent_clusters;
+
+        Scalar eps_probe = std::clamp(sink_resp_sum / total_branch_sites, 1e-6, settings.error_sink_max_weight);
+        Scalar sink_probe_ll = (diag.max_sink_surprisal_bits > 6.5)
+            ? evaluate_log_l(1.0, omegas0, weights0, {1.0}, {1.0}, nullptr, nullptr, 0.0, 0.0, eps_probe)
+            : base_ll;
+        diag.sink_delta_ll = std::max(0.0, sink_probe_ll - base_ll);
+
+        // Activate Error Sink if Delta LL > 2.2 AND either extreme short-branch surprisal (>= 13.0 bits, BF >= 8192) or spatial adjacency cluster
+        if (diag.sink_delta_ll > 2.2 && (diag.max_sink_surprisal_bits >= 13.0 || (diag.sink_adjacent_clusters >= 1 && diag.max_sink_surprisal_bits >= 8.0))) {
+            diag.activated_error_sink = true;
+        }
+
+        // Gate 2: Evaluate Multi-Hit Tangent Score & Probe (Quarantining high-R_sink branch-sites if Error Sink is active)
+        Scalar eps_active = diag.activated_error_sink ? eps_probe : 0.0;
+        Scalar s_delta = 0.0;
+        Scalar s_psi = 0.0;
+        for (size_t p = 0; p < num_patterns; ++p) {
+            Scalar w_p = aln.patterns[p].weight;
+            for (const auto& node : tree.nodes) {
+                if (node.id != tree.root_id && is_test_branch[node.id]) {
+                    int nid = node.id;
+                    Scalar r_val = pat_R_sink[p][nid];
+                    Scalar r_sink = (eps_active > 0.0) ? ((eps_active * r_val) / ((1.0 - eps_active) + eps_active * r_val)) : 0.0;
+                    Scalar clean_wt = w_p * (1.0 - r_sink);
+                    s_delta += clean_wt * pat_T2[p][nid];
+                    s_psi += clean_wt * pat_T3[p][nid];
+                }
+            }
+        }
+        diag.double_hit_score = s_delta;
+        diag.triple_hit_score = s_psi;
+
+        Scalar mh_base_ll = diag.activated_error_sink ? sink_probe_ll : base_ll;
+        if (s_delta > 0.15) {
+            Scalar ll_d1 = evaluate_log_l(1.0, omegas0, weights0, {1.0}, {1.0}, nullptr, nullptr, 0.06, 0.0, eps_active);
+            Scalar ll_d2 = evaluate_log_l(1.0, omegas0, weights0, {1.0}, {1.0}, nullptr, nullptr, 0.20, 0.0, eps_active);
+            Scalar best_d = (ll_d2 > ll_d1) ? 0.20 : 0.06;
+            Scalar best_d_ll = std::max(ll_d1, ll_d2);
+            diag.double_hit_delta_ll = std::max(0.0, best_d_ll - mh_base_ll);
+
+            // Check if diffuse 2-hit evolution (with eps=0) strictly outperforms an isolated non-clustered error sink
+            if (diag.activated_error_sink && diag.sink_adjacent_clusters == 0 && diag.max_sink_surprisal_bits < 16.0) {
+                Scalar pure_d_ll = evaluate_log_l(1.0, omegas0, weights0, {1.0}, {1.0}, nullptr, nullptr, best_d, 0.0, 0.0);
+                if (pure_d_ll > sink_probe_ll + 0.5 && (pure_d_ll - base_ll) > 2.2) {
+                    diag.activated_error_sink = false;
+                    eps_active = 0.0;
+                    mh_base_ll = base_ll;
+                    best_d_ll = pure_d_ll;
+                    diag.double_hit_delta_ll = pure_d_ll - base_ll;
+                }
+            }
+
+            if (diag.double_hit_delta_ll > 2.2) {
+                diag.selected_multiple_hits = "Double";
+                if (s_psi > 0.05) {
+                    Scalar ll_p = evaluate_log_l(1.0, omegas0, weights0, {1.0}, {1.0}, nullptr, nullptr, best_d, 0.06, eps_active);
+                    diag.triple_hit_delta_ll = std::max(0.0, ll_p - best_d_ll);
+                    if (diag.triple_hit_delta_ll > 2.2) {
+                        diag.selected_multiple_hits = "Double+Triple";
+                    }
+                }
+            }
+        }
+
+        // Gate 3: Evaluate Synonymous Rate Variation (SRV) Overdispersion & Probe
+        Scalar num_disp = 0.0;
+        Scalar den_disp = 0.0;
+        for (size_t p = 0; p < num_patterns; ++p) {
+            Scalar w_p = aln.patterns[p].weight;
+            Scalar u2 = pat_syn_score[p] * pat_syn_score[p];
+            Scalar v = pat_syn_info[p];
+            num_disp += w_p * (u2 - v);
+            den_disp += w_p * v * v;
+        }
+        diag.srv_overdispersion_z = (den_disp > 1e-12) ? (num_disp / std::sqrt(2.0 * den_disp)) : 0.0;
+
+        Scalar active_d = (diag.selected_multiple_hits != "None") ? 0.10 : 0.0;
+        Scalar active_p = (diag.selected_multiple_hits == "Double+Triple") ? 0.04 : 0.0;
+        Scalar pre_srv_ll = evaluate_log_l(1.0, omegas0, weights0, {1.0}, {1.0}, nullptr, nullptr, active_d, active_p, eps_active);
+
+        std::vector<Scalar> syn_r3 = {0.20, 0.75, 2.05};
+        std::vector<Scalar> syn_w3 = {1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0};
+        for (int it = 0; it < 2; ++it) {
+            syn_w3 = compute_expected_syn_weights(1.0, omegas0, weights0, syn_r3, syn_w3, nullptr, active_d, active_p, eps_active);
+        }
+        Scalar srv3_ll = evaluate_log_l(1.0, omegas0, weights0, syn_r3, syn_w3, nullptr, nullptr, active_d, active_p, eps_active);
+        diag.srv_delta_ll = std::max(0.0, srv3_ll - pre_srv_ll);
+
+        if (diag.srv_delta_ll > 4.5 && syn_w3[0] >= 0.02 && syn_w3[1] >= 0.02 && syn_w3[2] >= 0.02) {
+            diag.activated_srv = true;
+            diag.selected_syn_rates = 3;
+        } else if (diag.srv_delta_ll > 2.2) {
+            std::vector<Scalar> syn_r2 = {0.35, 1.65};
+            std::vector<Scalar> syn_w2 = {0.50, 0.50};
+            syn_w2 = compute_expected_syn_weights(1.0, omegas0, weights0, syn_r2, syn_w2, nullptr, active_d, active_p, eps_active);
+            Scalar srv2_ll = evaluate_log_l(1.0, omegas0, weights0, syn_r2, syn_w2, nullptr, nullptr, active_d, active_p, eps_active);
+            if (srv2_ll - pre_srv_ll > 2.2 && syn_w2[0] >= 0.02 && syn_w2[1] >= 0.02) {
+                diag.activated_srv = true;
+                diag.selected_syn_rates = 2;
+                diag.srv_delta_ll = srv2_ll - pre_srv_ll;
+            }
+        }
+
+        // Gate 4: Fast Unrefined Null Screen for Optimal Omega Classes K in {2, 3}
+        BUSTEDFit null_k2 = fit_model(true, 2, false, diag.activated_srv, diag.selected_syn_rates, diag.selected_multiple_hits, nullptr, "", diag.activated_error_sink, settings.error_sink_max_weight);
+        BUSTEDFit null_k3 = fit_model(true, 3, false, diag.activated_srv, diag.selected_syn_rates, diag.selected_multiple_hits, nullptr, "", diag.activated_error_sink, settings.error_sink_max_weight);
+
+        bool k3_collapsed = (std::abs(null_k3.test_distribution.omegas[1] - null_k3.test_distribution.omegas[0]) < 0.025) ||
+                            (null_k3.test_distribution.weights[0] < 0.015) ||
+                            (null_k3.test_distribution.weights[1] < 0.015);
+        if (!k3_collapsed && (null_k3.log_likelihood - null_k2.log_likelihood > 2.5)) {
+            diag.selected_k = 3;
+            diag.k_rationale = "K=3 retained (distinct two-rate purifying background, delta lnL = +" +
+                               std::to_string(null_k3.log_likelihood - null_k2.log_likelihood) + ")";
+        } else {
+            diag.selected_k = 2;
+            diag.k_rationale = k3_collapsed
+                ? "K=2 selected (pruned collapsed/low-weight 3rd background rate class)"
+                : "K=2 selected via AICc parsimony (K=3 gain < threshold)";
+        }
+
+        // Apply selected specification to settings
+        settings.error_sink = diag.activated_error_sink;
+        settings.multiple_hits = diag.selected_multiple_hits;
+        settings.srv = diag.activated_srv;
+        settings.num_syn_rate_classes = diag.selected_syn_rates;
+        settings.num_rate_classes = diag.selected_k;
+        settings.auto_select_k = false;
+
+        return diag;
     }
 
     // Step-up model selection across K in {1, ..., max_k} using AICc on the Null model
@@ -1157,13 +1692,15 @@ public:
         bool srv = false,
         size_t num_syn_rates = 3,
         const std::string& multiple_hits = "None",
-        ProgressBar* pbar = nullptr
+        ProgressBar* pbar = nullptr,
+        bool use_error_sink = false,
+        Scalar max_eps_sink = 0.01
     ) const {
         std::vector<BUSTEDFit> null_fits;
         null_fits.reserve(max_k);
         for (size_t k = 1; k <= max_k; ++k) {
             std::string desc = "Null K=" + std::to_string(k);
-            null_fits.push_back(fit_model(true, k, refine_branches, srv, num_syn_rates, multiple_hits, pbar, desc));
+            null_fits.push_back(fit_model(true, k, refine_branches, srv, num_syn_rates, multiple_hits, pbar, desc, use_error_sink, max_eps_sink));
         }
 
         size_t optimal_k = 1;
@@ -1184,11 +1721,14 @@ public:
     ) const {
         auto t0 = std::chrono::high_resolution_clock::now();
         BUSTEDResult res;
+        if (settings.full_auto) {
+            res.auto_diagnostics = diagnose_and_select_model(settings);
+        }
         res.settings = settings;
 
         bool allow_double = (settings.multiple_hits == "Double" || settings.multiple_hits == "Double+Triple");
         auto count_steps = [&](size_t K) -> size_t {
-            size_t max_ecm = (K == 1 && !settings.srv && !allow_double) ? 1 : 6;
+            size_t max_ecm = (K == 1 && !settings.srv && !allow_double && !settings.error_sink) ? 1 : 6;
             return max_ecm + (settings.refine_branch_lengths ? 1 : 0) + ((settings.refine_branch_lengths && allow_double) ? 1 : 0);
         };
 
@@ -1220,7 +1760,9 @@ public:
                 settings.srv,
                 settings.num_syn_rate_classes,
                 settings.multiple_hits,
-                pbar.get()
+                pbar.get(),
+                settings.error_sink,
+                settings.error_sink_max_weight
             );
             res.optimal_k = opt_k;
             res.k_null_fits = null_fits;
@@ -1233,7 +1775,9 @@ public:
                 settings.num_syn_rate_classes,
                 settings.multiple_hits,
                 pbar.get(),
-                "Unconstrained K=" + std::to_string(opt_k)
+                "Unconstrained K=" + std::to_string(opt_k),
+                settings.error_sink,
+                settings.error_sink_max_weight
             );
         } else {
             res.optimal_k = settings.num_rate_classes;
@@ -1245,7 +1789,9 @@ public:
                 settings.num_syn_rate_classes,
                 settings.multiple_hits,
                 pbar.get(),
-                "Unconstrained K=" + std::to_string(settings.num_rate_classes)
+                "Unconstrained K=" + std::to_string(settings.num_rate_classes),
+                settings.error_sink,
+                settings.error_sink_max_weight
             );
             res.constrained = fit_model(
                 true,
@@ -1255,7 +1801,9 @@ public:
                 settings.num_syn_rate_classes,
                 settings.multiple_hits,
                 pbar.get(),
-                "Constrained K=" + std::to_string(settings.num_rate_classes)
+                "Constrained K=" + std::to_string(settings.num_rate_classes),
+                settings.error_sink,
+                settings.error_sink_max_weight
             );
         }
 
@@ -1305,6 +1853,17 @@ public:
             }
         }
 
+        if (settings.error_sink) {
+            compute_error_sink_diagnostics(
+                res.unconstrained,
+                settings.error_sink_bf_threshold,
+                res.site_error_bfs,
+                res.flagged_error_events
+            );
+        } else {
+            res.site_error_bfs.assign(num_sites, 0.0);
+        }
+
         auto t1 = std::chrono::high_resolution_clock::now();
         res.runtime_seconds = std::chrono::duration<double>(t1 - t0).count();
         return res;
@@ -1319,7 +1878,7 @@ public:
             {"contact", "spond@temple.edu"},
             {"version", "4.7-next"},
             {"settings", {
-                {"error-sink", 0},
+                {"error-sink", res.settings.error_sink ? 1 : 0},
                 {"mss", "No"},
                 {"multiple-hit", res.settings.multiple_hits},
                 {"srv", (!res.unconstrained.test_distribution.syn_rates.empty() && res.unconstrained.test_distribution.syn_rates.size() > 1) ? "Yes" : "No"},
@@ -1357,17 +1916,24 @@ public:
             }}
         };
 
-        auto format_distro = [](const BUSTEDRateDistribution& d) {
+        auto format_distro = [&](const BUSTEDRateDistribution& d) {
             nlohmann::json distro;
+            Scalar bio_scale = res.settings.error_sink ? (1.0 - d.error_sink_weight) : 1.0;
             for (size_t k = 0; k < d.omegas.size(); ++k) {
                 nlohmann::json entry = {
                     {"omega", d.omegas[k]},
-                    {"proportion", d.weights[k]}
+                    {"proportion", bio_scale * d.weights[k]}
                 };
                 if (!d.annotations.empty() && k < d.annotations.size()) {
                     entry["annotation"] = d.annotations[k];
                 }
                 distro[std::to_string(k)] = entry;
+            }
+            if (res.settings.error_sink) {
+                distro["error_sink"] = {
+                    {"type", "saturation_replacement"},
+                    {"proportion", d.error_sink_weight}
+                };
             }
             return distro;
         };
@@ -1443,6 +2009,9 @@ public:
             {"constrained", {res.evidence_ratios}},
             {"optimized null", {res.evidence_ratios}}
         };
+        if (res.settings.error_sink) {
+            j["Evidence Ratios"]["error_sink_max_bf"] = {res.site_error_bfs};
+        }
 
         // Site Log Likelihood
         std::vector<Scalar> unc_site_ll(aln.num_codons), con_site_ll(aln.num_codons);
@@ -1485,6 +2054,11 @@ public:
         j["analysis"]["settings"]["syn_rates"] = res.settings.num_syn_rate_classes;
         j["analysis"]["settings"]["auto_k"] = res.settings.auto_select_k;
         j["analysis"]["settings"]["multiple_hits"] = res.settings.multiple_hits;
+        j["analysis"]["settings"]["error_sink"] = res.settings.error_sink;
+        if (res.settings.error_sink) {
+            j["analysis"]["settings"]["error_sink_max_weight"] = res.settings.error_sink_max_weight;
+            j["analysis"]["settings"]["error_sink_bf_threshold"] = res.settings.error_sink_bf_threshold;
+        }
         j["analysis"]["settings"]["refine_branch_lengths"] = res.settings.refine_branch_lengths;
         j["analysis"]["settings"]["pvalue_threshold"] = res.settings.p_value_threshold;
         j["analysis"]["settings"]["optimal_k"] = res.optimal_k;
@@ -1574,15 +2148,25 @@ public:
             f["tree_scale"] = fit.tree_scale;
             f["rate_classes"] = fit.num_rate_classes;
 
+            Scalar bio_scale = res.settings.error_sink ? (1.0 - fit.error_sink_weight) : 1.0;
             nlohmann::json test_dist = nlohmann::json::array();
             for (size_t k = 0; k < fit.test_distribution.omegas.size(); ++k) {
                 test_dist.push_back({
                     {"class", static_cast<int>(k + 1)},
                     {"omega", fit.test_distribution.omegas[k]},
-                    {"proportion", fit.test_distribution.weights[k]}
+                    {"proportion", bio_scale * fit.test_distribution.weights[k]}
                 });
             }
             f["rate_distributions"]["test"] = test_dist;
+
+            if (res.settings.error_sink) {
+                f["error_sink"] = {
+                    {"type", "saturation_replacement"},
+                    {"kernel", "P_sink(i,j) = pi_j / (1 - pi_i) for i != j, 0 for i == j"},
+                    {"proportion", fit.error_sink_weight},
+                    {"max_weight_bound", res.settings.error_sink_max_weight}
+                };
+            }
 
             if (!fit.test_distribution.syn_rates.empty() && fit.test_distribution.syn_rates.size() > 1) {
                 nlohmann::json syn_dist = nlohmann::json::array();
@@ -1650,6 +2234,55 @@ public:
             {"optimal_k", static_cast<int>(res.optimal_k)}
         };
 
+        if (res.auto_diagnostics.enabled) {
+            j["auto_model_selection"] = {
+                {"error_sink_gate", {
+                    {"max_surprisal_bits", res.auto_diagnostics.max_sink_surprisal_bits},
+                    {"max_baseline_bf", res.auto_diagnostics.max_sink_bf},
+                    {"candidate_sites_gt_8bits", static_cast<int>(res.auto_diagnostics.sink_candidate_sites)},
+                    {"adjacent_clusters", static_cast<int>(res.auto_diagnostics.sink_adjacent_clusters)},
+                    {"delta_log_l", res.auto_diagnostics.sink_delta_ll},
+                    {"activated", res.auto_diagnostics.activated_error_sink}
+                }},
+                {"multiple_hits_gate", {
+                    {"quarantined_double_hit_score", res.auto_diagnostics.double_hit_score},
+                    {"quarantined_triple_hit_score", res.auto_diagnostics.triple_hit_score},
+                    {"double_hit_delta_log_l", res.auto_diagnostics.double_hit_delta_ll},
+                    {"triple_hit_delta_log_l", res.auto_diagnostics.triple_hit_delta_ll},
+                    {"selected", res.auto_diagnostics.selected_multiple_hits}
+                }},
+                {"srv_gate", {
+                    {"overdispersion_z", res.auto_diagnostics.srv_overdispersion_z},
+                    {"delta_log_l", res.auto_diagnostics.srv_delta_ll},
+                    {"activated", res.auto_diagnostics.activated_srv},
+                    {"selected_syn_rates", static_cast<int>(res.auto_diagnostics.selected_syn_rates)}
+                }},
+                {"omega_classes_gate", {
+                    {"selected_k", static_cast<int>(res.auto_diagnostics.selected_k)},
+                    {"rationale", res.auto_diagnostics.k_rationale}
+                }}
+            };
+        }
+
+        if (res.settings.error_sink) {
+            nlohmann::json flagged = nlohmann::json::array();
+            for (const auto& ev : res.flagged_error_events) {
+                flagged.push_back({
+                    {"site", static_cast<int>(ev.site)},
+                    {"branch", ev.branch_name},
+                    {"posterior", ev.posterior},
+                    {"bayes_factor", ev.bayes_factor}
+                });
+            }
+            j["error_sink_diagnostics"] = {
+                {"unconstrained_epsilon", res.unconstrained.error_sink_weight},
+                {"constrained_epsilon", res.constrained.error_sink_weight},
+                {"bf_threshold", res.settings.error_sink_bf_threshold},
+                {"flagged_branch_sites_count", static_cast<int>(res.flagged_error_events.size())},
+                {"flagged_branch_sites", flagged}
+            };
+        }
+
         // Site results (Columnar format)
         j["site_results"]["columns"] = {
             {"site", {{"type", "integer"}, {"unit", "1-based codon position"}, {"description", "Alignment codon site index (1-based)"}}},
@@ -1657,13 +2290,20 @@ public:
             {"unconstrained_log_l", {{"type", "float"}, {"description", "Site log-likelihood under unconstrained model"}}},
             {"constrained_log_l", {{"type", "float"}, {"description", "Site log-likelihood under constrained null model"}}}
         };
+        if (res.settings.error_sink) {
+            j["site_results"]["columns"]["error_sink_max_bf"] = {
+                {"type", "float"},
+                {"description", "Maximum branch-site Empirical Bayes Factor for the saturation error sink across branches at this site"}
+            };
+        }
 
         std::vector<int> col_site;
-        std::vector<double> col_er, col_unc_ll, col_con_ll;
+        std::vector<double> col_er, col_unc_ll, col_con_ll, col_err_bf;
         col_site.reserve(aln.num_codons);
         col_er.reserve(aln.num_codons);
         col_unc_ll.reserve(aln.num_codons);
         col_con_ll.reserve(aln.num_codons);
+        if (res.settings.error_sink) col_err_bf.reserve(aln.num_codons);
 
         for (size_t s = 0; s < aln.num_codons; ++s) {
             col_site.push_back(static_cast<int>(s + 1));
@@ -1671,12 +2311,18 @@ public:
             size_t p = aln.site_to_pattern[s];
             col_unc_ll.push_back(res.unconstrained.site_log_likelihoods[p]);
             col_con_ll.push_back(res.constrained.site_log_likelihoods[p]);
+            if (res.settings.error_sink && s < res.site_error_bfs.size()) {
+                col_err_bf.push_back(res.site_error_bfs[s]);
+            }
         }
 
         j["site_results"]["data"]["site"] = col_site;
         j["site_results"]["data"]["evidence_ratio"] = col_er;
         j["site_results"]["data"]["unconstrained_log_l"] = col_unc_ll;
         j["site_results"]["data"]["constrained_log_l"] = col_con_ll;
+        if (res.settings.error_sink) {
+            j["site_results"]["data"]["error_sink_max_bf"] = col_err_bf;
+        }
 
         return j;
     }

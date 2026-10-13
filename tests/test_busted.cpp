@@ -173,3 +173,190 @@ TEST_CASE("BUSTED-S: Synonymous Rate Variation (SRV) on ADH") {
     CHECK(j_mod["model_fits"]["unconstrained"]["rate_distributions"].contains("synonymous"));
 }
 
+TEST_CASE("BUSTED-E: Saturation Error Sink (Option A) Quarantines Misalignment Artifacts") {
+    // 1. Construct a strictly purifying/neutral 6-taxon, 100-codon alignment on a tree with a very short sister pair (T1, T2)
+    std::string nwk = "((T1:0.002,T2:0.002)N1:0.05,(T3:0.04,T4:0.04)N2:0.05,(T5:0.04,T6:0.04)N3:0.05);";
+    auto tree = Tree::from_newick(nwk);
+
+    // Base ancestral sequence of 100 4-fold degenerate codons (GCT=Ala, GTT=Val, CCT=Pro, GGT=Gly)
+    std::vector<std::string> base_codons(100);
+    for (size_t s = 0; s < 100; ++s) {
+        if (s % 4 == 0) base_codons[s] = "GCT";
+        else if (s % 4 == 1) base_codons[s] = "GTT";
+        else if (s % 4 == 2) base_codons[s] = "CCT";
+        else base_codons[s] = "GGT";
+    }
+
+    auto make_seq = [&](int variant) {
+        std::string seq;
+        for (size_t s = 0; s < 100; ++s) {
+            std::string c = base_codons[s];
+            // Add realistic synonymous third-position variation across clades so omega < 1
+            if (variant == 1 && (s % 5 == 0)) c[2] = 'C'; // T1, T2 share synonymous T->C
+            if (variant == 2 && (s % 7 == 0)) c[2] = 'C'; // T3, T4 share synonymous T->C
+            if (variant == 3 && (s % 3 == 0)) c[2] = 'A'; // T5, T6 share synonymous T->A
+            seq += c;
+        }
+        return seq;
+    };
+
+    std::string s1 = make_seq(1);
+    std::string s2 = make_seq(1);
+    std::string s3 = make_seq(2);
+    std::string s4 = make_seq(2);
+    std::string s5 = make_seq(3);
+    std::string s6 = make_seq(3);
+
+    // Inject two 3-nucleotide non-synonymous frameshift/misalignment errors into T1 (branch length 0.002!)
+    // At codon 10 (index 9): GCT (Ala) -> TGG (Trp, 3-nt change)
+    // At codon 50 (index 49): GTT (Val) -> AAA (Lys, 3-nt change)
+    s1.replace(9 * 3, 3, "TGG");
+    s1.replace(49 * 3, 3, "AAA");
+
+    Alignment corrupted_aln;
+    corrupted_aln.add_sequence("T1", s1);
+    corrupted_aln.add_sequence("T2", s2);
+    corrupted_aln.add_sequence("T3", s3);
+    corrupted_aln.add_sequence("T4", s4);
+    corrupted_aln.add_sequence("T5", s5);
+    corrupted_aln.add_sequence("T6", s6);
+    corrupted_aln.finalize();
+
+    // Run standard BUSTED (no error sink): the two 3-nt changes on branch T1 (t=0.002) force a massive omega_3 blow-up
+    auto analyzer = BUSTEDAnalyzer::create_and_fit(tree, corrupted_aln);
+    BUSTEDSettings std_settings;
+    std_settings.error_sink = false;
+    auto res_std = analyzer.run(std_settings);
+
+    // Run BUSTED-E (--error-sink): the saturation replacement kernel absorbs the two 3-nt artifacts
+    BUSTEDSettings sink_settings;
+    sink_settings.error_sink = true;
+    auto res_sink = analyzer.run(sink_settings);
+
+    std::cout << "\n[BUSTED vs BUSTED-E on Corrupted Purifying Alignment]\n"
+              << "  Standard BUSTED : LRT = " << res_std.lrt << ", p = " << res_std.p_value
+              << ", omega_3 = " << res_std.unconstrained.test_distribution.omegas.back() << "\n"
+              << "  BUSTED-E (Sink) : LRT = " << res_sink.lrt << ", p = " << res_sink.p_value
+              << ", omega_3 = " << res_sink.unconstrained.test_distribution.omegas.back()
+              << ", eps_sink = " << res_sink.unconstrained.error_sink_weight
+              << ", flagged branch-sites = " << res_sink.flagged_error_events.size() << "\n";
+
+    for (const auto& ev : res_sink.flagged_error_events) {
+        std::cout << "    Flagged: codon " << ev.site << " on branch " << ev.branch_name
+                  << " (BF = " << ev.bayes_factor << ", P = " << ev.posterior << ")\n";
+    }
+
+    // Standard BUSTED is fooled by the 3-nt misalignments on a short branch (p < 0.05)
+    CHECK(res_std.p_value < 0.05);
+
+    // BUSTED-E eliminates the false positive (p > 0.10) and flags both corrupted codons (1-based sites 10 and 50 on T1)
+    CHECK(res_sink.p_value > 0.10);
+    CHECK(res_sink.flagged_error_events.size() >= 2);
+    bool found_c10 = false, found_c50 = false;
+    for (const auto& ev : res_sink.flagged_error_events) {
+        if (ev.site == 10 && ev.branch_name == "T1") found_c10 = true;
+        if (ev.site == 50 && ev.branch_name == "T1") found_c50 = true;
+    }
+    CHECK(found_c10);
+    CHECK(found_c50);
+
+    // JSON export verification
+    auto j_legacy = analyzer.to_legacy_json(res_sink);
+    CHECK(j_legacy["Evidence Ratios"].contains("error_sink_max_bf"));
+    auto j_modern = analyzer.to_modern_json(res_sink);
+    CHECK(j_modern["analysis"]["settings"]["error_sink"] == true);
+    CHECK(j_modern.contains("error_sink_diagnostics"));
+}
+
+TEST_CASE("BUSTED-Auto: 4-Gate Surprisal & Score Model Selector") {
+    // 1. Test on ADH: should skip Error Sink, skip Multi-Hits, activate SRV, select K=2, and detect positive selection
+    {
+        auto aln = Alignment::load(HYPHY3_SOURCE_DIR "/benchmarks/data/adh.nex");
+        auto tree = Tree::from_newick(aln.embedded_tree_newick);
+        auto analyzer = BUSTEDAnalyzer::create_and_fit(tree, aln);
+
+        BUSTEDSettings auto_settings;
+        auto_settings.full_auto = true;
+        auto res = analyzer.run(auto_settings);
+
+        const auto& d = res.auto_diagnostics;
+        std::cout << "\n[BUSTED-Auto on ADH]\n"
+                  << "  Gate 1 (Error Sink) : " << (d.activated_error_sink ? "ON" : "OFF")
+                  << " (max surprisal = " << d.max_sink_surprisal_bits << " bits, delta_ll = " << d.sink_delta_ll << ")\n"
+                  << "  Gate 2 (Multi-Hits) : " << d.selected_multiple_hits
+                  << " (2-hit score = " << d.double_hit_score << ", delta_ll = " << d.double_hit_delta_ll << ")\n"
+                  << "  Gate 3 (SRV)        : " << (d.activated_srv ? "ON" : "OFF")
+                  << " (M = " << d.selected_syn_rates << ", Z = " << d.srv_overdispersion_z << ", delta_ll = " << d.srv_delta_ll << ")\n"
+                  << "  Gate 4 (Omega K)    : K = " << d.selected_k << " (" << d.k_rationale << ")\n"
+                  << "  Final LRT           : " << res.lrt << " (p = " << res.p_value << ")\n";
+
+        CHECK(d.enabled == true);
+        CHECK(d.activated_error_sink == false);
+        CHECK(d.selected_multiple_hits == "None");
+        CHECK(d.activated_srv == true);
+        CHECK(d.selected_k == 2);
+        CHECK(res.p_value < 0.05);
+
+        auto j_mod = analyzer.to_modern_json(res);
+        CHECK(j_mod.contains("auto_model_selection"));
+    }
+
+    // 2. Test on Corrupted Purifying Alignment: should automatically activate Error Sink, NOT activate Multi-Hits, and eliminate false positive
+    {
+        std::string nwk = "((T1:0.002,T2:0.002)N1:0.05,(T3:0.04,T4:0.04)N2:0.05,(T5:0.04,T6:0.04)N3:0.05);";
+        auto tree = Tree::from_newick(nwk);
+
+        std::vector<std::string> base_codons(100);
+        for (size_t s = 0; s < 100; ++s) {
+            if (s % 4 == 0) base_codons[s] = "GCT";
+            else if (s % 4 == 1) base_codons[s] = "GTT";
+            else if (s % 4 == 2) base_codons[s] = "CCT";
+            else base_codons[s] = "GGT";
+        }
+        auto make_seq = [&](int variant) {
+            std::string seq;
+            for (size_t s = 0; s < 100; ++s) {
+                std::string c = base_codons[s];
+                if (variant == 1 && (s % 5 == 0)) c[2] = 'C';
+                if (variant == 2 && (s % 7 == 0)) c[2] = 'C';
+                if (variant == 3 && (s % 3 == 0)) c[2] = 'A';
+                seq += c;
+            }
+            return seq;
+        };
+        std::string s1 = make_seq(1), s2 = make_seq(1), s3 = make_seq(2), s4 = make_seq(2), s5 = make_seq(3), s6 = make_seq(3);
+        s1.replace(9 * 3, 3, "TGG");
+        s1.replace(49 * 3, 3, "AAA");
+
+        Alignment corrupted_aln;
+        corrupted_aln.add_sequence("T1", s1);
+        corrupted_aln.add_sequence("T2", s2);
+        corrupted_aln.add_sequence("T3", s3);
+        corrupted_aln.add_sequence("T4", s4);
+        corrupted_aln.add_sequence("T5", s5);
+        corrupted_aln.add_sequence("T6", s6);
+        corrupted_aln.finalize();
+
+        auto analyzer = BUSTEDAnalyzer::create_and_fit(tree, corrupted_aln);
+        BUSTEDSettings auto_settings;
+        auto_settings.full_auto = true;
+        auto res = analyzer.run(auto_settings);
+
+        const auto& d = res.auto_diagnostics;
+        std::cout << "\n[BUSTED-Auto on Corrupted Purifying Alignment]\n"
+                  << "  Gate 1 (Error Sink) : " << (d.activated_error_sink ? "ON" : "OFF")
+                  << " (max surprisal = " << d.max_sink_surprisal_bits << " bits, delta_ll = " << d.sink_delta_ll << ")\n"
+                  << "  Gate 2 (Multi-Hits) : " << d.selected_multiple_hits
+                  << " (quarantined 2-hit score = " << d.double_hit_score << ", delta_ll = " << d.double_hit_delta_ll << ")\n"
+                  << "  Gate 3 (SRV)        : " << (d.activated_srv ? "ON" : "OFF") << "\n"
+                  << "  Gate 4 (Omega K)    : K = " << d.selected_k << "\n"
+                  << "  Final LRT           : " << res.lrt << " (p = " << res.p_value << ")\n";
+
+        CHECK(d.activated_error_sink == true);
+        CHECK(d.selected_multiple_hits == "None");
+        CHECK(res.p_value > 0.10);
+        CHECK(res.flagged_error_events.size() == 2);
+    }
+}
+
+

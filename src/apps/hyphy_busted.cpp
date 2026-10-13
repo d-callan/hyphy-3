@@ -39,11 +39,15 @@ static void print_usage(const char* prog) {
               << Console::bold("Optional arguments:") << "\n"
               << "  " << Console::brand("--tree") << " <file>        Path to Newick tree file (optional if embedded in NEXUS)\n"
               << "  " << Console::brand("--code") << " <name>        Genetic code (default: Universal)\n"
+              << "  " << Console::brand("--auto") << "                Full-Auto BUSTED: 4-gate surprisal & score selector for SRV, MH, Error Sink & K\n"
               << "  " << Console::brand("--rates") << " <N>          Number of omega rate categories (default: 3)\n"
               << "  " << Console::brand("--srv") << "                Enable synonymous rate variation across sites (BUSTED-S)\n"
               << "  " << Console::brand("--syn-rates") << " <N>      Number of synonymous rate categories (default: 3)\n"
               << "  " << Console::brand("--auto-k") << "             Automatically select optimal K via AICc step-up\n"
               << "  " << Console::brand("--multiple-hits") << " <M>  Multi-nucleotide substitutions: None (default), Double, Double+Triple\n"
+              << "  " << Console::brand("--error-sink") << "          Enable non-evolutionary saturation error sink class (BUSTED-E)\n"
+              << "  " << Console::brand("--error-sink-weight") << " <W> Maximum allowed error sink mixture weight (default: 0.05)\n"
+              << "  " << Console::brand("--error-sink-bf") << " <BF>  Empirical Bayes Factor threshold to flag artifact branch-sites (default: 100)\n"
               << "  " << Console::brand("--no-branch-opt") << "      Disable individual branch length refinement (use proportional scaling)\n"
               << "  " << Console::brand("--threads") << " <N>        Number of OpenMP worker threads\n"
               << "  " << Console::brand("--output") << " <file>      Path to output JSON file (default: <alignment>.BUSTED.json)\n"
@@ -51,8 +55,8 @@ static void print_usage(const char* prog) {
               << "  " << Console::brand("--no-progress") << "        Disable progress bar\n"
               << "  " << Console::brand("--help, -h") << "           Show this help message\n\n"
               << Console::bold("Examples:") << "\n"
-              << "  " << prog << " --alignment data/cd2.fna --tree data/cd2.nwk\n"
-              << "  " << prog << " --alignment tests/data/adh.nex --auto-k --threads 8\n\n";
+              << "  " << prog << " --alignment data/cd2.fna --tree data/cd2.nwk --auto\n"
+              << "  " << prog << " --alignment tests/data/adh.nex --auto --threads 8\n\n";
 }
 
 int run_busted(int argc, char* argv[]) {
@@ -74,6 +78,8 @@ int run_busted(int argc, char* argv[]) {
             tree_file = argv[++i];
         } else if (arg == "--code" && i + 1 < argc) {
             code_name = argv[++i];
+        } else if (arg == "--auto" || arg == "--full-auto") {
+            settings.full_auto = true;
         } else if (arg == "--rates" && i + 1 < argc) {
             settings.num_rate_classes = std::stoul(argv[++i]);
         } else if (arg == "--srv") {
@@ -85,6 +91,14 @@ int run_busted(int argc, char* argv[]) {
             settings.auto_select_k = true;
         } else if (arg == "--multiple-hits" && i + 1 < argc) {
             settings.multiple_hits = argv[++i];
+        } else if (arg == "--error-sink") {
+            settings.error_sink = true;
+        } else if (arg == "--error-sink-weight" && i + 1 < argc) {
+            settings.error_sink = true;
+            settings.error_sink_max_weight = std::stod(argv[++i]);
+        } else if (arg == "--error-sink-bf" && i + 1 < argc) {
+            settings.error_sink = true;
+            settings.error_sink_bf_threshold = std::stod(argv[++i]);
         } else if (arg == "--no-branch-opt") {
             settings.refine_branch_lengths = false;
         } else if (arg == "--threads" && i + 1 < argc) {
@@ -189,9 +203,11 @@ int run_busted(int argc, char* argv[]) {
         {"Codon Sites", std::to_string(aln.num_codons) + " (" + std::to_string(aln.num_codons * 3) + " nt)"},
         {"Unique Patterns", std::to_string(aln.patterns.size())},
         {"Tree", std::to_string(tree.num_nodes()) + " nodes (" + std::to_string(tree.num_leaves()) + " leaves)"},
-        {"Rate Classes (K)", std::to_string(settings.num_rate_classes) + (settings.auto_select_k ? " (Auto-K enabled)" : "")},
-        {"Synonymous Variation", settings.srv ? "Enabled (" + std::to_string(settings.num_syn_rate_classes) + " classes)" : "Disabled"},
-        {"Multiple Hits", settings.multiple_hits},
+        {"Model Selection Mode", settings.full_auto ? "Full-Auto (4-Gate Surprisal & Score Screen)" : "Manual / Fixed"},
+        {"Rate Classes (K)", settings.full_auto ? "Auto (2..3)" : (std::to_string(settings.num_rate_classes) + (settings.auto_select_k ? " (Auto-K enabled)" : ""))},
+        {"Synonymous Variation", settings.full_auto ? "Auto" : (settings.srv ? "Enabled (" + std::to_string(settings.num_syn_rate_classes) + " classes)" : "Disabled")},
+        {"Multiple Hits", settings.full_auto ? "Auto" : settings.multiple_hits},
+        {"Error Sink (BUSTED-E)", settings.full_auto ? "Auto" : (settings.error_sink ? "Enabled (Saturation Replacement Kernel)" : "Disabled")},
         {"Genetic Code", code->name}
     });
 
@@ -203,11 +219,34 @@ int run_busted(int argc, char* argv[]) {
               << "  " << Console::muted("Global MG94 Log-L    : ") << Console::bold(std::to_string(analyzer.mg94_log_l))
               << Console::muted("  |  omega = ") << Console::brand(std::to_string(analyzer.mg94_omega)) << "\n\n";
 
-    Panel::print_step(2, 2, "Running BUSTED Mixture Models", "ECM + SQUAREM acceleration");
-    if (settings.auto_select_k) {
+    Panel::print_step(2, 2, "Running BUSTED Mixture Models", settings.full_auto ? "4-Gate Auto-Diagnostics + ECM/SQUAREM" : "ECM + SQUAREM acceleration");
+    if (settings.auto_select_k && !settings.full_auto) {
         std::cout << "  " << Console::muted("↳ Automatic model selection enabled (testing K = 1.." + std::to_string(settings.max_k) + ")...\n");
     }
     BUSTEDResult res = analyzer.run(settings, show_progress, force_progress);
+
+    if (res.auto_diagnostics.enabled) {
+        const auto& d = res.auto_diagnostics;
+        std::ostringstream g1, g2, g3, g4;
+        g1 << (d.activated_error_sink ? "ACTIVATED" : "Skipped")
+           << " (max surprisal = " << std::fixed << std::setprecision(1) << d.max_sink_surprisal_bits
+           << " bits, clusters = " << d.sink_adjacent_clusters
+           << ", ΔlnL = +" << std::setprecision(2) << d.sink_delta_ll << ")";
+        g2 << d.selected_multiple_hits
+           << " (quarantined 2-hit score = " << std::fixed << std::setprecision(2) << d.double_hit_score
+           << ", ΔlnL = +" << d.double_hit_delta_ll << ")";
+        g3 << (d.activated_srv ? ("ACTIVATED (M = " + std::to_string(d.selected_syn_rates) + ")") : "Skipped (M = 1)")
+           << " (Z_disp = " << std::fixed << std::setprecision(2) << d.srv_overdispersion_z
+           << ", ΔlnL = +" << d.srv_delta_ll << ")";
+        g4 << d.k_rationale;
+        std::cout << "\n";
+        Panel::print_card("Full-Auto 4-Gate Model Selection Diagnostics", {
+            {"Gate 1: Error Sink (BUSTED-E)", g1.str()},
+            {"Gate 2: Multi-Hits (BUSTED-MH)", g2.str()},
+            {"Gate 3: Synonymous Rates (SRV)", g3.str()},
+            {"Gate 4: Omega Classes (K)", g4.str()}
+        });
+    }
 
     auto end_time = std::chrono::high_resolution_clock::now();
     double total_runtime = std::chrono::duration<double>(end_time - start_time).count();
@@ -267,6 +306,21 @@ int run_busted(int argc, char* argv[]) {
         std::cout << "\n";
     }
 
+    if (res.settings.error_sink) {
+        std::cout << Console::bold("  Saturation Error Sink (BUSTED-E):") << "\n";
+        std::cout << "    Unconstrained sink weight (eps) : " << std::scientific << std::setprecision(4) << res.unconstrained.error_sink_weight
+                  << "  |  Constrained sink weight : " << res.constrained.error_sink_weight << "\n";
+        std::cout << "    Flagged artifact branch-sites   : " << res.flagged_error_events.size()
+                  << " (BF >= " << std::fixed << std::setprecision(1) << res.settings.error_sink_bf_threshold << ")\n";
+        for (size_t f = 0; f < std::min<size_t>(5, res.flagged_error_events.size()); ++f) {
+            const auto& ev = res.flagged_error_events[f];
+            std::cout << "      • Codon " << ev.site << " on branch '" << ev.branch_name
+                      << "' (BF_sink = " << std::fixed << std::setprecision(1) << ev.bayes_factor
+                      << ", P_post = " << std::setprecision(3) << ev.posterior << ")\n";
+        }
+        std::cout << "\n";
+    }
+
     std::ostringstream lrt_ss, p_ss, u_ss, c_ss, time_ss;
     lrt_ss << std::fixed << std::setprecision(4) << res.lrt;
     p_ss << std::scientific << std::setprecision(6) << res.p_value;
@@ -307,6 +361,7 @@ int run_busted(int argc, char* argv[]) {
     prov.invocation.arguments["syn_rates"] = std::to_string(settings.num_syn_rate_classes);
     prov.invocation.arguments["auto_k"] = settings.auto_select_k ? "true" : "false";
     prov.invocation.arguments["multiple_hits"] = settings.multiple_hits;
+    prov.invocation.arguments["error_sink"] = settings.error_sink ? "true" : "false";
     prov.invocation.arguments["refine_branch_lengths"] = settings.refine_branch_lengths ? "true" : "false";
     prov.invocation.arguments["json_format"] = (json_format == JSONFormat::Legacy) ? "legacy" : "modern_v3";
 
