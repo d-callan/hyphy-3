@@ -18,11 +18,15 @@ namespace hyphy::core {
 class LikelihoodEngine {
 public:
     static size_t find_taxon_index(const Alignment& aln, const std::string& name) {
-        auto it = aln.taxon_to_index.find(name);
+        std::string clean_name = name;
+        if (clean_name.size() >= 2 && ((clean_name.front() == '\'' && clean_name.back() == '\'') || (clean_name.front() == '"' && clean_name.back() == '"'))) {
+            clean_name = clean_name.substr(1, clean_name.size() - 2);
+        }
+        auto it = aln.taxon_to_index.find(clean_name);
         if (it != aln.taxon_to_index.end()) return it->second;
 
         // Fast O(1) case-insensitive lookup
-        std::string lower = name;
+        std::string lower = clean_name;
         std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c) { return std::tolower(c); });
         auto it_lower = aln.lower_taxon_to_index.find(lower);
         if (it_lower != aln.lower_taxon_to_index.end()) return it_lower->second;
@@ -33,10 +37,17 @@ public:
     static std::vector<size_t> build_leaf_to_taxon_map(const Tree& tree, const Alignment& aln) {
         size_t num_nodes = tree.num_nodes();
         std::vector<size_t> leaf_to_taxon(num_nodes, static_cast<size_t>(-1));
+        size_t leaves = 0, matched = 0;
         for (const auto& node : tree.nodes) {
             if (node.is_leaf) {
-                leaf_to_taxon[node.id] = find_taxon_index(aln, node.name);
+                leaves++;
+                size_t idx = find_taxon_index(aln, node.name);
+                leaf_to_taxon[node.id] = idx;
+                if (idx != static_cast<size_t>(-1)) matched++;
             }
+        }
+        if (leaves > 0 && matched == 0) {
+            throw std::runtime_error("Phylogenetic tree leaves do not match any sequences in alignment! (0/" + std::to_string(leaves) + " matched)");
         }
         return leaf_to_taxon;
     }

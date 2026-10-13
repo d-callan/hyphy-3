@@ -95,6 +95,9 @@ public:
             } else {
                 name = str;
             }
+            if (name.size() >= 2 && ((name.front() == '\'' && name.back() == '\'') || (name.front() == '"' && name.back() == '"'))) {
+                name = name.substr(1, name.size() - 2);
+            }
             tree.nodes[target_node].name = name;
             tree.nodes[target_node].branch_length = length;
             tree.nodes[target_node].model_tag = tag;
