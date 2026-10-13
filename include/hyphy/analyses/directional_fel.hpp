@@ -725,6 +725,7 @@ public:
         size_t E = unique_edges.size();
         std::vector<RootCandidate> cand_list(E);
 
+        #pragma omp parallel for schedule(dynamic)
         for (size_t i = 0; i < E; ++i) {
             const auto& ue = unique_edges[i];
             Tree cand_tree = reroot_on_edge(input_tree, ue.u, ue.v, 0.5);
