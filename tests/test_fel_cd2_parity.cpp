@@ -65,9 +65,9 @@ inline double spearman_correlation(const std::vector<double>& x, const std::vect
 }
 
 TEST_CASE("FEL Parity on Full CD2 Dataset: Matched Branch Lengths") {
-    std::string aln_path = "/Users/sergei/Development/hyphy/hyphy-next/benchmarks/data/cd2.fna";
-    std::string tree_path = "/Users/sergei/Development/hyphy/hyphy-next/benchmarks/data/cd2_fitted.nwk";
-    std::string gt_json_path = "/Users/sergei/Development/hyphy/hyphy-next/benchmarks/ground_truth/cd2_fel.json";
+    std::string aln_path = HYPHY3_SOURCE_DIR "/benchmarks/data/cd2.fna";
+    std::string tree_path = HYPHY3_SOURCE_DIR "/benchmarks/data/cd2_fitted.nwk";
+    std::string gt_json_path = HYPHY3_SOURCE_DIR "/benchmarks/ground_truth/cd2_fel.json";
     
     auto aln = Alignment::from_fasta(aln_path);
     auto tree = Tree::from_newick_file(tree_path);
@@ -119,9 +119,9 @@ TEST_CASE("FEL Parity on Full CD2 Dataset: Matched Branch Lengths") {
 }
 
 TEST_CASE("FEL Parity on Full CD2 Dataset: End-to-End from Unannotated Tree") {
-    std::string aln_path = "/Users/sergei/Development/hyphy/hyphy-next/benchmarks/data/cd2.fna";
-    std::string tree_path = "/Users/sergei/Development/hyphy/hyphy-next/benchmarks/data/cd2.nwk";
-    std::string gt_json_path = "/Users/sergei/Development/hyphy/hyphy-next/benchmarks/ground_truth/cd2_fel.json";
+    std::string aln_path = HYPHY3_SOURCE_DIR "/benchmarks/data/cd2.fna";
+    std::string tree_path = HYPHY3_SOURCE_DIR "/benchmarks/data/cd2.nwk";
+    std::string gt_json_path = HYPHY3_SOURCE_DIR "/benchmarks/ground_truth/cd2_fel.json";
     
     auto aln = Alignment::from_fasta(aln_path);
     auto tree = Tree::from_newick_file(tree_path);

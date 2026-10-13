@@ -64,12 +64,12 @@ inline double spearman_correlation(const std::vector<double>& x, const std::vect
 }
 
 TEST_CASE("MEME Parity: CD2 (Universal Code, 10 taxa, 187 codons)") {
-    auto aln = Alignment::load("/Users/sergei/Development/hyphy/hyphy-next/benchmarks/data/cd2.fna");
-    auto tree = Tree::from_newick_file("/Users/sergei/Development/hyphy/hyphy-next/benchmarks/data/cd2.nwk");
+    auto aln = Alignment::load(HYPHY3_SOURCE_DIR "/benchmarks/data/cd2.fna");
+    auto tree = Tree::from_newick_file(HYPHY3_SOURCE_DIR "/benchmarks/data/cd2.nwk");
     auto meme = MEMEAnalyzer::create_and_fit(tree, aln, 0.1, nullptr, false);
     auto results = meme.run();
 
-    std::ifstream gt_file("/Users/sergei/Development/hyphy/hyphy-next/benchmarks/ground_truth/cd2_meme_rel.json");
+    std::ifstream gt_file(HYPHY3_SOURCE_DIR "/benchmarks/ground_truth/cd2_meme_rel.json");
     REQUIRE(gt_file.is_open());
     nlohmann::json gt;
     gt_file >> gt;
@@ -103,13 +103,13 @@ TEST_CASE("MEME Parity: CD2 (Universal Code, 10 taxa, 187 codons)") {
 }
 
 TEST_CASE("MEME Parity: ADH (Universal Code, 23 taxa, 254 codons)") {
-    auto aln = Alignment::load("/Users/sergei/Development/hyphy/tests/data/adh.nex");
+    auto aln = Alignment::load(HYPHY3_SOURCE_DIR "/benchmarks/data/adh.nex");
     REQUIRE(!aln.embedded_tree_newick.empty());
     auto tree = Tree::from_newick(aln.embedded_tree_newick);
     auto meme = MEMEAnalyzer::create_and_fit(tree, aln, 0.1, nullptr, false);
     auto results = meme.run();
 
-    std::ifstream gt_file("/Users/sergei/Development/hyphy/hyphy-next/benchmarks/ground_truth/adh_meme_rel.json");
+    std::ifstream gt_file(HYPHY3_SOURCE_DIR "/benchmarks/ground_truth/adh_meme_rel.json");
     REQUIRE(gt_file.is_open());
     nlohmann::json gt;
     gt_file >> gt;
@@ -143,7 +143,7 @@ TEST_CASE("MEME Parity: ADH (Universal Code, 23 taxa, 254 codons)") {
 }
 
 TEST_CASE("MEME Full Unconstrained MG94 Fit Parity: ADH") {
-    auto aln = Alignment::load("/Users/sergei/Development/hyphy/tests/data/adh.nex");
+    auto aln = Alignment::load(HYPHY3_SOURCE_DIR "/benchmarks/data/adh.nex");
     REQUIRE(!aln.embedded_tree_newick.empty());
     auto tree = Tree::from_newick(aln.embedded_tree_newick);
     

@@ -42,6 +42,8 @@ endif()
 
 # Test targets
 enable_testing()
+# Lets tests locate benchmarks/ and tests/data/ regardless of working directory
+add_compile_definitions(HYPHY3_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
 add_executable(hyphy_test tests/test_core.cpp)
 target_link_libraries(hyphy_test PRIVATE hyphy3_core)
 add_test(NAME CoreTests COMMAND hyphy_test)

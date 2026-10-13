@@ -11,7 +11,7 @@ using namespace hyphy::core;
 using namespace hyphy::analyses;
 
 TEST_CASE("FEL: Site-by-site dN/dS estimation on cd2_reduced with matched branch lengths") {
-    std::string aln_path = "/Users/sergei/Development/hyphy/hyphy-next/benchmarks/data/cd2_reduced.fna";
+    std::string aln_path = HYPHY3_SOURCE_DIR "/benchmarks/data/cd2_reduced.fna";
     auto aln = Alignment::from_fasta(aln_path);
 
     // Tree with exact fitted branch lengths from HyPhy 2.5 cd2_reduced_fel.json (Global MG94xREV)
@@ -76,7 +76,7 @@ TEST_CASE("FEL: Site-by-site dN/dS estimation on cd2_reduced with matched branch
 }
 
 TEST_CASE("FEL: Branch subset testing on cd2_reduced with Leaves mode") {
-    std::string aln_path = "/Users/sergei/Development/hyphy/hyphy-next/benchmarks/data/cd2_reduced.fna";
+    std::string aln_path = HYPHY3_SOURCE_DIR "/benchmarks/data/cd2_reduced.fna";
     auto aln = Alignment::from_fasta(aln_path);
 
     std::string nwk_fitted = "(Rat:0.0,Mouse:0.09748291588565174,((Human:0.0,Chimp:0.05545563815378509)Node12:0.1321590496511669,RhMonkey:0.0,Baboon:0.0)Node8:0.8462121433135308,Horse:0.95992364787302,Cat:1.197250478870998,Pig:0.4755389109237619,Cow:0.5939647347629947);";
