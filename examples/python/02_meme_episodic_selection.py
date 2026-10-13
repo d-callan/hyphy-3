@@ -37,7 +37,7 @@ def main():
     print(f"  Sites with evidence of episodic positive selection (p < 0.10, beta+ > 1.0): {len(sig_sites)}")
 
     for s in sig_sites:
-        print(f"    Codon {s.site + 1:3d}: alpha={s.alpha:5.2f}, beta-={s.beta_minus:5.2f} (p-={s.p_minus:4.2f}), "
+        print(f"    Codon {s.site_index + 1:3d}: alpha={s.alpha:5.2f}, beta-={s.beta1:5.2f} (p-={s.p1:4.2f}), "
               f"beta+={s.beta_plus:6.2f} (p+={s.p_plus:4.2f}), LRT={s.lrt:5.2f}, p={s.p_value:.4f}")
 
     # Export Datamonkey JSON

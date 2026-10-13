@@ -10,7 +10,7 @@
 using namespace hyphy::core;
 
 TEST_CASE("Alignment: Reading and frequency calculation on cd2_reduced") {
-    std::string aln_path = "/Users/sergei/Development/hyphy/hyphy-next/benchmarks/data/cd2_reduced.fna";
+    std::string aln_path = HYPHY3_SOURCE_DIR "/benchmarks/data/cd2_reduced.fna";
     auto aln = Alignment::from_fasta(aln_path);
 
     CHECK(aln.num_taxa == 10);
@@ -93,7 +93,7 @@ TEST_CASE("RateMatrix: GTR and MG94 generator properties") {
 }
 
 TEST_CASE("Likelihood: Point likelihood comparison against HyPhy 2.5 ground truth") {
-    std::string aln_path = "/Users/sergei/Development/hyphy/hyphy-next/benchmarks/data/cd2_reduced.fna";
+    std::string aln_path = HYPHY3_SOURCE_DIR "/benchmarks/data/cd2_reduced.fna";
     std::string nwk = "((((Pig:0.147969,Cow:0.213430):0.085099,Horse:0.165787,Cat:0.264806):0.058611,((RhMonkey:0.002015,Baboon:0.003108):0.022733,(Human:0.004349,Chimp:0.000799):0.011873):0.101856):0.340802,Rat:0.050958,Mouse:0.097950);";
 
     auto aln = Alignment::from_fasta(aln_path);
@@ -124,7 +124,7 @@ TEST_CASE("Likelihood: Point likelihood comparison against HyPhy 2.5 ground trut
 using namespace hyphy::opt;
 
 TEST_CASE("Optimizer: L-BFGS-B optimization of omega on cd2_reduced") {
-    std::string aln_path = "/Users/sergei/Development/hyphy/hyphy-next/benchmarks/data/cd2_reduced.fna";
+    std::string aln_path = HYPHY3_SOURCE_DIR "/benchmarks/data/cd2_reduced.fna";
     std::string nwk = "((((Pig:0.147969,Cow:0.213430):0.085099,Horse:0.165787,Cat:0.264806):0.058611,((RhMonkey:0.002015,Baboon:0.003108):0.022733,(Human:0.004349,Chimp:0.000799):0.011873):0.101856):0.340802,Rat:0.050958,Mouse:0.097950);";
 
     auto aln = Alignment::from_fasta(aln_path);
@@ -147,7 +147,7 @@ TEST_CASE("Optimizer: L-BFGS-B optimization of omega on cd2_reduced") {
 }
 
 TEST_CASE("LikelihoodEngine: Exact Spectral Fréchet Joint Gradients vs Finite Differences") {
-    std::string aln_path = "/Users/sergei/Development/hyphy/hyphy-next/benchmarks/data/cd2_reduced.fna";
+    std::string aln_path = HYPHY3_SOURCE_DIR "/benchmarks/data/cd2_reduced.fna";
     std::string nwk = "((((Pig:0.147969,Cow:0.213430):0.085099,Horse:0.165787,Cat:0.264806):0.058611,((RhMonkey:0.002015,Baboon:0.003108):0.022733,(Human:0.004349,Chimp:0.000799):0.011873):0.101856):0.340802,Rat:0.050958,Mouse:0.097950);";
 
     auto aln = Alignment::from_fasta(aln_path);

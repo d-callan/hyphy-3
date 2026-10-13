@@ -64,12 +64,12 @@ inline double spearman_correlation(const std::vector<double>& x, const std::vect
 }
 
 TEST_CASE("Parity 1: CD2 (Universal Code, 10 taxa, 187 codons)") {
-    auto aln = Alignment::load("/Users/sergei/Development/hyphy/hyphy-next/benchmarks/data/cd2.fna");
-    auto tree = Tree::from_newick_file("/Users/sergei/Development/hyphy/hyphy-next/benchmarks/data/cd2.nwk");
+    auto aln = Alignment::load(HYPHY3_SOURCE_DIR "/benchmarks/data/cd2.fna");
+    auto tree = Tree::from_newick_file(HYPHY3_SOURCE_DIR "/benchmarks/data/cd2.nwk");
     auto fel = FELAnalyzer::create_and_fit(tree, aln, 0.1);
     auto results = fel.run();
 
-    std::ifstream gt_file("/Users/sergei/Development/hyphy/hyphy-next/benchmarks/ground_truth/cd2_fel.json");
+    std::ifstream gt_file(HYPHY3_SOURCE_DIR "/benchmarks/ground_truth/cd2_fel.json");
     REQUIRE(gt_file.is_open());
     nlohmann::json gt;
     gt_file >> gt;
@@ -92,13 +92,13 @@ TEST_CASE("Parity 1: CD2 (Universal Code, 10 taxa, 187 codons)") {
 }
 
 TEST_CASE("Parity 2: ADH (Universal Code, 23 taxa, 254 codons)") {
-    auto aln = Alignment::load("/Users/sergei/Development/hyphy/tests/data/adh.nex");
+    auto aln = Alignment::load(HYPHY3_SOURCE_DIR "/benchmarks/data/adh.nex");
     REQUIRE(!aln.embedded_tree_newick.empty());
     auto tree = Tree::from_newick(aln.embedded_tree_newick);
     auto fel = FELAnalyzer::create_and_fit(tree, aln, 0.1, nullptr, false);
     auto results = fel.run();
 
-    std::ifstream gt_file("/Users/sergei/Development/hyphy/hyphy-next/benchmarks/ground_truth/adh_fel_rel.json");
+    std::ifstream gt_file(HYPHY3_SOURCE_DIR "/benchmarks/ground_truth/adh_fel_rel.json");
     REQUIRE(gt_file.is_open());
     nlohmann::json gt;
     gt_file >> gt;
@@ -121,13 +121,13 @@ TEST_CASE("Parity 2: ADH (Universal Code, 23 taxa, 254 codons)") {
 }
 
 TEST_CASE("Parity 3: BGLOBIN (Universal Code, 17 taxa, 144 codons)") {
-    auto aln = Alignment::load("/Users/sergei/Development/hyphy/tests/data/bglobin.nex");
+    auto aln = Alignment::load(HYPHY3_SOURCE_DIR "/benchmarks/data/bglobin.nex");
     REQUIRE(!aln.embedded_tree_newick.empty());
     auto tree = Tree::from_newick(aln.embedded_tree_newick);
     auto fel = FELAnalyzer::create_and_fit(tree, aln, 0.1, nullptr, false);
     auto results = fel.run();
 
-    std::ifstream gt_file("/Users/sergei/Development/hyphy/hyphy-next/benchmarks/ground_truth/bglobin_fel_rel.json");
+    std::ifstream gt_file(HYPHY3_SOURCE_DIR "/benchmarks/ground_truth/bglobin_fel_rel.json");
     REQUIRE(gt_file.is_open());
     nlohmann::json gt;
     gt_file >> gt;
@@ -153,7 +153,7 @@ TEST_CASE("Parity 4: COXI (Vertebrate-mtDNA Non-Universal Code, 21 taxa, 510 cod
     auto gcode = GeneticCode::vertebrate_mtdna();
     REQUIRE(gcode->num_sense_codons == 60);
 
-    auto aln = Alignment::load("/Users/sergei/Development/hyphy/tests/hbltests/libv3/data/COXI.nex", gcode);
+    auto aln = Alignment::load(HYPHY3_SOURCE_DIR "/benchmarks/data/COXI.nex", gcode);
     REQUIRE(aln.num_codons == 510);
     REQUIRE(!aln.embedded_tree_newick.empty());
 
@@ -161,7 +161,7 @@ TEST_CASE("Parity 4: COXI (Vertebrate-mtDNA Non-Universal Code, 21 taxa, 510 cod
     auto fel = FELAnalyzer::create_and_fit(tree, aln, 0.1, nullptr, false);
     auto results = fel.run();
 
-    std::ifstream gt_file("/Users/sergei/Development/hyphy/hyphy-next/benchmarks/ground_truth/coxi_fel_rel.json");
+    std::ifstream gt_file(HYPHY3_SOURCE_DIR "/benchmarks/ground_truth/coxi_fel_rel.json");
     REQUIRE(gt_file.is_open());
     nlohmann::json gt;
     gt_file >> gt;

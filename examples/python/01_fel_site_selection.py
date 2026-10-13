@@ -24,15 +24,14 @@ def main():
     aln = hp.Alignment.load(aln_path)
     tree = hp.Tree.from_newick_file(tree_path)
 
-    print(f"Dataset: {aln.num_taxa} sequences, {aln.num_codons} codons, {len(aln.patterns)} unique patterns")
+    print(f"Dataset: {aln.num_taxa} sequences, {aln.num_codons} codons, {aln.num_patterns} unique patterns")
 
     # Fit baseline GTR + MG94 and run FEL site-by-site LRTs
     print("\nRunning FEL analysis...")
     analyzer = hp.FELAnalyzer.create_and_fit(tree, aln, pvalue_threshold=0.10)
     results = analyzer.run()
 
-    print(f"Baseline GTR ln L : {analyzer.gtr_log_l:.2f}")
-    print(f"Baseline MG94 ln L: {analyzer.mg94_log_l:.2f} (omega = {analyzer.mg94_omega:.4f})")
+    print(f"Global MG94 ln L: {analyzer.global_log_l:.2f} (AICc = {analyzer.global_aicc:.2f})")
     print(f"Analyzed {len(results)} codon sites.")
 
     # Filter significant sites
@@ -43,10 +42,10 @@ def main():
     print(f"  Pervasive Diversifying Sites (dN > dS, p < 0.10): {len(pos_sites)}")
     for s in pos_sites:
         omega_site = (s.beta / s.alpha) if s.alpha > 0 else float("inf")
-        print(f"    Site {s.site + 1:3d}: alpha={s.alpha:6.3f}, beta={s.beta:6.3f} (dN/dS={omega_site:6.2f}), LRT={s.lrt:6.2f}, p={s.p_value:.4f}")
+        print(f"    Site {s.site_index + 1:3d}: alpha={s.alpha:6.3f}, beta={s.beta:6.3f} (dN/dS={omega_site:6.2f}), LRT={s.lrt:6.2f}, p={s.p_value:.4f}")
 
     print(f"  Pervasive Purifying Sites (dN < dS, p < 0.10): {len(neg_sites)}")
-    print(f"    First 5 sites: {[s.site + 1 for s in neg_sites[:5]]}...")
+    print(f"    First 5 sites: {[s.site_index + 1 for s in neg_sites[:5]]}...")
 
     # Export Datamonkey-compatible JSON
     json_str = analyzer.to_json()

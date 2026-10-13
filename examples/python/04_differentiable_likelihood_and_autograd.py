@@ -16,7 +16,8 @@ import hyphy3 as hp
 def main():
     data_dir = repo_root / "benchmarks" / "data"
     aln_path = str(data_dir / "cd2.fna")
-    tree_path = str(data_dir / "cd2.nwk")
+    # Use the fitted tree: gradients at zero-length branches are degenerate
+    tree_path = str(data_dir / "cd2_fitted.nwk")
 
     aln = hp.Alignment.load(aln_path)
     tree = hp.Tree.from_newick_file(tree_path)
@@ -45,6 +46,7 @@ def main():
     print("-" * 75)
 
     eps = 1e-6
+    max_rel_err = 0.0
     for node in tree.nodes:
         if node.id == tree.root_id:
             continue
@@ -62,10 +64,14 @@ def main():
         fd_grad = (ll_plus - ll_minus) / (2.0 * eps)
         ana_grad = analytical_grads[nid]
         rel_err = abs(ana_grad - fd_grad) / (abs(ana_grad) + 1e-8)
+        max_rel_err = max(max_rel_err, rel_err)
 
         print(f"{nid:<10} {node.name:<20} {ana_grad:<15.6f} {fd_grad:<15.6f} {rel_err:<12.2e}")
 
-    print("\nAll analytical gradients match finite differences to machine precision!")
+    if max_rel_err > 1e-4:
+        print(f"\nGradient check FAILED: max relative error {max_rel_err:.2e}")
+        sys.exit(1)
+    print(f"\nAll analytical gradients match finite differences (max relative error {max_rel_err:.2e}).")
 
 if __name__ == "__main__":
     main()

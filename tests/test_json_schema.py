@@ -14,8 +14,8 @@ import _hyphy3 as hp
 
 def test_fel_modern_and_legacy_json_schema():
     repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-    aln_path = os.path.join(repo_root, "..", "hyphy", "hyphy-next", "benchmarks", "data", "cd2.fna")
-    tree_path = os.path.join(repo_root, "..", "hyphy", "hyphy-next", "benchmarks", "data", "cd2_fitted.nwk")
+    aln_path = os.path.join(repo_root, "benchmarks", "data", "cd2.fna")
+    tree_path = os.path.join(repo_root, "benchmarks", "data", "cd2_fitted.nwk")
     schema_path = os.path.join(repo_root, "schemas", "v3", "fel.v3.schema.json")
 
     assert os.path.exists(aln_path), f"Missing alignment: {aln_path}"
@@ -82,8 +82,8 @@ def test_fel_modern_and_legacy_json_schema():
 
 def test_meme_modern_and_legacy_json_schema():
     repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-    aln_path = os.path.join(repo_root, "..", "hyphy", "hyphy-next", "benchmarks", "data", "cd2.fna")
-    tree_path = os.path.join(repo_root, "..", "hyphy", "hyphy-next", "benchmarks", "data", "cd2_fitted.nwk")
+    aln_path = os.path.join(repo_root, "benchmarks", "data", "cd2.fna")
+    tree_path = os.path.join(repo_root, "benchmarks", "data", "cd2_fitted.nwk")
     schema_path = os.path.join(repo_root, "schemas", "v3", "meme.v3.schema.json")
 
     assert os.path.exists(schema_path), f"Missing schema: {schema_path}"
@@ -124,8 +124,8 @@ def test_meme_modern_and_legacy_json_schema():
 
 def test_busted_modern_and_legacy_json_schema():
     repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-    aln_path = os.path.join(repo_root, "..", "hyphy", "hyphy-next", "benchmarks", "data", "cd2.fna")
-    tree_path = os.path.join(repo_root, "..", "hyphy", "hyphy-next", "benchmarks", "data", "cd2.nwk")
+    aln_path = os.path.join(repo_root, "benchmarks", "data", "cd2.fna")
+    tree_path = os.path.join(repo_root, "benchmarks", "data", "cd2.nwk")
     schema_path = os.path.join(repo_root, "schemas", "v3", "busted.v3.schema.json")
 
     assert os.path.exists(schema_path), f"Missing schema: {schema_path}"
@@ -164,8 +164,8 @@ def test_busted_modern_and_legacy_json_schema():
 
 def test_absrel_modern_and_legacy_json_schema():
     repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-    aln_path = os.path.join(repo_root, "..", "hyphy", "hyphy-next", "benchmarks", "data", "cd2.fna")
-    tree_path = os.path.join(repo_root, "..", "hyphy", "hyphy-next", "benchmarks", "data", "cd2.nwk")
+    aln_path = os.path.join(repo_root, "benchmarks", "data", "cd2.fna")
+    tree_path = os.path.join(repo_root, "benchmarks", "data", "cd2.nwk")
     schema_path = os.path.join(repo_root, "schemas", "v3", "absrel.v3.schema.json")
 
     assert os.path.exists(schema_path), f"Missing schema: {schema_path}"
@@ -246,8 +246,8 @@ def test_relax_modern_and_legacy_json_schema():
 
 def test_fel_branch_subset_json_schema():
     repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-    aln_path = os.path.join(repo_root, "..", "hyphy", "hyphy-next", "benchmarks", "data", "cd2.fna")
-    tree_path = os.path.join(repo_root, "..", "hyphy", "hyphy-next", "benchmarks", "data", "cd2_fitted.nwk")
+    aln_path = os.path.join(repo_root, "benchmarks", "data", "cd2.fna")
+    tree_path = os.path.join(repo_root, "benchmarks", "data", "cd2_fitted.nwk")
     schema_path = os.path.join(repo_root, "schemas", "v3", "fel.v3.schema.json")
 
     assert os.path.exists(aln_path), f"Missing alignment: {aln_path}"
@@ -287,10 +287,10 @@ def test_fel_branch_subset_json_schema():
 
 def test_fubar_modern_and_legacy_json_schema():
     repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-    aln_path = os.path.join(repo_root, "..", "hyphy", "hyphy-next", "benchmarks", "data", "cd2.fna")
+    aln_path = os.path.join(repo_root, "benchmarks", "data", "cd2.fna")
     if not os.path.exists(aln_path):
         aln_path = os.path.join(repo_root, "benchmarks", "data", "cd2.fna")
-    tree_path = os.path.join(repo_root, "..", "hyphy", "hyphy-next", "benchmarks", "data", "cd2.nwk")
+    tree_path = os.path.join(repo_root, "benchmarks", "data", "cd2.nwk")
     if not os.path.exists(tree_path):
         tree_path = os.path.join(repo_root, "benchmarks", "data", "cd2.nwk")
     schema_path = os.path.join(repo_root, "schemas", "v3", "fubar.v3.schema.json")
@@ -343,8 +343,8 @@ def test_fubar_modern_and_legacy_json_schema():
 
 def test_prime_modern_and_legacy_json_schema():
     repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-    aln_path = os.path.join(repo_root, "..", "hyphy", "hyphy-next", "benchmarks", "data", "cd2.fna")
-    tree_path = os.path.join(repo_root, "..", "hyphy", "hyphy-next", "benchmarks", "data", "cd2_fitted.nwk")
+    aln_path = os.path.join(repo_root, "benchmarks", "data", "cd2.fna")
+    tree_path = os.path.join(repo_root, "benchmarks", "data", "cd2_fitted.nwk")
     schema_path = os.path.join(repo_root, "schemas", "v3", "prime.v3.schema.json")
 
     assert os.path.exists(aln_path), f"Missing alignment: {aln_path}"
@@ -444,10 +444,10 @@ def test_gard_modern_and_legacy_json_schema():
 
 def test_slac_modern_and_legacy_json_schema():
     repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-    aln_path = os.path.join(repo_root, "..", "hyphy", "hyphy-next", "benchmarks", "data", "cd2.fna")
+    aln_path = os.path.join(repo_root, "benchmarks", "data", "cd2.fna")
     if not os.path.exists(aln_path):
         aln_path = os.path.join(repo_root, "benchmarks", "data", "cd2.fna")
-    tree_path = os.path.join(repo_root, "..", "hyphy", "hyphy-next", "benchmarks", "data", "cd2_fitted.nwk")
+    tree_path = os.path.join(repo_root, "benchmarks", "data", "cd2_fitted.nwk")
     if not os.path.exists(tree_path):
         tree_path = os.path.join(repo_root, "benchmarks", "data", "cd2.nwk")
     schema_path = os.path.join(repo_root, "schemas", "v3", "slac.v3.schema.json")

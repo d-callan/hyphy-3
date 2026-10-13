@@ -15,8 +15,8 @@ using namespace hyphy::core;
 using namespace hyphy::analyses;
 
 TEST_CASE("BUSTED: CD2 Dataset (10 taxa, 187 codons)") {
-    auto aln = Alignment::load("/Users/sergei/Development/hyphy/hyphy-next/benchmarks/data/cd2.fna");
-    auto tree = Tree::from_newick_file("/Users/sergei/Development/hyphy/hyphy-next/benchmarks/data/cd2.nwk");
+    auto aln = Alignment::load(HYPHY3_SOURCE_DIR "/benchmarks/data/cd2.fna");
+    auto tree = Tree::from_newick_file(HYPHY3_SOURCE_DIR "/benchmarks/data/cd2.nwk");
 
     auto busted = BUSTEDAnalyzer::create_and_fit(tree, aln);
     auto res = busted.run();
@@ -61,7 +61,7 @@ TEST_CASE("BUSTED: CD2 Dataset (10 taxa, 187 codons)") {
 }
 
 TEST_CASE("BUSTED: ADH Dataset (23 taxa, 254 codons)") {
-    auto aln = Alignment::load("/Users/sergei/Development/hyphy/tests/data/adh.nex");
+    auto aln = Alignment::load(HYPHY3_SOURCE_DIR "/benchmarks/data/adh.nex");
     REQUIRE(!aln.embedded_tree_newick.empty());
     auto tree = Tree::from_newick(aln.embedded_tree_newick);
 
@@ -94,7 +94,7 @@ TEST_CASE("BUSTED: ADH Dataset (23 taxa, 254 codons)") {
 }
 
 TEST_CASE("BUSTED: Automatic K Model Selection (AICc Step-Up)") {
-    auto aln = Alignment::load("/Users/sergei/Development/hyphy/tests/data/adh.nex");
+    auto aln = Alignment::load(HYPHY3_SOURCE_DIR "/benchmarks/data/adh.nex");
     auto tree = Tree::from_newick(aln.embedded_tree_newick);
 
     auto busted = BUSTEDAnalyzer::create_and_fit(tree, aln);
@@ -123,7 +123,7 @@ TEST_CASE("BUSTED: Automatic K Model Selection (AICc Step-Up)") {
 }
 
 TEST_CASE("BUSTED-S: Synonymous Rate Variation (SRV) on ADH") {
-    auto aln = Alignment::load("/Users/sergei/Development/hyphy/tests/data/adh.nex");
+    auto aln = Alignment::load(HYPHY3_SOURCE_DIR "/benchmarks/data/adh.nex");
     auto tree = Tree::from_newick(aln.embedded_tree_newick);
 
     auto busted = BUSTEDAnalyzer::create_and_fit(tree, aln);
