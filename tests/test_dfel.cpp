@@ -1,25 +1,30 @@
 #include "hyphy/analyses/directional_fel.hpp"
 #include <cassert>
 #include <iostream>
+#include <fstream>
 #include <cmath>
 
 using namespace hyphy::core;
 using namespace hyphy::analyses;
 
+inline std::string resolve_test_path(const std::string& path) {
+    if (std::ifstream(path).good()) return path;
+    if (std::ifstream("../" + path).good()) return "../" + path;
+    if (std::ifstream("../../" + path).good()) return "../../" + path;
+    return path;
+}
+
 void test_chi2_p_value() {
     std::cout << "Testing Chi-Square p-value calculations...\n";
 
     // df = 1: p-value of 3.84146 is ~0.05
-    Scalar p1 = chi2_p_value(3.84146, 1);
-    assert(std::abs(p1 - 0.05) < 0.001);
+    assert(std::abs(chi2_p_value(3.84146, 1) - 0.05) < 0.001);
 
     // df = 2: p-value of 5.991 is ~0.05
-    Scalar p2 = chi2_p_value(5.99146, 2);
-    assert(std::abs(p2 - 0.05) < 0.001);
+    assert(std::abs(chi2_p_value(5.99146, 2) - 0.05) < 0.001);
 
     // df = 10: p-value of 18.307 is ~0.05
-    Scalar p10 = chi2_p_value(18.307, 10);
-    assert(std::abs(p10 - 0.05) < 0.002);
+    assert(std::abs(chi2_p_value(18.307, 10) - 0.05) < 0.002);
 
     // Incomplete gamma boundary conditions
     assert(chi2_p_value(0.0, 5) == 1.0);
@@ -31,7 +36,7 @@ void test_chi2_p_value() {
 void test_compositional_heterogeneity() {
     std::cout << "Testing Compositional Heterogeneity Screening...\n";
 
-    Alignment aln = Alignment::from_nexus("tests/data/adh.nex");
+    Alignment aln = Alignment::from_nexus(resolve_test_path("tests/data/adh.nex"));
     auto comp = DirectionalFELAnalyzer::run_composition_test(aln, 0.05);
 
     assert(comp.taxa.size() == aln.num_taxa);
@@ -45,6 +50,7 @@ void test_compositional_heterogeneity() {
     assert(comp.p_value_cp3 >= 0.0 && comp.p_value_cp3 <= 1.0);
 
     for (const auto& tc : comp.taxa) {
+        (void)tc;
         assert(tc.total_codons == aln.num_codons);
         assert(tc.gc_overall >= 0.0 && tc.gc_overall <= 1.0);
         assert(tc.gc_cp3 >= 0.0 && tc.gc_cp3 <= 1.0);
@@ -60,7 +66,7 @@ void test_compositional_heterogeneity() {
 void test_tree_rerooting() {
     std::cout << "Testing Tree Re-rooting & Invariant Geometry...\n";
 
-    Alignment aln = Alignment::from_nexus("tests/data/adh.nex");
+    Alignment aln = Alignment::from_nexus(resolve_test_path("tests/data/adh.nex"));
     Tree tree = Tree::from_newick(aln.embedded_tree_newick);
 
     Scalar orig_tree_len = 0.0;
@@ -85,6 +91,7 @@ void test_tree_rerooting() {
     // Number of leaves must be conserved
     assert(rerooted.num_leaves() == tree.num_leaves());
     for (const auto& [name, id] : tree.leaf_name_to_id) {
+        (void)id;
         assert(rerooted.leaf_name_to_id.count(name) > 0);
     }
 
@@ -95,7 +102,7 @@ void test_tree_rerooting() {
 void test_auto_rooting_and_dfel_fit() {
     std::cout << "Testing Auto-Rooting Selection and dFEL Analyzer...\n";
 
-    Alignment aln = Alignment::from_nexus("tests/data/adh.nex");
+    Alignment aln = Alignment::from_nexus(resolve_test_path("tests/data/adh.nex"));
     Tree tree = Tree::from_newick(aln.embedded_tree_newick);
 
     DirectionalFELSettings settings;
@@ -118,6 +125,7 @@ void test_auto_rooting_and_dfel_fit() {
     Scalar total_w = 0.0;
     for (const auto& c : dfel.root_result.candidates) total_w += c.weight;
     assert(std::abs(total_w - 1.0) < 1e-4);
+    (void)total_w;
 
     std::cout << "  Auto-rooting selected branch: " << dfel.root_result.chosen_branch_name 
               << " with weight " << dfel.root_result.chosen_weight << "\n";
@@ -146,14 +154,14 @@ void test_auto_rooting_and_dfel_fit() {
     std::cout << "  Analyzed " << results.size() << " codons. Significant sites: " << sig_count << "\n";
 
     // Verify JSON export
-    auto modern_j = dfel.to_modern_json("tests/data/adh.nex", dfel.tree.to_newick(true));
+    auto modern_j = dfel.to_modern_json(resolve_test_path("tests/data/adh.nex"), dfel.tree.to_newick(true));
     assert(modern_j["schema_version"] == "3.0.0");
     assert(modern_j["analysis"]["id"] == "dfel");
     assert(modern_j["compositional_heterogeneity"]["taxa"].size() == aln.num_taxa);
     assert(!modern_j["root_selection"]["candidates"].empty());
     assert(modern_j["site_results"]["data"]["site"].size() == aln.num_codons);
 
-    auto legacy_j = dfel.to_legacy_json("tests/data/adh.nex", dfel.tree.to_newick(true));
+    auto legacy_j = dfel.to_legacy_json(resolve_test_path("tests/data/adh.nex"), dfel.tree.to_newick(true));
     assert(legacy_j["MLE"]["content"]["0"].size() == aln.num_codons);
 
     std::cout << "  Passed Auto-Rooting and dFEL fit tests.\n";

@@ -267,7 +267,8 @@ public:
     AutoRootResult root_result;
 
     std::vector<DirectionalRegime> regimes;
-    std::vector<int> branch_regime_ids; // regime id per tree node
+    std::vector<int> branch_regime_ids; // dominant regime id per tree node
+    std::vector<std::vector<Scalar>> branch_regime_weights; // soft mixture weights [w_0, w_1, w_2] per tree node
     Vector root_frequencies;
 
     Scalar p_value_threshold = 0.1;
@@ -931,39 +932,70 @@ public:
             sd_delta = std::sqrt(sum_sq / branch_deltas.size());
         }
 
-        Scalar tau = std::max(0.02, 0.4 * sd_delta);
+        Scalar sigma = std::max(0.015, sd_delta);
+        Scalar tau = std::max(0.02, 0.4 * sigma);
+        Scalar kappa = 3.5 / sigma;
 
-        // Assign regimes
+        // Assign regimes via Softmax mixture
         branch_regime_ids.assign(num_nodes, 1); // Default Neutral
-        std::array<size_t, 3> regime_counts = {0, 0, 0};
-        std::array<Scalar, 3> regime_gc_sum = {0.0, 0.0, 0.0};
+        branch_regime_weights.assign(num_nodes, {0.0, 1.0, 0.0});
+        std::array<Scalar, 3> soft_regime_counts = {0.0, 0.0, 0.0};
+        std::array<Scalar, 3> soft_regime_gc_sum = {0.0, 0.0, 0.0};
 
         if (K == 3) {
             for (const auto& node : tree.nodes) {
                 if (node.id != tree.root_id) {
                     Scalar d = node_gc[node.id] - bg_gc;
+                    // Softmax logits for 3 regimes: 0 (AT-drift), 1 (Neutral), 2 (GC-drift)
+                    Scalar ell_0 = kappa * (-d - tau);
+                    Scalar ell_1 = 0.0;
+                    Scalar ell_2 = kappa * (d - tau);
+
+                    Scalar max_l = std::max(ell_0, std::max(ell_1, ell_2));
+                    Scalar e0 = std::exp(ell_0 - max_l);
+                    Scalar e1 = std::exp(ell_1 - max_l);
+                    Scalar e2 = std::exp(ell_2 - max_l);
+                    Scalar sum_e = e0 + e1 + e2;
+                    Scalar w0 = e0 / sum_e;
+                    Scalar w1 = e1 / sum_e;
+                    Scalar w2 = e2 / sum_e;
+
+                    branch_regime_weights[node.id] = {w0, w1, w2};
+
                     int r_id = 1;
-                    if (d > tau) r_id = 2; // GC-drift
-                    else if (d < -tau) r_id = 0; // AT-drift
+                    if (w2 > w1 && w2 > w0) r_id = 2;
+                    else if (w0 > w1 && w0 > w2) r_id = 0;
                     branch_regime_ids[node.id] = r_id;
-                    regime_counts[r_id]++;
-                    regime_gc_sum[r_id] += node_gc[node.id];
+
+                    soft_regime_counts[0] += w0;
+                    soft_regime_counts[1] += w1;
+                    soft_regime_counts[2] += w2;
+
+                    soft_regime_gc_sum[0] += w0 * node_gc[node.id];
+                    soft_regime_gc_sum[1] += w1 * node_gc[node.id];
+                    soft_regime_gc_sum[2] += w2 * node_gc[node.id];
                 }
             }
         } else {
             for (const auto& node : tree.nodes) {
                 if (node.id != tree.root_id) {
+                    branch_regime_weights[node.id] = {0.0, 1.0, 0.0};
                     branch_regime_ids[node.id] = 1;
-                    regime_counts[1]++;
-                    regime_gc_sum[1] += node_gc[node.id];
+                    soft_regime_counts[1] += 1.0;
+                    soft_regime_gc_sum[1] += node_gc[node.id];
                 }
             }
         }
 
         // Build regimes
         regimes.clear();
-        if (regime_counts[1] > 0) bg_gc = regime_gc_sum[1] / regime_counts[1];
+        Scalar avg_gc_1 = (soft_regime_counts[1] > 1e-4) ? (soft_regime_gc_sum[1] / soft_regime_counts[1]) : bg_gc;
+        Scalar avg_gc_2 = (soft_regime_counts[2] > 1e-4) ? (soft_regime_gc_sum[2] / soft_regime_counts[2]) : (bg_gc + 0.1);
+        Scalar avg_gc_0 = (soft_regime_counts[0] > 1e-4) ? (soft_regime_gc_sum[0] / soft_regime_counts[0]) : (bg_gc - 0.1);
 
+        avg_gc_1 = std::clamp(avg_gc_1, 0.05, 0.95);
+        avg_gc_2 = std::clamp(avg_gc_2, 0.05, 0.95);
+        avg_gc_0 = std::clamp(avg_gc_0, 0.05, 0.95);
 
         auto make_regime = [&](int id, const std::string& name, Scalar psi_val, size_t count, Scalar avg_gc) {
             DirectionalRegime reg;
@@ -1001,16 +1033,16 @@ public:
         };
 
         if (K == 3) {
-            Scalar psi_gc = (regime_counts[2] > 0) ? std::log((regime_gc_sum[2]/regime_counts[2]) / std::max(1.0 - (regime_gc_sum[2]/regime_counts[2]), 1e-4) / (bg_gc / std::max(1.0 - bg_gc, 1e-4))) : 0.4;
-            Scalar psi_at = (regime_counts[0] > 0) ? std::log((regime_gc_sum[0]/regime_counts[0]) / std::max(1.0 - (regime_gc_sum[0]/regime_counts[0]), 1e-4) / (bg_gc / std::max(1.0 - bg_gc, 1e-4))) : -0.4;
+            Scalar psi_gc = std::log((avg_gc_2 / (1.0 - avg_gc_2)) / (avg_gc_1 / (1.0 - avg_gc_1)));
+            Scalar psi_at = std::log((avg_gc_0 / (1.0 - avg_gc_0)) / (avg_gc_1 / (1.0 - avg_gc_1)));
             psi_gc = std::clamp(psi_gc, 0.05, 3.0);
             psi_at = std::clamp(psi_at, -3.0, -0.05);
 
-            regimes.push_back(make_regime(0, "AT-drift", psi_at, regime_counts[0], (regime_counts[0] > 0) ? regime_gc_sum[0]/regime_counts[0] : 0.35));
-            regimes.push_back(make_regime(1, "Neutral", 0.0, regime_counts[1], bg_gc));
-            regimes.push_back(make_regime(2, "GC-drift", psi_gc, regime_counts[2], (regime_counts[2] > 0) ? regime_gc_sum[2]/regime_counts[2] : 0.65));
+            regimes.push_back(make_regime(0, "AT-drift", psi_at, static_cast<size_t>(std::round(soft_regime_counts[0])), avg_gc_0));
+            regimes.push_back(make_regime(1, "Neutral", 0.0, static_cast<size_t>(std::round(soft_regime_counts[1])), avg_gc_1));
+            regimes.push_back(make_regime(2, "GC-drift", psi_gc, static_cast<size_t>(std::round(soft_regime_counts[2])), avg_gc_2));
         } else {
-            regimes.push_back(make_regime(1, "Neutral", 0.0, regime_counts[1], bg_gc));
+            regimes.push_back(make_regime(1, "Neutral", 0.0, static_cast<size_t>(std::round(soft_regime_counts[1])), avg_gc_1));
         }
 
         // Root frequencies: Neutral regime codon frequencies
@@ -1032,13 +1064,27 @@ public:
         branch_transition_matrices.resize(num_nodes);
         for (const auto& node : tree.nodes) {
             if (node.id != tree.root_id) {
-                int r_id = branch_regime_ids[node.id];
-                // Map r_id to regimes index
-                size_t reg_idx = (K == 3) ? static_cast<size_t>(r_id) : 0;
-                branch_transition_matrices[node.id] = regimes[reg_idx].base_matrix.transition_matrix(node.branch_length);
+                if (K == 3) {
+                    const auto& w = branch_regime_weights[node.id];
+                    if (w[1] > 0.99) {
+                        branch_transition_matrices[node.id] = regimes[1].base_matrix.transition_matrix(node.branch_length);
+                    } else if (w[2] > 0.99) {
+                        branch_transition_matrices[node.id] = regimes[2].base_matrix.transition_matrix(node.branch_length);
+                    } else if (w[0] > 0.99) {
+                        branch_transition_matrices[node.id] = regimes[0].base_matrix.transition_matrix(node.branch_length);
+                    } else {
+                        Matrix P = w[1] * regimes[1].base_matrix.transition_matrix(node.branch_length);
+                        if (w[2] > 1e-4) P += w[2] * regimes[2].base_matrix.transition_matrix(node.branch_length);
+                        if (w[0] > 1e-4) P += w[0] * regimes[0].base_matrix.transition_matrix(node.branch_length);
+                        branch_transition_matrices[node.id] = std::move(P);
+                    }
+                } else {
+                    branch_transition_matrices[node.id] = regimes[0].base_matrix.transition_matrix(node.branch_length);
+                }
             }
         }
     }
+
 
     // Factory: Phase 1 GTR + Composition Test + Auto-Root + Global MG94
     static DirectionalFELAnalyzer create_and_fit(
@@ -1153,9 +1199,23 @@ public:
 
             for (const auto& node : tree.nodes) {
                 if (node.id != tree.root_id) {
-                    int r_id = branch_regime_ids[node.id];
-                    size_t reg_idx = (K == 3) ? static_cast<size_t>(r_id) : 0;
-                    P_branches[node.id] = regime_matrices[reg_idx].transition_matrix(node.branch_length);
+                    if (K == 3) {
+                        const auto& w = branch_regime_weights[node.id];
+                        if (w[1] > 0.99) {
+                            P_branches[node.id] = regime_matrices[1].transition_matrix(node.branch_length);
+                        } else if (w[2] > 0.99) {
+                            P_branches[node.id] = regime_matrices[2].transition_matrix(node.branch_length);
+                        } else if (w[0] > 0.99) {
+                            P_branches[node.id] = regime_matrices[0].transition_matrix(node.branch_length);
+                        } else {
+                            Matrix P = w[1] * regime_matrices[1].transition_matrix(node.branch_length);
+                            if (w[2] > 1e-4) P += w[2] * regime_matrices[2].transition_matrix(node.branch_length);
+                            if (w[0] > 1e-4) P += w[0] * regime_matrices[0].transition_matrix(node.branch_length);
+                            P_branches[node.id] = std::move(P);
+                        }
+                    } else {
+                        P_branches[node.id] = regime_matrices[0].transition_matrix(node.branch_length);
+                    }
                 }
             }
 
@@ -1577,6 +1637,18 @@ public:
             });
         }
         j["directional_model"]["regimes"] = reg_arr;
+
+        nlohmann::json branch_regimes_j = nlohmann::json::object();
+        for (const auto& node : tree.nodes) {
+            if (node.id != tree.root_id) {
+                const auto& w = branch_regime_weights[node.id];
+                branch_regimes_j[node.name] = {
+                    {"regime_id", branch_regime_ids[node.id]},
+                    {"weights", nlohmann::json::array({w[0], w[1], w[2]})}
+                };
+            }
+        }
+        j["directional_model"]["branch_regimes"] = branch_regimes_j;
 
         // Model Fits
         j["model_fits"]["gtr"]["log_likelihood"] = gtr_log_l;

@@ -812,5 +812,7 @@ NB_MODULE(_hyphy3, m) {
         .def_ro("comp_test", &DirectionalFELAnalyzer::comp_test)
         .def_ro("root_result", &DirectionalFELAnalyzer::root_result)
         .def_ro("regimes", &DirectionalFELAnalyzer::regimes)
+        .def_ro("branch_regime_ids", &DirectionalFELAnalyzer::branch_regime_ids)
+        .def_ro("branch_regime_weights", &DirectionalFELAnalyzer::branch_regime_weights)
         .def_ro("site_results", &DirectionalFELAnalyzer::site_results);
 }

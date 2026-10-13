@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="assets/hyphy3-icon.png" width="140" height="140" alt="HyPhy 3 Icon" />
+<img src="https://raw.githubusercontent.com/veg/hyphy-3/main/assets/hyphy3-icon.png" width="140" height="140" alt="HyPhy 3 Icon" />
 
 # HYPHY 3
 
@@ -145,15 +145,15 @@ HyPhy 3 computes exact analytical branch gradients in **one single combined pass
 
 **Homogeneous Model Gradient**:
 
-$$
-\frac{\partial \ln L}{\partial t_b} = \sum_{p=1}^P \frac{w_p}{L_p} V_{b,p}^{\top} \left( \frac{\partial P_b}{\partial t_b} \right) D_{b,p}, \quad \text{where } \frac{\partial P_b}{\partial t_b} = Q P_b
-$$
+```math
+\frac{\partial \ln L}{\partial t_b} = \sum_{p=1}^P \frac{w_p}{L_p} V_{b,p}^T \left( \frac{\partial P_b}{\partial t_b} \right) D_{b,p}, \quad \text{where } \frac{\partial P_b}{\partial t_b} = Q P_b
+```
 
 **Branch-Site Discrete Mixture Gradient (aBSREL)**:
 
-$$
-\frac{\partial \ln L}{\partial \alpha_b} = \sum_{p=1}^P \frac{w_p}{L_p} V_{b,p}^{\top} \left( \sum_{k=1}^{M_b} p_{b,k} Q(1, \omega_{b,k}) P_{b,k} \right) D_{b,p}
-$$
+```math
+\frac{\partial \ln L}{\partial \alpha_b} = \sum_{p=1}^P \frac{w_p}{L_p} V_{b,p}^T \left( \sum_{k=1}^{M_b} p_{b,k} Q(1, \omega_{b,k}) P_{b,k} \right) D_{b,p}
+```
 
 This allows joint L-BFGS optimization across all branch lengths simultaneously in **O(B)** time.
 
@@ -201,7 +201,7 @@ This allows joint L-BFGS optimization across all branch lengths simultaneously i
 | **GTR / MG94** | What are baseline nucleotide biases & global dN/dS? | Alignment-wide | Reversible CTMC with F3x4 equilibrium | Global ω | Supported | 100% Verified |
 | **GARD** | Where are recombination breakpoints located? | Recombination & Topology | Segmented GTR + Neighbor-Joining, AICc selection | Independent segment rates | — | 100% Verified |
 | **SLAC** | Are individual sites undergoing selection using counting methods? | Site-level (dN ≷ dS) | Joint ML Ancestral Reconstruction, exact Binomial test | None | — | 100% Verified |
-| **dFEL** | Which sites evolve under selection in compositionally heterogeneous lineages? | Site-level & Lineage direction (dN ≷ dS, ΔGC) | Non-stationary discrete regimes (AT/Neutral/GC), ML auto-rooting, LRT | Regime-specific target frequencies | — | 100% Verified |
+| **dFEL** | Which sites evolve under selection in compositionally heterogeneous lineages? | Site-level & Lineage direction (dN ≷ dS, ΔGC) | Continuous Softmax mixture (AT/Neutral/GC), ML auto-rooting, LRT | Regime-specific target frequencies | — | 100% Verified |
 | **Adjoint Core** | Differentiable tree likelihoods for custom ML models | Arbitrary parameters | Inside-Outside analytical O(B) gradients | User-defined | User-defined | Exact Analytical |
 
 ---
@@ -358,9 +358,10 @@ Null ~ ½ χ²₀ + ½(0.4 χ²₁ + 0.6 χ²₂)
      - Breaks the Felsenstein Pulley Principle by formulating an explicit directional substitution model (Q_{W → S} ≠ Q_{S → W}).
      - Systematically evaluates each candidate internal or external branch b as the phylogenetic root, computing its directional log-likelihood ln L(b as root).
      - Calculates Akaike root support weights w(b) = exp(-½ Δ_b) / ∑_b' exp(-½ Δ_b') and reroots the tree at the maximum likelihood position while strictly conserving total tree length and pairwise leaf distances.
-  3. **Non-Stationary Discrete Regimes**:
-     - Classifies tree branches into K = 3 discrete directional regimes based on lineage-specific compositional shifts ΔGC (Regime 0: AT-drift ψ < 1, Regime 1: Neutral equilibrium ψ = 1, Regime 2: GC-drift ψ > 1).
-     - Each regime k maintains its own target equilibrium frequencies π^(k) satisfying local detailed balance, evaluating matrix exponentials via SIMD orthogonal eigensystems without Fréchet derivative penalties.
+  3. **Continuous Softmax Mixture over Directional Regimes**:
+     - Formulates a continuous multinomial logit (Softmax) mixture over K = 3 directional regimes: AT-drift (ψ^(0) < 0), Neutral equilibrium (ψ^(1) = 0), and GC-drift (ψ^(2) > 0), eliminating hard-boundary threshold artifacts while guaranteeing exact row-stochasticity via convex combinations P_b(t_b) = ∑_k w_{b,k} exp(Q^(k) t_b).
+     - Soft empirical Bayes expectations estimate regime drift parameters from lineage-specific 3rd-position deviations δ_b = GC3(u) - GC_bg.
+     - Each regime k maintains its own target equilibrium frequencies π^(k) satisfying local detailed balance, evaluating matrix exponentials via SIMD orthogonal eigensystems with an accelerated fast path for regime-dominated branches (w_{b,k} > 0.99).
   4. **Site-Level Selection & Directed Ancestral Reconstruction**:
      - Optimizes site-specific synonymous rate α_s and non-synonymous rate β_s across branches under their respective regimes.
      - Tests H₀: α_s = β_s vs H₁: α_s ≠ β_s via asymptotic χ²₁ LRT.
@@ -469,7 +470,7 @@ hyphy3 gard --alignment tests/data/adh.nex --max-breakpoints 3 --output adh.GARD
 # 13. Run SLAC (counting-based site selection with Joint ML ancestral reconstruction)
 hyphy3 slac --alignment tests/data/adh.nex --samples 100 --output adh.SLAC.json --threads 8
 
-# 14. Run Directional-FEL (dFEL with upfront chi^2 tests, ML auto-rooting, and 3-regime non-stationary codon dynamics)
+# 14. Run Directional-FEL (dFEL with upfront chi^2 tests, ML auto-rooting, and continuous Softmax directional mixture)
 hyphy3 dfel --alignment tests/data/adh.nex --output adh.dFEL.json --threads 8
 ```
 
