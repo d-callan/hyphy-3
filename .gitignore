@@ -39,7 +39,6 @@ Testing/
 !benchmarks/ground_truth/*.json
 !tests/data/*.json
 !schemas/**/*.json
-!viz/**/package.json
 *.cache
 *.log
 *.FEL.json

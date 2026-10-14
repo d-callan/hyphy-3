@@ -6,7 +6,6 @@ import { KpiBar } from './components/kpi-bar.js';
 import { EvidencePlot } from './components/evidence-plot.js';
 import { CandidatesTable } from './components/candidates-table.js';
 import { SiteDrawer } from './components/site-drawer.js';
-import './styles/viewer.css';
 
 export class HyPhyFELViewer {
   constructor(container, options = {}) {

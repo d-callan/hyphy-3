@@ -7,6 +7,7 @@
 #include "hyphy/core/console.hpp"
 #include "hyphy/opt/optimizer.hpp"
 #include "hyphy/analyses/fel.hpp"
+#include "hyphy/report/html_report.hpp"
 
 #include <iostream>
 #include <string>
@@ -43,6 +44,7 @@ static void print_usage(const char* prog) {
               << "  " << Console::brand("--branch-regex") << " <reg> Regular expression to match branch names to test\n"
               << "  " << Console::brand("--threads") << " <N>        Number of OpenMP worker threads\n"
               << "  " << Console::brand("--output") << " <file>      Path to output JSON file (default: <alignment>.FEL.json)\n"
+              << "  " << Console::brand("--html") << " <file>        Also write a self-contained interactive HTML report\n"
               << "  " << Console::brand("--pvalue") << " <float>     P-value significance threshold (default: 0.1)\n"
               << "  " << Console::brand("--json-format") << " <type> Output JSON schema format: 'modern' (v3.0, default) or 'legacy' (Datamonkey 2.5)\n"
               << "  " << Console::brand("--legacy-json") << "        Emit legacy Datamonkey/HyPhy 2.5 JSON schema\n"
@@ -63,6 +65,7 @@ int run_fel(int argc, char* argv[]) {
     std::string alignment_file;
     std::string tree_file;
     std::string output_file;
+    std::string html_file;
     std::string code_name = "Universal";
     std::string test_branches = "All";
     std::string test_branch_regex = "";
@@ -90,6 +93,8 @@ int run_fel(int argc, char* argv[]) {
             num_threads = std::stoi(argv[++i]);
         } else if (arg == "--output" && i + 1 < argc) {
             output_file = argv[++i];
+        } else if (arg == "--html" && i + 1 < argc) {
+            html_file = argv[++i];
         } else if (arg == "--pvalue" && i + 1 < argc) {
             pvalue_threshold = std::stod(argv[++i]);
         } else if (arg == "--json-format" && i + 1 < argc) {
@@ -508,6 +513,17 @@ int run_fel(int argc, char* argv[]) {
     } catch (const std::exception& e) {
         std::cerr << Console::danger("Error writing JSON: ") << e.what() << "\n";
         return 1;
+    }
+
+    if (!html_file.empty()) {
+        try {
+            hyphy::report::write_html_report(output_file, html_file);
+            std::cout << Console::success("✔") << " " << Console::bold("Saved HTML report to: ")
+                      << Console::brand(html_file) << "\n\n";
+        } catch (const std::exception& e) {
+            std::cerr << Console::danger("Error writing HTML report: ") << e.what() << "\n";
+            return 1;
+        }
     }
 
     return 0;

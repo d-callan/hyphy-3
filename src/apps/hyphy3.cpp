@@ -18,6 +18,7 @@ int run_prime(int argc, char* argv[]);
 int run_gard(int argc, char* argv[]);
 int run_slac(int argc, char* argv[]);
 int run_dfel(int argc, char* argv[]);
+int run_report(int argc, char* argv[]);
 
 void print_hyphy3_banner() {
     Panel::print_banner(
@@ -47,12 +48,15 @@ void print_hyphy3_usage(const char* prog) {
               << "  " << Console::brand("slac         ") << "  Single-Likelihood Ancestor Counting (counting site selection)\n"
               << "  " << Console::brand("dfel         ") << "  Directional FEL (non-stationary selection & auto-rooting)\n\n";
 
+    std::cout << Console::bold("Reports:") << "\n"
+              << "  " << Console::brand("report       ") << "  Write a self-contained HTML report for an existing result JSON\n\n";
+
     std::cout << Console::bold("General Options:") << "\n"
               << "  " << Console::brand("--help, -h   ") << "  Show this help message\n"
               << "  " << Console::brand("--version, -v") << "  Show version information\n\n";
 
     std::cout << Console::bold("Examples:") << "\n"
-              << "  " << prog << " fel --alignment data/cd2.fna --tree data/cd2.nwk\n"
+              << "  " << prog << " fel --alignment data/cd2.fna --tree data/cd2.nwk --html cd2.FEL.html\n"
               << "  " << prog << " dfel --alignment tests/data/adh.nex --root auto\n"
               << "  " << prog << " meme --alignment tests/data/adh.nex --threads 8\n"
               << "  " << prog << " busted --alignment tests/data/adh.nex --auto-k --threads 8\n"
@@ -60,7 +64,8 @@ void print_hyphy3_usage(const char* prog) {
               << "  " << prog << " relax --alignment tests/data/Fig4E.nex\n"
               << "  " << prog << " fubar --alignment data/cd2.fna --tree data/cd2.nwk\n"
               << "  " << prog << " prime --alignment data/cd2.fna --tree data/cd2.nwk --property-set 5PROP\n"
-              << "  " << prog << " slac --alignment tests/data/adh.nex --samples 100\n\n";
+              << "  " << prog << " slac --alignment tests/data/adh.nex --samples 100\n"
+              << "  " << prog << " report results.MEME.json --html results.MEME.html\n\n";
 }
 
 int main(int argc, char* argv[]) {
@@ -111,6 +116,8 @@ int main(int argc, char* argv[]) {
         return run_slac(sub_argc, sub_argv.data());
     } else if (cmd == "dfel" || cmd == "directional-fel" || cmd == "directional_fel") {
         return run_dfel(sub_argc, sub_argv.data());
+    } else if (cmd == "report") {
+        return run_report(sub_argc, sub_argv.data());
     } else {
         std::cerr << "Error: Unknown analysis '" << cmd << "'.\n\n";
         print_hyphy3_usage(argv[0]);
