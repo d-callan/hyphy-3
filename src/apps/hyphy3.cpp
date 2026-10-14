@@ -11,6 +11,7 @@ int run_fel(int argc, char* argv[]);
 int run_contrast_fel(int argc, char* argv[]);
 int run_meme(int argc, char* argv[]);
 int run_busted(int argc, char* argv[]);
+int run_busted_ph(int argc, char* argv[]);
 int run_absrel(int argc, char* argv[]);
 int run_relax(int argc, char* argv[]);
 int run_fubar(int argc, char* argv[]);
@@ -41,6 +42,7 @@ void print_hyphy3_usage(const char* prog) {
               << "  " << Console::brand("contrast-fel ") << "  Contrast-FEL (differential selection between branch sets)\n"
               << "  " << Console::brand("meme         ") << "  Mixed Effects Model of Evolution (episodic selection)\n"
               << "  " << Console::brand("busted       ") << "  Branch-site Unrestricted Statistical Test (gene-wide selection)\n"
+              << "  " << Console::brand("busted-ph    ") << "  BUSTED-Phenotype (selection associated with a phenotype/trait)\n"
               << "  " << Console::brand("absrel       ") << "  Adaptive Branch-Site Random Effects Likelihood (lineage selection)\n"
               << "  " << Console::brand("relax        ") << "  Test for Selection Relaxation (branch set contrast)\n"
               << "  " << Console::brand("fubar        ") << "  Fast, Unconstrained Bayesian AppRoximation (Bayesian site selection)\n"
@@ -63,6 +65,7 @@ void print_hyphy3_usage(const char* prog) {
               << "  " << prog << " ohmic --alignment tests/data/cd2.fna\n"
               << "  " << prog << " meme --alignment tests/data/adh.nex --threads 8\n"
               << "  " << prog << " busted --alignment tests/data/adh.nex --auto-k --threads 8\n"
+              << "  " << prog << " busted-ph --alignment data/cd2.fna --tree data/cd2.nwk --branches Human,Chimp,Baboon\n"
               << "  " << prog << " absrel --alignment tests/data/adh.nex --threads 8\n"
               << "  " << prog << " relax --alignment tests/data/Fig4E.nex\n"
               << "  " << prog << " fubar --alignment data/cd2.fna --tree data/cd2.nwk\n"
@@ -106,6 +109,8 @@ int main(int argc, char* argv[]) {
             return run_meme(sub_argc, sub_argv.data());
         } else if (cmd == "busted") {
             return run_busted(sub_argc, sub_argv.data());
+        } else if (cmd == "busted-ph" || cmd == "busted_ph" || cmd == "BUSTED-PH") {
+            return run_busted_ph(sub_argc, sub_argv.data());
         } else if (cmd == "absrel") {
             return run_absrel(sub_argc, sub_argv.data());
         } else if (cmd == "relax") {

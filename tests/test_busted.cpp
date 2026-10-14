@@ -359,4 +359,73 @@ TEST_CASE("BUSTED-Auto: 4-Gate Surprisal & Score Model Selector") {
     }
 }
 
+TEST_CASE("BUSTED-PH: Phenotype-Associated Selection (4-Model Workflow)") {
+    auto aln = Alignment::load(HYPHY3_SOURCE_DIR "/benchmarks/data/cd2.fna");
+    auto tree = Tree::from_newick_file(HYPHY3_SOURCE_DIR "/benchmarks/data/cd2.nwk");
+
+    auto analyzer = BUSTEDAnalyzer::create_and_fit(tree, aln);
+    BUSTEDSettings ph_settings;
+    ph_settings.phenotype_mode = true;
+    ph_settings.test_branches = "Human,Chimp,Baboon,RhMonkey,Node3,Node2";
+    ph_settings.num_rate_classes = 3;
+
+    auto res = analyzer.run(ph_settings);
+
+    std::cout << "\n[BUSTED-PH on CD2 (Primates vs Non-Primates)]\n"
+              << "  Unconstrained Two-Set ln L : " << res.unconstrained.log_likelihood << "\n"
+              << "  Constrained Test ln L      : " << res.constrained.log_likelihood
+              << " (LRT_T = " << res.lrt << ", p_T = " << res.p_value << ")\n"
+              << "  Constrained BG ln L        : " << res.constrained_background.log_likelihood
+              << " (LRT_B = " << res.background_lrt << ", p_B = " << res.background_p_value
+              << ", delta_AICc = " << res.background_delta_aicc << ")\n"
+              << "  Shared Dist ln L           : " << res.shared_distributions.log_likelihood
+              << " (LRT_diff = " << res.shared_lrt << ", df = " << res.shared_df << ", p_diff = " << res.shared_p_value << ")\n"
+              << "  Union-Intersection p_UIT   : " << res.union_intersection_p_value << "\n"
+              << "  BG Neutral Supported (AICc): " << (res.background_neutral_supported ? "YES" : "NO") << "\n"
+              << "  Phenotype Associated       : " << (res.phenotype_associated ? "YES" : "NO")
+              << " (" << res.phenotype_verdict << ")\n";
+
+    CHECK(res.has_background_test == true);
+    CHECK(res.shared_df == 5);
+    CHECK(res.lrt >= 0.0);
+    CHECK(res.background_lrt >= 0.0);
+    CHECK(res.shared_lrt >= 0.0);
+    CHECK(res.p_value >= 0.0);
+    CHECK(res.p_value <= 1.0);
+    CHECK(res.background_p_value >= 0.0);
+    CHECK(res.background_p_value <= 1.0);
+    CHECK(res.shared_p_value >= 0.0);
+    CHECK(res.shared_p_value <= 1.0);
+    CHECK(std::abs(res.union_intersection_p_value - std::max(res.p_value, res.shared_p_value)) < 1e-12);
+    CHECK(std::abs(res.background_delta_aicc - (res.constrained_background.aicc - res.unconstrained.aicc)) < 1e-9);
+    CHECK(res.unconstrained.has_background_distribution == true);
+    CHECK(res.unconstrained.background_distribution.omegas.size() == 3);
+    CHECK(res.constrained.test_distribution.omegas.back() == 1.0);
+    CHECK(res.constrained_background.background_distribution.omegas.back() == 1.0);
+    CHECK(!res.phenotype_verdict.empty());
+
+    // Verify Legacy JSON
+    auto j_leg = analyzer.to_legacy_json(res);
+    CHECK(j_leg.contains("test results background"));
+    CHECK(j_leg.contains("test results shared distributions"));
+    CHECK(j_leg.contains("BUSTED-PH"));
+    CHECK(j_leg["BUSTED-PH"].contains("union_intersection_p_value"));
+    CHECK(j_leg["BUSTED-PH"].contains("background_delta_aicc"));
+    CHECK(j_leg.contains("phenotype association"));
+    CHECK(j_leg["fits"].contains("Constrained model (background)"));
+    CHECK(j_leg["fits"].contains("Unconstrained model with shared distributions"));
+    CHECK(j_leg["fits"]["Unconstrained model"]["Rate Distributions"].contains("Background"));
+
+    // Verify Modern v3 JSON
+    auto j_mod = analyzer.to_modern_json(res);
+    CHECK(j_mod["analysis"]["id"] == "busted-ph");
+    CHECK(j_mod["model_fits"].contains("constrained_background"));
+    CHECK(j_mod["model_fits"].contains("shared_distributions"));
+    CHECK(j_mod["statistical_tests"].contains("background_selection"));
+    CHECK(j_mod["statistical_tests"].contains("shared_distributions"));
+    CHECK(j_mod["statistical_tests"].contains("union_intersection"));
+    CHECK(j_mod["statistical_tests"].contains("phenotype_association"));
+}
+
+
 

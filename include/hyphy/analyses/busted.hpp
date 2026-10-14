@@ -32,6 +32,47 @@ namespace hyphy::analyses {
 using namespace hyphy::core;
 using namespace hyphy::opt;
 
+inline Scalar busted_regularized_gamma_p(Scalar a, Scalar z) {
+    if (z <= 0.0) return 0.0;
+    if (a <= 0.0) return 1.0;
+    if (z < a + 1.0) {
+        Scalar sum = 1.0 / a;
+        Scalar term = sum;
+        for (int n = 1; n < 200; ++n) {
+            term *= z / (a + n);
+            sum += term;
+            if (std::abs(term) < std::abs(sum) * 1e-15) break;
+        }
+        return sum * std::exp(-z + a * std::log(z) - std::lgamma(a));
+    }
+    Scalar tiny = 1e-30;
+    Scalar b = z + 1.0 - a;
+    Scalar c = 1.0 / tiny;
+    Scalar d = 1.0 / b;
+    Scalar h = d;
+    for (int i = 1; i < 200; ++i) {
+        Scalar an = -i * (i - a);
+        b += 2.0;
+        d = an * d + b;
+        if (std::abs(d) < tiny) d = tiny;
+        c = b + an / c;
+        if (std::abs(c) < tiny) c = tiny;
+        d = 1.0 / d;
+        Scalar del = d * c;
+        h *= del;
+        if (std::abs(del - 1.0) < 1e-15) break;
+    }
+    Scalar q = std::exp(-z + a * std::log(z) - std::lgamma(a)) * h;
+    return std::clamp(1.0 - q, 0.0, 1.0);
+}
+
+inline Scalar busted_chi2_p_value(Scalar chi2, Scalar df) {
+    if (chi2 <= 0.0 || df <= 0.0) return 1.0;
+    if (df == 1.0) return std::erfc(std::sqrt(chi2 / 2.0));
+    if (df == 2.0) return std::exp(-chi2 / 2.0);
+    return std::clamp(1.0 - busted_regularized_gamma_p(df / 2.0, chi2 / 2.0), 0.0, 1.0);
+}
+
 struct BUSTEDErrorEvent {
     size_t site = 0;         // 1-based codon site
     std::string branch_name; // Node/branch name
@@ -54,6 +95,8 @@ struct BUSTEDFit {
     Scalar tree_scale = 1.0;
     size_t num_rate_classes = 3;
     BUSTEDRateDistribution test_distribution;
+    bool has_background_distribution = false;
+    BUSTEDRateDistribution background_distribution;
     std::vector<Scalar> branch_lengths; // Branch lengths per node id
     std::vector<Scalar> site_log_likelihoods;
     Scalar delta = 0.0;      // Double-hit rate parameter
@@ -105,6 +148,8 @@ struct BUSTEDSettings {
     Scalar error_sink_max_weight = 0.01; // Upper bound on contamination proportion epsilon
     Scalar error_sink_bf_threshold = 100.0; // Bayes factor cutoff to flag branch-site errors
     std::string test_branches = "All"; // "All", "Internal", "Leaves", "Unlabeled", or tag/comma-separated names
+    bool phenotype_mode = false;       // Run BUSTED-PH (Test selection, Background selection, and Shared distribution LRTs)
+    std::string comparison_branches = ""; // Optional comparison/background branch set for BUSTED-PH (default: complement of test_branches)
 };
 
 struct BUSTEDResult {
@@ -116,6 +161,22 @@ struct BUSTEDResult {
     Scalar p_value = 1.0;
     BUSTEDFit unconstrained;
     BUSTEDFit constrained;
+    // BUSTED-PH fields
+    bool has_background_test = false;
+    Scalar background_lrt = 0.0;
+    Scalar background_p_value = 1.0;
+    Scalar shared_lrt = 0.0;
+    Scalar shared_p_value = 1.0;
+    size_t shared_df = 0;
+    Scalar union_intersection_p_value = 1.0; // max(p_FG, p_diff)
+    Scalar background_delta_aicc = 0.0;      // AICc(Constrained BG) - AICc(Unconstrained)
+    bool background_neutral_supported = true; // Delta AICc <= 2.0 (or p_BG > 0.068)
+    Scalar ranking_score = 0.0;              // -log10(max(1e-8, p_FG)) - log10(max(1e-8, p_diff)) + log10(max(1e-8, p_BG))
+    bool phenotype_associated = false;
+    std::string phenotype_verdict;
+    BUSTEDFit constrained_background;
+    BUSTEDFit shared_distributions;
+
     std::vector<Scalar> evidence_ratios; // Bayes factors per site for omega_K > 1
     std::vector<Scalar> site_error_bfs;  // Max error sink Bayes factor across branches per site
     std::vector<BUSTEDErrorEvent> flagged_error_events; // Branch-site pairs with BF_sink >= threshold
@@ -132,8 +193,12 @@ public:
     // Relative branch lengths tau_b (normalized from MG94 baseline)
     std::vector<Scalar> branch_tau;
     mutable std::vector<bool> is_test_branch;
+    // 0 = Test, 1 = Background/Comparison, 2 = Unclassified/Nuisance
+    mutable std::vector<int> branch_partition;
     std::vector<size_t> leaf_to_taxon;
     mutable size_t num_test_branches = 0;
+    mutable size_t num_background_branches = 0;
+    mutable size_t num_unclassified_branches = 0;
 
     // Precomputed off-diagonal saturation replacement kernel P_sink(i, j) = pi_j / (1 - pi_i) for i != j, 0 for i == j
     Matrix P_sink;
@@ -160,19 +225,65 @@ public:
         size_t num_nodes = tree.num_nodes();
         branch_tau.assign(num_nodes, 0.0);
         is_test_branch.assign(num_nodes, true); // Default: all branches are Test
+        branch_partition.assign(num_nodes, 0);
         if (tree.root_id >= 0 && static_cast<size_t>(tree.root_id) < num_nodes) {
             is_test_branch[tree.root_id] = false;
         }
         num_test_branches = (num_nodes > 0) ? (num_nodes - 1) : 0; // Non-root branches
+        num_background_branches = 0;
+        num_unclassified_branches = 0;
         leaf_to_taxon = LikelihoodEngine::build_leaf_to_taxon_map(tree, aln);
         build_sink_kernel();
         prepare_baseline_lengths();
     }
 
+    void select_branch_partitions(
+        const std::string& test_spec,
+        const std::string& comp_spec = "",
+        bool auto_detect_tags = false
+    ) const {
+        size_t num_nodes = tree.num_nodes();
+        auto sel_test = tree.select_branches(test_spec, "", {}, auto_detect_tags);
+        is_test_branch = sel_test.is_selected;
+        num_test_branches = sel_test.num_selected;
+        branch_partition.assign(num_nodes, 1);
+        num_background_branches = 0;
+        num_unclassified_branches = 0;
+
+        if (!comp_spec.empty()) {
+            auto sel_comp = tree.select_branches(comp_spec, "", {}, false);
+            for (const auto& node : tree.nodes) {
+                if (node.id == tree.root_id) continue;
+                int nid = node.id;
+                if (is_test_branch[nid]) {
+                    branch_partition[nid] = 0;
+                } else if (sel_comp.is_selected[nid]) {
+                    branch_partition[nid] = 1;
+                    num_background_branches++;
+                } else {
+                    branch_partition[nid] = 2;
+                    num_unclassified_branches++;
+                }
+            }
+            if (num_background_branches == 0) {
+                throw std::runtime_error("No non-test branches matched '--comparison " + comp_spec + "'.");
+            }
+        } else {
+            for (const auto& node : tree.nodes) {
+                if (node.id == tree.root_id) continue;
+                int nid = node.id;
+                if (is_test_branch[nid]) {
+                    branch_partition[nid] = 0;
+                } else {
+                    branch_partition[nid] = 1;
+                    num_background_branches++;
+                }
+            }
+        }
+    }
+
     void select_test_branches(const std::string& spec) const {
-        auto sel = tree.select_branches(spec, "", {}, false);
-        is_test_branch = std::move(sel.is_selected);
-        num_test_branches = sel.num_selected;
+        select_branch_partitions(spec, "", false);
     }
 
     void build_sink_kernel() {
@@ -1756,14 +1867,1108 @@ public:
         return {optimal_k, null_fits};
     }
 
-    // Run complete BUSTED analysis with options
+    // Two-set likelihood evaluation for BUSTED with separate Test (partition 0) and Background/Comparison (partition 1) K-class distributions
+    Scalar evaluate_two_set_log_l(
+        Scalar s,
+        const std::vector<Scalar>& omegas_test,
+        const std::vector<Scalar>& weights_test,
+        const std::vector<Scalar>& omegas_bg,
+        const std::vector<Scalar>& weights_bg,
+        const std::vector<Scalar>& syn_rates = {1.0},
+        const std::vector<Scalar>& syn_weights = {1.0},
+        const std::vector<Scalar>* custom_branch_lengths = nullptr,
+        std::vector<Scalar>* out_pattern_ll = nullptr,
+        Scalar delta = 0.0,
+        Scalar psi = 0.0,
+        Scalar eps_sink_test = 0.0,
+        Scalar eps_sink_bg = 0.0
+    ) const {
+        size_t num_nodes = tree.num_nodes();
+        size_t num_patterns = aln.patterns.size();
+        int S = code->num_sense_codons;
+        size_t K_t = omegas_test.size();
+        size_t K_b = omegas_bg.size();
+        size_t M = syn_rates.size();
+        Scalar bio_scale_t = 1.0 - eps_sink_test;
+        Scalar bio_scale_b = 1.0 - eps_sink_bg;
+
+        std::vector<MG94Matrix> mg_t(K_t);
+        for (size_t k = 0; k < K_t; ++k) {
+            MG94Parameters p = base_params;
+            p.alpha = 1.0;
+            p.beta = omegas_test[k];
+            p.delta = delta;
+            p.psi = psi;
+            mg_t[k].update(p, aln.pos_nuc_frequencies, aln.codon_frequencies_f3x4, *code);
+        }
+
+        std::vector<MG94Matrix> mg_b(K_b);
+        for (size_t k = 0; k < K_b; ++k) {
+            MG94Parameters p = base_params;
+            p.alpha = 1.0;
+            p.beta = omegas_bg[k];
+            p.delta = delta;
+            p.psi = psi;
+            mg_b[k].update(p, aln.pos_nuc_frequencies, aln.codon_frequencies_f3x4, *code);
+        }
+
+        MG94Matrix mg_unclass;
+        if (num_unclassified_branches > 0) {
+            MG94Parameters p_u = base_params;
+            p_u.alpha = 1.0;
+            p_u.beta = mg94_omega;
+            p_u.delta = delta;
+            p_u.psi = psi;
+            mg_unclass.update(p_u, aln.pos_nuc_frequencies, aln.codon_frequencies_f3x4, *code);
+        }
+
+        std::vector<std::vector<Matrix>> P_mix(M, std::vector<Matrix>(num_nodes));
+        for (size_t m = 0; m < M; ++m) {
+            Scalar alpha_m = syn_rates[m];
+            for (const auto& node : tree.nodes) {
+                if (node.id != tree.root_id) {
+                    int nid = node.id;
+                    Scalar bl = custom_branch_lengths ? (*custom_branch_lengths)[nid] : (s * branch_tau[nid]);
+                    int part = (static_cast<size_t>(nid) < branch_partition.size()) ? branch_partition[nid] : (is_test_branch[nid] ? 0 : 1);
+                    if (part == 0) {
+                        P_mix[m][nid] = Matrix::Zero(S, S);
+                        Scalar use_bio = (eps_sink_test > 0.0) ? bio_scale_t : 1.0;
+                        for (size_t k = 0; k < K_t; ++k) {
+                            P_mix[m][nid] += (use_bio * weights_test[k]) * mg_t[k].transition_matrix(alpha_m * bl);
+                        }
+                        if (eps_sink_test > 0.0) {
+                            P_mix[m][nid].noalias() += eps_sink_test * P_sink;
+                        }
+                    } else if (part == 1) {
+                        P_mix[m][nid] = Matrix::Zero(S, S);
+                        Scalar use_bio = (eps_sink_bg > 0.0) ? bio_scale_b : 1.0;
+                        for (size_t k = 0; k < K_b; ++k) {
+                            P_mix[m][nid] += (use_bio * weights_bg[k]) * mg_b[k].transition_matrix(alpha_m * bl);
+                        }
+                        if (eps_sink_bg > 0.0) {
+                            P_mix[m][nid].noalias() += eps_sink_bg * P_sink;
+                        }
+                    } else {
+                        P_mix[m][nid] = mg_unclass.transition_matrix(alpha_m * bl);
+                    }
+                }
+            }
+        }
+
+        if (out_pattern_ll) {
+            out_pattern_ll->assign(num_patterns, 0.0);
+        }
+
+        Scalar total_log_l = 0.0;
+        #pragma omp parallel
+        {
+            std::vector<Vector> node_L(num_nodes, Vector::Zero(S));
+            std::vector<double> node_log_scale(num_nodes, 0.0);
+            #pragma omp for reduction(+:total_log_l) schedule(dynamic)
+            for (size_t p = 0; p < num_patterns; ++p) {
+                const auto& pattern = aln.patterns[p];
+                Scalar pat_L = 0.0;
+
+                for (size_t m = 0; m < M; ++m) {
+                    for (int32_t node_id : tree.post_order) {
+                        const auto& node = tree.nodes[node_id];
+                        if (node.is_leaf) {
+                            size_t t_idx = leaf_to_taxon[node_id];
+                            if (t_idx != static_cast<size_t>(-1)) {
+                                int8_t state = pattern.states[t_idx];
+                                if (state >= 0 && state < S) {
+                                    node_L[node_id].setZero();
+                                    node_L[node_id](state) = 1.0;
+                                } else {
+                                    node_L[node_id].setOnes();
+                                }
+                            } else {
+                                node_L[node_id].setOnes();
+                            }
+                            node_log_scale[node_id] = 0.0;
+                        } else {
+                            double child_scale_sum = 0.0;
+                            tree.eval_internal_node(node_id, P_mix[m], node_L, node_log_scale, node_L[node_id], child_scale_sum);
+                            node_log_scale[node_id] = child_scale_sum;
+                        }
+                    }
+                    Scalar cond_L = aln.codon_frequencies_f3x4.dot(node_L[tree.root_id]);
+                    if (cond_L > 0.0 && node_log_scale[tree.root_id] != 0.0) {
+                        cond_L *= std::exp(node_log_scale[tree.root_id]);
+                    }
+                    pat_L += syn_weights[m] * cond_L;
+                }
+
+                Scalar pll = (pat_L > 0.0) ? std::log(pat_L) : -1e20;
+                total_log_l += pattern.weight * pll;
+                if (out_pattern_ll) {
+                    (*out_pattern_ll)[p] = pll;
+                }
+            }
+        }
+        return total_log_l;
+    }
+
+    // Two-set Expectation Step: simultaneously updates Test (partition 0) and Background (partition 1) mixture weights in one Inside-Outside pass
+    std::pair<std::vector<Scalar>, std::vector<Scalar>> compute_expected_two_set_weights(
+        Scalar s,
+        const std::vector<Scalar>& omegas_test,
+        const std::vector<Scalar>& weights_test,
+        const std::vector<Scalar>& omegas_bg,
+        const std::vector<Scalar>& weights_bg,
+        const std::vector<Scalar>& syn_rates = {1.0},
+        const std::vector<Scalar>& syn_weights = {1.0},
+        const std::vector<Scalar>* custom_branch_lengths = nullptr,
+        Scalar delta = 0.0,
+        Scalar psi = 0.0,
+        Scalar eps_sink_test = 0.0,
+        Scalar eps_sink_bg = 0.0,
+        Scalar* out_new_eps_test = nullptr,
+        Scalar* out_new_eps_bg = nullptr,
+        Scalar max_eps_sink = 0.01
+    ) const {
+        size_t K_t = omegas_test.size();
+        size_t K_b = omegas_bg.size();
+        size_t M = syn_rates.size();
+        size_t num_nodes = tree.num_nodes();
+        size_t num_patterns = aln.patterns.size();
+        int S = code->num_sense_codons;
+        Scalar bio_scale_t = (out_new_eps_test != nullptr) ? (1.0 - eps_sink_test) : 1.0;
+        Scalar bio_scale_b = (out_new_eps_bg != nullptr) ? (1.0 - eps_sink_bg) : 1.0;
+
+        std::vector<std::vector<std::vector<Matrix>>> P_comp_t(M, std::vector<std::vector<Matrix>>(K_t, std::vector<Matrix>(num_nodes)));
+        std::vector<std::vector<std::vector<Matrix>>> P_comp_b(M, std::vector<std::vector<Matrix>>(K_b, std::vector<Matrix>(num_nodes)));
+        std::vector<std::vector<Matrix>> P_mix(M, std::vector<Matrix>(num_nodes));
+
+        for (size_t k = 0; k < K_t; ++k) {
+            MG94Parameters p = base_params;
+            p.alpha = 1.0;
+            p.beta = omegas_test[k];
+            p.delta = delta;
+            p.psi = psi;
+            MG94Matrix mg;
+            mg.update(p, aln.pos_nuc_frequencies, aln.codon_frequencies_f3x4, *code);
+            for (size_t m = 0; m < M; ++m) {
+                Scalar alpha_m = syn_rates[m];
+                for (const auto& node : tree.nodes) {
+                    if (node.id != tree.root_id && branch_partition[node.id] == 0) {
+                        Scalar bl = custom_branch_lengths ? (*custom_branch_lengths)[node.id] : (s * branch_tau[node.id]);
+                        P_comp_t[m][k][node.id] = mg.transition_matrix(alpha_m * bl);
+                    }
+                }
+            }
+        }
+
+        for (size_t k = 0; k < K_b; ++k) {
+            MG94Parameters p = base_params;
+            p.alpha = 1.0;
+            p.beta = omegas_bg[k];
+            p.delta = delta;
+            p.psi = psi;
+            MG94Matrix mg;
+            mg.update(p, aln.pos_nuc_frequencies, aln.codon_frequencies_f3x4, *code);
+            for (size_t m = 0; m < M; ++m) {
+                Scalar alpha_m = syn_rates[m];
+                for (const auto& node : tree.nodes) {
+                    if (node.id != tree.root_id && branch_partition[node.id] == 1) {
+                        Scalar bl = custom_branch_lengths ? (*custom_branch_lengths)[node.id] : (s * branch_tau[node.id]);
+                        P_comp_b[m][k][node.id] = mg.transition_matrix(alpha_m * bl);
+                    }
+                }
+            }
+        }
+
+        MG94Matrix mg_unclass;
+        if (num_unclassified_branches > 0) {
+            MG94Parameters p_u = base_params;
+            p_u.alpha = 1.0;
+            p_u.beta = mg94_omega;
+            p_u.delta = delta;
+            p_u.psi = psi;
+            mg_unclass.update(p_u, aln.pos_nuc_frequencies, aln.codon_frequencies_f3x4, *code);
+        }
+
+        for (size_t m = 0; m < M; ++m) {
+            Scalar alpha_m = syn_rates[m];
+            for (const auto& node : tree.nodes) {
+                if (node.id != tree.root_id) {
+                    int nid = node.id;
+                    int part = branch_partition[nid];
+                    if (part == 0) {
+                        P_mix[m][nid] = Matrix::Zero(S, S);
+                        for (size_t k = 0; k < K_t; ++k) {
+                            P_mix[m][nid] += (bio_scale_t * weights_test[k]) * P_comp_t[m][k][nid];
+                        }
+                        if (out_new_eps_test != nullptr) {
+                            P_mix[m][nid].noalias() += eps_sink_test * P_sink;
+                        }
+                    } else if (part == 1) {
+                        P_mix[m][nid] = Matrix::Zero(S, S);
+                        for (size_t k = 0; k < K_b; ++k) {
+                            P_mix[m][nid] += (bio_scale_b * weights_bg[k]) * P_comp_b[m][k][nid];
+                        }
+                        if (out_new_eps_bg != nullptr) {
+                            P_mix[m][nid].noalias() += eps_sink_bg * P_sink;
+                        }
+                    } else {
+                        Scalar bl = custom_branch_lengths ? (*custom_branch_lengths)[nid] : (s * branch_tau[nid]);
+                        P_mix[m][nid] = mg_unclass.transition_matrix(alpha_m * bl);
+                    }
+                }
+            }
+        }
+
+        Vector accum_t = Vector::Zero(K_t);
+        Vector accum_b = Vector::Zero(K_b);
+        Scalar sink_accum_t = 0.0, sink_accum_b = 0.0;
+        Scalar total_wt_t = 0.0, total_wt_b = 0.0;
+
+        #pragma omp parallel
+        {
+            Vector local_t = Vector::Zero(K_t);
+            Vector local_b = Vector::Zero(K_b);
+            Scalar local_sink_t = 0.0, local_sink_b = 0.0;
+            Scalar local_wt_t = 0.0, local_wt_b = 0.0;
+
+            #pragma omp for schedule(dynamic)
+            for (size_t p = 0; p < num_patterns; ++p) {
+                const auto& pattern = aln.patterns[p];
+                Scalar pat_L = 0.0;
+                std::vector<LikelihoodEngine::InsideOutsideResult> io_m(M);
+
+                for (size_t m = 0; m < M; ++m) {
+                    io_m[m] = LikelihoodEngine::compute_inside_outside(
+                        tree, pattern, leaf_to_taxon, P_mix[m], aln.codon_frequencies_f3x4, S
+                    );
+                    pat_L += syn_weights[m] * io_m[m].likelihood;
+                }
+
+                if (pat_L > 0.0) {
+                    Scalar inv_L = pattern.weight / pat_L;
+                    for (const auto& node : tree.nodes) {
+                        if (node.id != tree.root_id) {
+                            int nid = node.id;
+                            int part = branch_partition[nid];
+                            if (part == 0) {
+                                for (size_t k = 0; k < K_t; ++k) {
+                                    Scalar num = 0.0;
+                                    for (size_t m = 0; m < M; ++m) {
+                                        num += syn_weights[m] * io_m[m].V[nid].dot(P_comp_t[m][k][nid] * io_m[m].D[nid]);
+                                    }
+                                    local_t(k) += (bio_scale_t * weights_test[k]) * inv_L * num;
+                                }
+                                if (out_new_eps_test != nullptr) {
+                                    Scalar sink_num = 0.0;
+                                    for (size_t m = 0; m < M; ++m) {
+                                        sink_num += syn_weights[m] * eval_sink_bilinear(io_m[m].V[nid], io_m[m].D[nid]);
+                                    }
+                                    local_sink_t += eps_sink_test * inv_L * sink_num;
+                                }
+                                local_wt_t += pattern.weight;
+                            } else if (part == 1) {
+                                for (size_t k = 0; k < K_b; ++k) {
+                                    Scalar num = 0.0;
+                                    for (size_t m = 0; m < M; ++m) {
+                                        num += syn_weights[m] * io_m[m].V[nid].dot(P_comp_b[m][k][nid] * io_m[m].D[nid]);
+                                    }
+                                    local_b(k) += (bio_scale_b * weights_bg[k]) * inv_L * num;
+                                }
+                                if (out_new_eps_bg != nullptr) {
+                                    Scalar sink_num = 0.0;
+                                    for (size_t m = 0; m < M; ++m) {
+                                        sink_num += syn_weights[m] * eval_sink_bilinear(io_m[m].V[nid], io_m[m].D[nid]);
+                                    }
+                                    local_sink_b += eps_sink_bg * inv_L * sink_num;
+                                }
+                                local_wt_b += pattern.weight;
+                            }
+                        }
+                    }
+                }
+            }
+            #pragma omp critical
+            {
+                accum_t += local_t;
+                accum_b += local_b;
+                sink_accum_t += local_sink_t;
+                sink_accum_b += local_sink_b;
+                total_wt_t += local_wt_t;
+                total_wt_b += local_wt_b;
+            }
+        }
+
+        std::vector<Scalar> new_wt_t = weights_test;
+        if (total_wt_t > 0.0) {
+            Scalar sum_w = 0.0;
+            for (size_t k = 0; k < K_t; ++k) {
+                new_wt_t[k] = std::clamp(accum_t(k) / total_wt_t, 1e-6, 1.0 - 1e-6);
+                sum_w += new_wt_t[k];
+            }
+            for (size_t k = 0; k < K_t; ++k) new_wt_t[k] /= sum_w;
+            if (out_new_eps_test != nullptr) {
+                *out_new_eps_test = std::clamp(sink_accum_t / total_wt_t, 1e-7, max_eps_sink);
+            }
+        }
+
+        std::vector<Scalar> new_wt_b = weights_bg;
+        if (total_wt_b > 0.0) {
+            Scalar sum_w = 0.0;
+            for (size_t k = 0; k < K_b; ++k) {
+                new_wt_b[k] = std::clamp(accum_b(k) / total_wt_b, 1e-6, 1.0 - 1e-6);
+                sum_w += new_wt_b[k];
+            }
+            for (size_t k = 0; k < K_b; ++k) new_wt_b[k] /= sum_w;
+            if (out_new_eps_bg != nullptr) {
+                *out_new_eps_bg = std::clamp(sink_accum_b / total_wt_b, 1e-7, max_eps_sink);
+            }
+        }
+
+        return {new_wt_t, new_wt_b};
+    }
+
+    // Two-set synonymous rate E-step
+    std::vector<Scalar> compute_expected_two_set_syn_weights(
+        Scalar s,
+        const std::vector<Scalar>& omegas_test,
+        const std::vector<Scalar>& weights_test,
+        const std::vector<Scalar>& omegas_bg,
+        const std::vector<Scalar>& weights_bg,
+        const std::vector<Scalar>& syn_rates,
+        const std::vector<Scalar>& syn_weights,
+        const std::vector<Scalar>* custom_branch_lengths = nullptr,
+        Scalar delta = 0.0,
+        Scalar psi = 0.0,
+        Scalar eps_sink_test = 0.0,
+        Scalar eps_sink_bg = 0.0
+    ) const {
+        size_t M = syn_rates.size();
+        if (M <= 1) return {1.0};
+
+        size_t num_nodes = tree.num_nodes();
+        size_t num_patterns = aln.patterns.size();
+        int S = code->num_sense_codons;
+        size_t K_t = omegas_test.size();
+        size_t K_b = omegas_bg.size();
+        Scalar bio_scale_t = 1.0 - eps_sink_test;
+        Scalar bio_scale_b = 1.0 - eps_sink_bg;
+
+        std::vector<MG94Matrix> mg_t(K_t), mg_b(K_b);
+        for (size_t k = 0; k < K_t; ++k) {
+            MG94Parameters p = base_params;
+            p.alpha = 1.0; p.beta = omegas_test[k]; p.delta = delta; p.psi = psi;
+            mg_t[k].update(p, aln.pos_nuc_frequencies, aln.codon_frequencies_f3x4, *code);
+        }
+        for (size_t k = 0; k < K_b; ++k) {
+            MG94Parameters p = base_params;
+            p.alpha = 1.0; p.beta = omegas_bg[k]; p.delta = delta; p.psi = psi;
+            mg_b[k].update(p, aln.pos_nuc_frequencies, aln.codon_frequencies_f3x4, *code);
+        }
+        MG94Matrix mg_unclass;
+        if (num_unclassified_branches > 0) {
+            MG94Parameters p_u = base_params;
+            p_u.alpha = 1.0; p_u.beta = mg94_omega; p_u.delta = delta; p_u.psi = psi;
+            mg_unclass.update(p_u, aln.pos_nuc_frequencies, aln.codon_frequencies_f3x4, *code);
+        }
+
+        std::vector<std::vector<Matrix>> P_mix(M, std::vector<Matrix>(num_nodes));
+        for (size_t m = 0; m < M; ++m) {
+            Scalar alpha_m = syn_rates[m];
+            for (const auto& node : tree.nodes) {
+                if (node.id != tree.root_id) {
+                    int nid = node.id;
+                    Scalar bl = custom_branch_lengths ? (*custom_branch_lengths)[nid] : (s * branch_tau[nid]);
+                    int part = branch_partition[nid];
+                    if (part == 0) {
+                        P_mix[m][nid] = Matrix::Zero(S, S);
+                        Scalar use_bio = (eps_sink_test > 0.0) ? bio_scale_t : 1.0;
+                        for (size_t k = 0; k < K_t; ++k) {
+                            P_mix[m][nid] += (use_bio * weights_test[k]) * mg_t[k].transition_matrix(alpha_m * bl);
+                        }
+                        if (eps_sink_test > 0.0) P_mix[m][nid].noalias() += eps_sink_test * P_sink;
+                    } else if (part == 1) {
+                        P_mix[m][nid] = Matrix::Zero(S, S);
+                        Scalar use_bio = (eps_sink_bg > 0.0) ? bio_scale_b : 1.0;
+                        for (size_t k = 0; k < K_b; ++k) {
+                            P_mix[m][nid] += (use_bio * weights_bg[k]) * mg_b[k].transition_matrix(alpha_m * bl);
+                        }
+                        if (eps_sink_bg > 0.0) P_mix[m][nid].noalias() += eps_sink_bg * P_sink;
+                    } else {
+                        P_mix[m][nid] = mg_unclass.transition_matrix(alpha_m * bl);
+                    }
+                }
+            }
+        }
+
+        Vector syn_accum = Vector::Zero(M);
+        Scalar total_pattern_weight = 0.0;
+
+        #pragma omp parallel
+        {
+            Vector local_accum = Vector::Zero(M);
+            Scalar local_pat_wt = 0.0;
+            std::vector<Vector> node_L(num_nodes, Vector::Zero(S));
+
+            #pragma omp for schedule(dynamic)
+            for (size_t p = 0; p < num_patterns; ++p) {
+                const auto& pattern = aln.patterns[p];
+                Scalar pat_L = 0.0;
+                std::vector<Scalar> cond_L(M, 0.0);
+
+                for (size_t m = 0; m < M; ++m) {
+                    for (int32_t node_id : tree.post_order) {
+                        const auto& node = tree.nodes[node_id];
+                        if (node.is_leaf) {
+                            size_t t_idx = leaf_to_taxon[node_id];
+                            if (t_idx != static_cast<size_t>(-1)) {
+                                int8_t state = pattern.states[t_idx];
+                                if (state >= 0 && state < S) {
+                                    node_L[node_id].setZero();
+                                    node_L[node_id](state) = 1.0;
+                                } else {
+                                    node_L[node_id].setOnes();
+                                }
+                            } else {
+                                node_L[node_id].setOnes();
+                            }
+                        } else {
+                            node_L[node_id].setOnes();
+                            for (int32_t child_id : node.children) {
+                                Vector child_msg = P_mix[m][child_id] * node_L[child_id];
+                                node_L[node_id] = node_L[node_id].cwiseProduct(child_msg);
+                            }
+                        }
+                    }
+                    cond_L[m] = aln.codon_frequencies_f3x4.dot(node_L[tree.root_id]);
+                    pat_L += syn_weights[m] * cond_L[m];
+                }
+
+                if (pat_L > 0.0) {
+                    for (size_t m = 0; m < M; ++m) {
+                        Scalar rho_m = (syn_weights[m] * cond_L[m]) / pat_L;
+                        local_accum(m) += pattern.weight * rho_m;
+                    }
+                    local_pat_wt += pattern.weight;
+                }
+            }
+
+            #pragma omp critical
+            {
+                syn_accum += local_accum;
+                total_pattern_weight += local_pat_wt;
+            }
+        }
+
+        std::vector<Scalar> new_syn_weights(M);
+        if (total_pattern_weight > 0.0) {
+            Scalar sum_w = 0.0;
+            for (size_t m = 0; m < M; ++m) {
+                new_syn_weights[m] = std::clamp(syn_accum(m) / total_pattern_weight, 1e-6, 1.0 - 1e-6);
+                sum_w += new_syn_weights[m];
+            }
+            for (size_t m = 0; m < M; ++m) new_syn_weights[m] /= sum_w;
+        } else {
+            new_syn_weights = syn_weights;
+        }
+        return new_syn_weights;
+    }
+
+    // Two-set analytical branch gradients
+    std::pair<Scalar, std::vector<Scalar>> compute_two_set_branch_gradients(
+        const std::vector<Scalar>& branch_lengths,
+        const std::vector<Scalar>& omegas_test,
+        const std::vector<Scalar>& weights_test,
+        const std::vector<Scalar>& omegas_bg,
+        const std::vector<Scalar>& weights_bg,
+        const std::vector<Scalar>& syn_rates = {1.0},
+        const std::vector<Scalar>& syn_weights = {1.0},
+        Scalar delta = 0.0,
+        Scalar psi = 0.0,
+        Scalar eps_sink_test = 0.0,
+        Scalar eps_sink_bg = 0.0
+    ) const {
+        size_t num_nodes = tree.num_nodes();
+        size_t num_patterns = aln.patterns.size();
+        int S = code->num_sense_codons;
+        size_t K_t = omegas_test.size();
+        size_t K_b = omegas_bg.size();
+        size_t M = syn_rates.size();
+        Scalar bio_scale_t = 1.0 - eps_sink_test;
+        Scalar bio_scale_b = 1.0 - eps_sink_bg;
+
+        std::vector<MG94Matrix> mg_t(K_t), mg_b(K_b);
+        for (size_t k = 0; k < K_t; ++k) {
+            MG94Parameters p = base_params;
+            p.alpha = 1.0; p.beta = omegas_test[k]; p.delta = delta; p.psi = psi;
+            mg_t[k].update(p, aln.pos_nuc_frequencies, aln.codon_frequencies_f3x4, *code);
+        }
+        for (size_t k = 0; k < K_b; ++k) {
+            MG94Parameters p = base_params;
+            p.alpha = 1.0; p.beta = omegas_bg[k]; p.delta = delta; p.psi = psi;
+            mg_b[k].update(p, aln.pos_nuc_frequencies, aln.codon_frequencies_f3x4, *code);
+        }
+        MG94Matrix mg_unclass;
+        if (num_unclassified_branches > 0) {
+            MG94Parameters p_u = base_params;
+            p_u.alpha = 1.0; p_u.beta = mg94_omega; p_u.delta = delta; p_u.psi = psi;
+            mg_unclass.update(p_u, aln.pos_nuc_frequencies, aln.codon_frequencies_f3x4, *code);
+        }
+
+        std::vector<std::vector<Matrix>> P_mix(M, std::vector<Matrix>(num_nodes));
+        std::vector<std::vector<Matrix>> dP_mix(M, std::vector<Matrix>(num_nodes));
+        for (size_t m = 0; m < M; ++m) {
+            Scalar alpha_m = syn_rates[m];
+            for (const auto& node : tree.nodes) {
+                if (node.id != tree.root_id) {
+                    int nid = node.id;
+                    Scalar bl = branch_lengths[nid];
+                    int part = branch_partition[nid];
+                    if (part == 0) {
+                        P_mix[m][nid] = Matrix::Zero(S, S);
+                        dP_mix[m][nid] = Matrix::Zero(S, S);
+                        Scalar use_bio = (eps_sink_test > 0.0) ? bio_scale_t : 1.0;
+                        for (size_t k = 0; k < K_t; ++k) {
+                            Matrix P_k = mg_t[k].transition_matrix(alpha_m * bl);
+                            P_mix[m][nid] += (use_bio * weights_test[k]) * P_k;
+                            dP_mix[m][nid] += (use_bio * weights_test[k]) * alpha_m * (mg_t[k].Q * P_k);
+                        }
+                        if (eps_sink_test > 0.0) P_mix[m][nid].noalias() += eps_sink_test * P_sink;
+                    } else if (part == 1) {
+                        P_mix[m][nid] = Matrix::Zero(S, S);
+                        dP_mix[m][nid] = Matrix::Zero(S, S);
+                        Scalar use_bio = (eps_sink_bg > 0.0) ? bio_scale_b : 1.0;
+                        for (size_t k = 0; k < K_b; ++k) {
+                            Matrix P_k = mg_b[k].transition_matrix(alpha_m * bl);
+                            P_mix[m][nid] += (use_bio * weights_bg[k]) * P_k;
+                            dP_mix[m][nid] += (use_bio * weights_bg[k]) * alpha_m * (mg_b[k].Q * P_k);
+                        }
+                        if (eps_sink_bg > 0.0) P_mix[m][nid].noalias() += eps_sink_bg * P_sink;
+                    } else {
+                        Matrix P_u = mg_unclass.transition_matrix(alpha_m * bl);
+                        P_mix[m][nid] = P_u;
+                        dP_mix[m][nid] = alpha_m * (mg_unclass.Q * P_u);
+                    }
+                }
+            }
+        }
+
+        Scalar total_log_l = 0.0;
+        std::vector<Scalar> grad_b(num_nodes, 0.0);
+
+        #pragma omp parallel
+        {
+            std::vector<Scalar> local_grad(num_nodes, 0.0);
+            Scalar local_ll = 0.0;
+
+            #pragma omp for schedule(dynamic)
+            for (size_t p = 0; p < num_patterns; ++p) {
+                const auto& pattern = aln.patterns[p];
+                Scalar pat_L = 0.0;
+                std::vector<LikelihoodEngine::InsideOutsideResult> io_m(M);
+
+                for (size_t m = 0; m < M; ++m) {
+                    io_m[m] = LikelihoodEngine::compute_inside_outside(
+                        tree, pattern, leaf_to_taxon, P_mix[m], aln.codon_frequencies_f3x4, S
+                    );
+                    pat_L += syn_weights[m] * io_m[m].likelihood;
+                }
+
+                if (pat_L > 0.0) {
+                    local_ll += pattern.weight * std::log(pat_L);
+                    Scalar inv_L = pattern.weight / pat_L;
+                    for (const auto& node : tree.nodes) {
+                        if (node.id != tree.root_id) {
+                            int32_t vid = node.id;
+                            Scalar dL_dt = 0.0;
+                            for (size_t m = 0; m < M; ++m) {
+                                dL_dt += syn_weights[m] * io_m[m].V[vid].dot(dP_mix[m][vid] * io_m[m].D[vid]);
+                            }
+                            local_grad[vid] += inv_L * dL_dt;
+                        }
+                    }
+                }
+            }
+
+            #pragma omp critical
+            {
+                total_log_l += local_ll;
+                for (size_t i = 0; i < num_nodes; ++i) {
+                    grad_b[i] += local_grad[i];
+                }
+            }
+        }
+
+        return {total_log_l, grad_b};
+    }
+
+    std::vector<Scalar> refine_two_set_branch_lengths(
+        const std::vector<Scalar>& init_bl,
+        const std::vector<Scalar>& omegas_test,
+        const std::vector<Scalar>& weights_test,
+        const std::vector<Scalar>& omegas_bg,
+        const std::vector<Scalar>& weights_bg,
+        const std::vector<Scalar>& syn_rates = {1.0},
+        const std::vector<Scalar>& syn_weights = {1.0},
+        Scalar delta = 0.0,
+        Scalar psi = 0.0,
+        int max_iters = 6,
+        Scalar eps_sink_test = 0.0,
+        Scalar eps_sink_bg = 0.0
+    ) const {
+        size_t num_nodes = tree.num_nodes();
+        std::vector<Scalar> bl = init_bl;
+        for (size_t i = 0; i < num_nodes; ++i) {
+            if (i != static_cast<size_t>(tree.root_id)) {
+                bl[i] = std::clamp(bl[i], 1e-4, 10.0);
+            }
+        }
+
+        const size_t m_history = 5;
+        std::vector<std::vector<Scalar>> s_hist, y_hist;
+        std::vector<Scalar> rho_hist;
+
+        auto [curr_ll, curr_grad] = compute_two_set_branch_gradients(
+            bl, omegas_test, weights_test, omegas_bg, weights_bg, syn_rates, syn_weights, delta, psi, eps_sink_test, eps_sink_bg
+        );
+        Scalar best_ll = curr_ll;
+        std::vector<Scalar> best_bl = bl;
+
+        for (int iter = 0; iter < max_iters; ++iter) {
+            Scalar max_g = 0.0;
+            for (size_t i = 0; i < num_nodes; ++i) {
+                if (i != static_cast<size_t>(tree.root_id)) {
+                    max_g = std::max(max_g, std::abs(curr_grad[i]));
+                }
+            }
+            if (max_g < 1e-3) break;
+
+            std::vector<Scalar> q = curr_grad;
+            std::vector<Scalar> alpha(s_hist.size());
+            for (int j = static_cast<int>(s_hist.size()) - 1; j >= 0; --j) {
+                Scalar s_dot_q = 0.0;
+                for (size_t i = 0; i < num_nodes; ++i) s_dot_q += s_hist[j][i] * q[i];
+                alpha[j] = rho_hist[j] * s_dot_q;
+                for (size_t i = 0; i < num_nodes; ++i) q[i] -= alpha[j] * y_hist[j][i];
+            }
+
+            Scalar gamma = 1.0;
+            if (!s_hist.empty()) {
+                Scalar s_dot_y = 0.0, y_dot_y = 0.0;
+                const auto& s_last = s_hist.back();
+                const auto& y_last = y_hist.back();
+                for (size_t i = 0; i < num_nodes; ++i) {
+                    s_dot_y += s_last[i] * y_last[i];
+                    y_dot_y += y_last[i] * y_last[i];
+                }
+                if (y_dot_y > 1e-12) gamma = std::clamp(s_dot_y / y_dot_y, 1e-4, 10.0);
+            }
+
+            std::vector<Scalar> r(num_nodes);
+            for (size_t i = 0; i < num_nodes; ++i) r[i] = gamma * q[i];
+            for (size_t j = 0; j < s_hist.size(); ++j) {
+                Scalar y_dot_r = 0.0;
+                for (size_t i = 0; i < num_nodes; ++i) y_dot_r += y_hist[j][i] * r[i];
+                Scalar beta = rho_hist[j] * y_dot_r;
+                for (size_t i = 0; i < num_nodes; ++i) r[i] += s_hist[j][i] * (alpha[j] - beta);
+            }
+
+            std::vector<Scalar> d = r;
+            d[tree.root_id] = 0.0;
+            Scalar dir_dot_grad = 0.0;
+            for (size_t i = 0; i < num_nodes; ++i) {
+                if (i != static_cast<size_t>(tree.root_id)) dir_dot_grad += d[i] * curr_grad[i];
+            }
+            if (dir_dot_grad <= 0.0) {
+                d = curr_grad;
+                d[tree.root_id] = 0.0;
+                dir_dot_grad = 0.0;
+                for (size_t i = 0; i < num_nodes; ++i) {
+                    if (i != static_cast<size_t>(tree.root_id)) dir_dot_grad += d[i] * curr_grad[i];
+                }
+                s_hist.clear(); y_hist.clear(); rho_hist.clear();
+            }
+
+            Scalar step_size = 1.0;
+            std::vector<Scalar> new_bl(num_nodes);
+            Scalar new_ll = curr_ll;
+            std::vector<Scalar> new_grad;
+            bool line_search_ok = false;
+            for (int ls = 0; ls < 8; ++ls) {
+                for (size_t i = 0; i < num_nodes; ++i) {
+                    new_bl[i] = (i != static_cast<size_t>(tree.root_id)) ? std::clamp(bl[i] + step_size * d[i], 1e-4, 10.0) : 0.0;
+                }
+                auto [test_ll, test_grad] = compute_two_set_branch_gradients(
+                    new_bl, omegas_test, weights_test, omegas_bg, weights_bg, syn_rates, syn_weights, delta, psi, eps_sink_test, eps_sink_bg
+                );
+                if (test_ll > curr_ll + 1e-4 * step_size * dir_dot_grad) {
+                    new_ll = test_ll;
+                    new_grad = test_grad;
+                    line_search_ok = true;
+                    break;
+                }
+                step_size *= 0.5;
+            }
+            if (!line_search_ok) break;
+
+            std::vector<Scalar> s_k(num_nodes), y_k(num_nodes);
+            Scalar s_dot_y = 0.0;
+            for (size_t i = 0; i < num_nodes; ++i) {
+                s_k[i] = new_bl[i] - bl[i];
+                y_k[i] = curr_grad[i] - new_grad[i];
+                s_dot_y += s_k[i] * y_k[i];
+            }
+            if (s_dot_y > 1e-8) {
+                if (s_hist.size() >= m_history) {
+                    s_hist.erase(s_hist.begin()); y_hist.erase(y_hist.begin()); rho_hist.erase(rho_hist.begin());
+                }
+                s_hist.push_back(s_k); y_hist.push_back(y_k); rho_hist.push_back(1.0 / s_dot_y);
+            }
+
+            bl = new_bl; curr_ll = new_ll; curr_grad = new_grad;
+            if (curr_ll > best_ll) {
+                best_ll = curr_ll; best_bl = bl;
+            }
+        }
+        return best_bl;
+    }
+
+    // Fits two-set BUSTED / BUSTED-PH model with independent K-class omega distributions on Test and Background branches
+    BUSTEDFit fit_two_set_model(
+        bool constrain_test,
+        bool constrain_bg,
+        size_t K = 3,
+        bool refine_branches = true,
+        bool srv = false,
+        size_t num_syn_rates = 3,
+        const std::string& multiple_hits = "None",
+        ProgressBar* pbar = nullptr,
+        const std::string& model_desc = "",
+        bool use_error_sink = false,
+        Scalar max_eps_sink = 0.01,
+        const BUSTEDRateDistribution* init_test_dist = nullptr,
+        const BUSTEDRateDistribution* init_bg_dist = nullptr
+    ) const {
+        BUSTEDFit fit;
+        fit.num_rate_classes = K;
+        fit.has_background_distribution = true;
+        Scalar s = 1.0;
+
+        bool allow_double = (multiple_hits == "Double" || multiple_hits == "Double+Triple");
+        bool allow_triple = (multiple_hits == "Double+Triple");
+        Scalar delta = 0.0;
+        Scalar psi = 0.0;
+        Scalar eps_sink_t = use_error_sink ? std::min(0.002, max_eps_sink * 0.5) : 0.0;
+        Scalar eps_sink_b = use_error_sink ? std::min(0.002, max_eps_sink * 0.5) : 0.0;
+
+        auto init_dist = [&](bool is_con, const BUSTEDRateDistribution* warm, std::vector<Scalar>& omegas, std::vector<Scalar>& weights) {
+            if (warm && warm->omegas.size() == K && warm->weights.size() == K) {
+                omegas = warm->omegas;
+                weights = warm->weights;
+                if (is_con) {
+                    omegas.back() = (K == 1) ? std::min(1.0, omegas.back()) : 1.0;
+                    for (size_t k = 0; k + 1 < K; ++k) omegas[k] = std::min(1.0, omegas[k]);
+                } else if (omegas.back() <= 1.001) {
+                    omegas.back() = 2.5;
+                }
+                return;
+            }
+            omegas.resize(K);
+            weights.resize(K);
+            if (K == 1) {
+                weights[0] = 1.0;
+                omegas[0] = is_con ? std::min(0.5, mg94_omega) : mg94_omega;
+            } else if (K == 2) {
+                weights = {0.75, 0.25};
+                omegas = is_con ? std::vector<Scalar>{0.10, 1.0} : std::vector<Scalar>{0.10, 3.0};
+            } else {
+                if (is_con) {
+                    omegas = {0.05, 0.50, 1.0};
+                    weights = {0.45, 0.45, 0.10};
+                } else {
+                    omegas = {0.05, 0.50, 4.0};
+                    weights = {0.50, 0.40, 0.10};
+                }
+            }
+        };
+
+        std::vector<Scalar> omegas_t, weights_t, omegas_b, weights_b;
+        init_dist(constrain_test, init_test_dist, omegas_t, weights_t);
+        init_dist(constrain_bg, init_bg_dist, omegas_b, weights_b);
+
+        size_t M = srv ? num_syn_rates : 1;
+        std::vector<Scalar> syn_rates(M, 1.0);
+        std::vector<Scalar> syn_weights(M, 1.0 / M);
+        if (srv && M == 2) {
+            syn_rates = {0.35, 1.65};
+            syn_weights = {0.50, 0.50};
+        } else if (srv && M == 3) {
+            syn_rates = {0.20, 0.60, 2.20};
+            syn_weights = {1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0};
+        }
+
+        if (allow_double) {
+            Scalar best_grid_ll = -1e20;
+            std::vector<Scalar> d_cands = {0.0, 0.02, 0.08, 0.20};
+            std::vector<Scalar> p_cands = allow_triple ? std::vector<Scalar>{0.0, 0.02, 0.05} : std::vector<Scalar>{0.0};
+            for (Scalar d_c : d_cands) {
+                for (Scalar p_c : p_cands) {
+                    Scalar cand_ll = evaluate_two_set_log_l(s, omegas_t, weights_t, omegas_b, weights_b, syn_rates, syn_weights, nullptr, nullptr, d_c, p_c, eps_sink_t, eps_sink_b);
+                    if (cand_ll > best_grid_ll) {
+                        best_grid_ll = cand_ll;
+                        delta = d_c;
+                        psi = p_c;
+                    }
+                }
+            }
+        }
+
+        int max_ecm = (K == 1 && !srv && !allow_double && !use_error_sink) ? 1 : 6;
+        for (int ecm_iter = 0; ecm_iter < max_ecm; ++ecm_iter) {
+            for (int em = 0; em < 2; ++em) {
+                auto [wt_t, wt_b] = compute_expected_two_set_weights(
+                    s, omegas_t, weights_t, omegas_b, weights_b, syn_rates, syn_weights, nullptr, delta, psi,
+                    eps_sink_t, eps_sink_b,
+                    use_error_sink ? &eps_sink_t : nullptr,
+                    use_error_sink ? &eps_sink_b : nullptr,
+                    max_eps_sink
+                );
+                weights_t = wt_t;
+                weights_b = wt_b;
+            }
+
+            if (srv && M >= 2) {
+                for (int em = 0; em < 2; ++em) {
+                    syn_weights = compute_expected_two_set_syn_weights(
+                        s, omegas_t, weights_t, omegas_b, weights_b, syn_rates, syn_weights, nullptr, delta, psi, eps_sink_t, eps_sink_b
+                    );
+                }
+            }
+
+            Scalar max_omega = use_error_sink ? 50.0 : 2000.0;
+
+            // Optimize Test omegas + scale s
+            if (constrain_test) {
+                if (K == 1) {
+                    auto opt = NelderMead2D::minimize([&](Scalar w1, Scalar s_c) {
+                        return -evaluate_two_set_log_l(s_c, {w1}, weights_t, omegas_b, weights_b, syn_rates, syn_weights, nullptr, nullptr, delta, psi, eps_sink_t, eps_sink_b);
+                    }, omegas_t[0], s, 1e-4, 1.0, 1e-4, 35);
+                    omegas_t[0] = opt.a; s = opt.b;
+                } else if (K == 2) {
+                    auto opt = NelderMead2D::minimize([&](Scalar w1, Scalar s_c) {
+                        return -evaluate_two_set_log_l(s_c, {w1, 1.0}, weights_t, omegas_b, weights_b, syn_rates, syn_weights, nullptr, nullptr, delta, psi, eps_sink_t, eps_sink_b);
+                    }, omegas_t[0], s, 1e-4, 1.0, 1e-4, 35);
+                    omegas_t[0] = opt.a; omegas_t[1] = 1.0; s = opt.b;
+                } else if (K == 3) {
+                    auto opt = NelderMeadND<3>::minimize([&](const std::array<Scalar, 3>& x) {
+                        if (x[1] > x[2]) return 1e20;
+                        return -evaluate_two_set_log_l(x[0], {x[1], x[2], 1.0}, weights_t, omegas_b, weights_b, syn_rates, syn_weights, nullptr, nullptr, delta, psi, eps_sink_t, eps_sink_b);
+                    }, {s, omegas_t[0], omegas_t[1]}, {0.01, 1e-4, 1e-4}, {50.0, 1.0, 1.0}, 1e-4, 35);
+                    s = opt.x[0]; omegas_t[0] = opt.x[1]; omegas_t[1] = opt.x[2]; omegas_t[2] = 1.0;
+                }
+            } else {
+                if (K == 1) {
+                    auto opt = NelderMead2D::minimize([&](Scalar w1, Scalar s_c) {
+                        return -evaluate_two_set_log_l(s_c, {w1}, weights_t, omegas_b, weights_b, syn_rates, syn_weights, nullptr, nullptr, delta, psi, eps_sink_t, eps_sink_b);
+                    }, omegas_t[0], s, 1e-4, max_omega, 1e-4, 35);
+                    omegas_t[0] = opt.a; s = opt.b;
+                } else if (K == 2) {
+                    auto opt = NelderMeadND<3>::minimize([&](const std::array<Scalar, 3>& x) {
+                        return -evaluate_two_set_log_l(x[0], {x[1], x[2]}, weights_t, omegas_b, weights_b, syn_rates, syn_weights, nullptr, nullptr, delta, psi, eps_sink_t, eps_sink_b);
+                    }, {s, omegas_t[0], omegas_t[1]}, {0.01, 1e-4, 1.0}, {50.0, 1.0, max_omega}, 1e-4, 45);
+                    s = opt.x[0]; omegas_t[0] = opt.x[1]; omegas_t[1] = opt.x[2];
+                } else if (K == 3) {
+                    auto opt = NelderMeadND<4>::minimize([&](const std::array<Scalar, 4>& x) {
+                        if (x[1] > x[2]) return 1e20;
+                        return -evaluate_two_set_log_l(x[0], {x[1], x[2], x[3]}, weights_t, omegas_b, weights_b, syn_rates, syn_weights, nullptr, nullptr, delta, psi, eps_sink_t, eps_sink_b);
+                    }, {s, omegas_t[0], omegas_t[1], omegas_t[2]}, {0.01, 1e-4, 1e-4, 1.0}, {50.0, 1.0, 1.0, max_omega}, 1e-4, 45);
+                    s = opt.x[0]; omegas_t[0] = opt.x[1]; omegas_t[1] = opt.x[2]; omegas_t[2] = opt.x[3];
+                }
+            }
+
+            // Optimize Background omegas
+            if (constrain_bg) {
+                if (K == 1) {
+                    auto opt = NelderMead2D::minimize([&](Scalar w1, Scalar s_c) {
+                        return -evaluate_two_set_log_l(s_c, omegas_t, weights_t, {w1}, weights_b, syn_rates, syn_weights, nullptr, nullptr, delta, psi, eps_sink_t, eps_sink_b);
+                    }, omegas_b[0], s, 1e-4, 1.0, 1e-4, 35);
+                    omegas_b[0] = opt.a; s = opt.b;
+                } else if (K == 2) {
+                    auto opt = NelderMead2D::minimize([&](Scalar w1, Scalar s_c) {
+                        return -evaluate_two_set_log_l(s_c, omegas_t, weights_t, {w1, 1.0}, weights_b, syn_rates, syn_weights, nullptr, nullptr, delta, psi, eps_sink_t, eps_sink_b);
+                    }, omegas_b[0], s, 1e-4, 1.0, 1e-4, 35);
+                    omegas_b[0] = opt.a; omegas_b[1] = 1.0; s = opt.b;
+                } else if (K == 3) {
+                    auto opt = NelderMeadND<3>::minimize([&](const std::array<Scalar, 3>& x) {
+                        if (x[1] > x[2]) return 1e20;
+                        return -evaluate_two_set_log_l(x[0], omegas_t, weights_t, {x[1], x[2], 1.0}, weights_b, syn_rates, syn_weights, nullptr, nullptr, delta, psi, eps_sink_t, eps_sink_b);
+                    }, {s, omegas_b[0], omegas_b[1]}, {0.01, 1e-4, 1e-4}, {50.0, 1.0, 1.0}, 1e-4, 35);
+                    s = opt.x[0]; omegas_b[0] = opt.x[1]; omegas_b[1] = opt.x[2]; omegas_b[2] = 1.0;
+                }
+            } else {
+                if (K == 1) {
+                    auto opt = NelderMead2D::minimize([&](Scalar w1, Scalar s_c) {
+                        return -evaluate_two_set_log_l(s_c, omegas_t, weights_t, {w1}, weights_b, syn_rates, syn_weights, nullptr, nullptr, delta, psi, eps_sink_t, eps_sink_b);
+                    }, omegas_b[0], s, 1e-4, max_omega, 1e-4, 35);
+                    omegas_b[0] = opt.a; s = opt.b;
+                } else if (K == 2) {
+                    auto opt = NelderMeadND<3>::minimize([&](const std::array<Scalar, 3>& x) {
+                        return -evaluate_two_set_log_l(x[0], omegas_t, weights_t, {x[1], x[2]}, weights_b, syn_rates, syn_weights, nullptr, nullptr, delta, psi, eps_sink_t, eps_sink_b);
+                    }, {s, omegas_b[0], omegas_b[1]}, {0.01, 1e-4, 1.0}, {50.0, 1.0, max_omega}, 1e-4, 45);
+                    s = opt.x[0]; omegas_b[0] = opt.x[1]; omegas_b[1] = opt.x[2];
+                } else if (K == 3) {
+                    auto opt = NelderMeadND<4>::minimize([&](const std::array<Scalar, 4>& x) {
+                        if (x[1] > x[2]) return 1e20;
+                        return -evaluate_two_set_log_l(x[0], omegas_t, weights_t, {x[1], x[2], x[3]}, weights_b, syn_rates, syn_weights, nullptr, nullptr, delta, psi, eps_sink_t, eps_sink_b);
+                    }, {s, omegas_b[0], omegas_b[1], omegas_b[2]}, {0.01, 1e-4, 1e-4, 1.0}, {50.0, 1.0, 1.0, max_omega}, 1e-4, 45);
+                    s = opt.x[0]; omegas_b[0] = opt.x[1]; omegas_b[1] = opt.x[2]; omegas_b[2] = opt.x[3];
+                }
+            }
+
+            if (srv && M == 2) {
+                auto syn_opt = NelderMead2D::minimize([&](Scalar a1, Scalar /*unused*/) {
+                    Scalar q1 = syn_weights[0], q2 = syn_weights[1];
+                    Scalar a2 = (1.0 - q1 * a1) / q2;
+                    if (a1 < 0.01 || a2 < a1 || a2 > 50.0) return 1e20;
+                    return -evaluate_two_set_log_l(s, omegas_t, weights_t, omegas_b, weights_b, {a1, a2}, syn_weights, nullptr, nullptr, delta, psi, eps_sink_t, eps_sink_b);
+                }, syn_rates[0], 0.0, 0.01, 2.0, 1e-3, 25);
+                Scalar a1 = syn_opt.a;
+                Scalar a2 = (1.0 - syn_weights[0] * a1) / syn_weights[1];
+                if (a1 >= 0.01 && a2 >= a1) {
+                    syn_rates[0] = a1; syn_rates[1] = a2;
+                }
+            } else if (srv && M == 3) {
+                auto syn_opt = NelderMead2D::minimize([&](Scalar a1, Scalar a2) {
+                    Scalar q1 = syn_weights[0], q2 = syn_weights[1], q3 = syn_weights[2];
+                    Scalar a3 = (1.0 - q1 * a1 - q2 * a2) / q3;
+                    if (a1 < 0.01 || a2 < a1 || a3 < a2 || a3 > 50.0) return 1e20;
+                    return -evaluate_two_set_log_l(s, omegas_t, weights_t, omegas_b, weights_b, {a1, a2, a3}, syn_weights, nullptr, nullptr, delta, psi, eps_sink_t, eps_sink_b);
+                }, syn_rates[0], syn_rates[1], 0.01, 5.0, 1e-3, 30);
+                Scalar a1 = syn_opt.a, a2 = syn_opt.b;
+                Scalar a3 = (1.0 - syn_weights[0] * a1 - syn_weights[1] * a2) / syn_weights[2];
+                if (a1 >= 0.01 && a2 >= a1 && a3 >= a2) {
+                    syn_rates[0] = a1; syn_rates[1] = a2; syn_rates[2] = a3;
+                }
+            }
+
+            if (allow_triple) {
+                auto mh_opt = NelderMead2D::minimize([&](Scalar d, Scalar p) {
+                    if (d < 0.0 || d > 10.0 || p < 0.0 || p > 10.0) return 1e20;
+                    return -evaluate_two_set_log_l(s, omegas_t, weights_t, omegas_b, weights_b, syn_rates, syn_weights, nullptr, nullptr, d, p, eps_sink_t, eps_sink_b);
+                }, delta, psi, 0.0, 10.0, 1e-4, 25);
+                delta = std::max(0.0, mh_opt.a); psi = std::max(0.0, mh_opt.b);
+            } else if (allow_double) {
+                auto d_opt = NelderMead2D::minimize([&](Scalar d, Scalar /*unused*/) {
+                    if (d < 0.0 || d > 10.0) return 1e20;
+                    return -evaluate_two_set_log_l(s, omegas_t, weights_t, omegas_b, weights_b, syn_rates, syn_weights, nullptr, nullptr, d, 0.0, eps_sink_t, eps_sink_b);
+                }, delta, 0.0, 0.0, 10.0, 1e-4, 25);
+                delta = std::max(0.0, d_opt.a);
+            }
+
+            if (pbar) {
+                std::ostringstream ss;
+                ss << model_desc << " (ECM " << (ecm_iter + 1) << "/" << max_ecm << "): lnL = "
+                   << std::fixed << std::setprecision(2)
+                   << evaluate_two_set_log_l(s, omegas_t, weights_t, omegas_b, weights_b, syn_rates, syn_weights, nullptr, nullptr, delta, psi, eps_sink_t, eps_sink_b);
+                pbar->set_status(ss.str());
+                pbar->tick();
+            }
+        }
+
+        std::vector<Scalar> bl(tree.num_nodes(), 0.0);
+        for (const auto& node : tree.nodes) {
+            if (node.id != tree.root_id) {
+                bl[node.id] = s * branch_tau[node.id];
+            }
+        }
+
+        if (refine_branches) {
+            bl = refine_two_set_branch_lengths(bl, omegas_t, weights_t, omegas_b, weights_b, syn_rates, syn_weights, delta, psi, 1, eps_sink_t, eps_sink_b);
+            if (pbar) {
+                std::ostringstream ss;
+                ss << model_desc << ": Branch lengths refined";
+                pbar->set_status(ss.str());
+                pbar->tick();
+            }
+            if (K >= 2 || use_error_sink) {
+                auto [wt_t, wt_b] = compute_expected_two_set_weights(
+                    1.0, omegas_t, weights_t, omegas_b, weights_b, syn_rates, syn_weights, &bl, delta, psi,
+                    eps_sink_t, eps_sink_b,
+                    use_error_sink ? &eps_sink_t : nullptr,
+                    use_error_sink ? &eps_sink_b : nullptr,
+                    max_eps_sink
+                );
+                weights_t = wt_t;
+                weights_b = wt_b;
+            }
+            if (srv && M >= 2) {
+                syn_weights = compute_expected_two_set_syn_weights(1.0, omegas_t, weights_t, omegas_b, weights_b, syn_rates, syn_weights, &bl, delta, psi, eps_sink_t, eps_sink_b);
+            }
+            if (allow_triple) {
+                auto mh_polish = NelderMead2D::minimize([&](Scalar d, Scalar p) {
+                    if (d < 0.0 || d > 10.0 || p < 0.0 || p > 10.0) return 1e20;
+                    return -evaluate_two_set_log_l(1.0, omegas_t, weights_t, omegas_b, weights_b, syn_rates, syn_weights, &bl, nullptr, d, p, eps_sink_t, eps_sink_b);
+                }, delta, psi, 0.0, 10.0, 1e-4, 25);
+                delta = std::max(0.0, mh_polish.a); psi = std::max(0.0, mh_polish.b);
+            } else if (allow_double) {
+                auto d_polish = NelderMead2D::minimize([&](Scalar d, Scalar /*unused*/) {
+                    if (d < 0.0 || d > 10.0) return 1e20;
+                    return -evaluate_two_set_log_l(1.0, omegas_t, weights_t, omegas_b, weights_b, syn_rates, syn_weights, &bl, nullptr, d, 0.0, eps_sink_t, eps_sink_b);
+                }, delta, 0.0, 0.0, 10.0, 1e-4, 25);
+                delta = std::max(0.0, d_polish.a);
+            }
+            if (allow_double && pbar) {
+                pbar->tick();
+            }
+        }
+
+        Scalar best_lnL = evaluate_two_set_log_l(
+            1.0, omegas_t, weights_t, omegas_b, weights_b, syn_rates, syn_weights, &bl, &fit.site_log_likelihoods, delta, psi, eps_sink_t, eps_sink_b
+        );
+        fit.log_likelihood = best_lnL;
+        fit.tree_scale = s;
+        fit.branch_lengths = bl;
+        fit.delta = delta;
+        fit.psi = psi;
+        fit.error_sink_weight = eps_sink_t;
+
+        fit.test_distribution.omegas = omegas_t;
+        fit.test_distribution.weights = weights_t;
+        fit.test_distribution.error_sink_weight = eps_sink_t;
+        fit.background_distribution.omegas = omegas_b;
+        fit.background_distribution.weights = weights_b;
+        fit.background_distribution.error_sink_weight = eps_sink_b;
+        if (srv) {
+            fit.test_distribution.syn_rates = syn_rates;
+            fit.test_distribution.syn_weights = syn_weights;
+            fit.background_distribution.syn_rates = syn_rates;
+            fit.background_distribution.syn_weights = syn_weights;
+        }
+
+        size_t N_codons = aln.num_codons;
+        size_t num_branches = tree.num_nodes() - 1;
+        size_t num_mixture_params = (2 * K - 1 - (constrain_test ? 1 : 0)) + (2 * K - 1 - (constrain_bg ? 1 : 0)) + (use_error_sink ? 2 : 0);
+        size_t num_syn_params = srv ? 2 * (M - 1) : 0;
+        size_t num_mh_params = (allow_double ? 1 : 0) + (allow_triple ? 1 : 0);
+        size_t K_params = 5 + (refine_branches ? num_branches : 1) + num_mixture_params + num_syn_params + num_mh_params;
+        fit.aicc = -2.0 * fit.log_likelihood + 2.0 * K_params * N_codons / std::max(1.0, static_cast<double>(N_codons) - static_cast<double>(K_params) - 1.0);
+
+        return fit;
+    }
+
+    // Run complete BUSTED or BUSTED-PH analysis with options
     BUSTEDResult run(
         BUSTEDSettings settings = {},
         bool show_progress = false,
         bool force_progress = false
     ) const {
         auto t0 = std::chrono::high_resolution_clock::now();
-        select_test_branches(settings.test_branches);
+        select_branch_partitions(settings.test_branches, settings.comparison_branches, settings.phenotype_mode);
+        if (settings.phenotype_mode && num_background_branches == 0) {
+            throw std::runtime_error(
+                "BUSTED-PH requires a proper subset of foreground/phenotype branches and a non-empty background/comparison set. "
+                "Specify foreground branches via --branches <spec> or label branches with {TEST}/{Foreground} in the tree."
+            );
+        }
+
         BUSTEDResult res;
         if (settings.full_auto) {
             res.auto_diagnostics = diagnose_and_select_model(settings);
@@ -1777,7 +2982,9 @@ public:
         };
 
         size_t total_steps = 0;
-        if (settings.auto_select_k) {
+        if (settings.phenotype_mode) {
+            total_steps = count_steps(settings.num_rate_classes) * 4;
+        } else if (settings.auto_select_k) {
             for (size_t k = 1; k <= settings.max_k; ++k) {
                 total_steps += count_steps(k);
             }
@@ -1790,14 +2997,125 @@ public:
         if (show_progress && (force_progress || ProgressBar::is_terminal())) {
             pbar = std::make_unique<ProgressBar>(
                 total_steps,
-                "[BUSTED] Mixture Models",
+                settings.phenotype_mode ? "[BUSTED-PH] Mixture Models" : "[BUSTED] Mixture Models",
                 "steps",
                 force_progress,
                 ProgressBar::Style::SmoothBlocks
             );
         }
 
-        if (settings.auto_select_k) {
+        if (settings.phenotype_mode) {
+            size_t K = settings.num_rate_classes;
+            res.optimal_k = K;
+            res.has_background_test = true;
+            res.shared_df = static_cast<int>(2 * K - 1);
+
+            // 1. Fit Shared Distributions Model (M_shared: D_T == D_B on Test U Background)
+            {
+                auto saved_is_test = is_test_branch;
+                auto saved_num_test = num_test_branches;
+                num_test_branches = 0;
+                for (const auto& node : tree.nodes) {
+                    if (node.id != tree.root_id) {
+                        bool in_shared = (branch_partition[node.id] <= 1);
+                        is_test_branch[node.id] = in_shared;
+                        if (in_shared) num_test_branches++;
+                    }
+                }
+                res.shared_distributions = fit_model(
+                    false, K, settings.refine_branch_lengths, settings.srv, settings.num_syn_rate_classes,
+                    settings.multiple_hits, pbar.get(), "Shared Dist K=" + std::to_string(K),
+                    settings.error_sink, settings.error_sink_max_weight
+                );
+                res.shared_distributions.has_background_distribution = true;
+                res.shared_distributions.background_distribution = res.shared_distributions.test_distribution;
+                is_test_branch = saved_is_test;
+                num_test_branches = saved_num_test;
+            }
+
+            // 2. Fit Constrained Test Model (M_null_T: omega_K^(T) = 1, omega_K^(B) >= 1)
+            res.constrained = fit_two_set_model(
+                true, false, K, settings.refine_branch_lengths, settings.srv, settings.num_syn_rate_classes,
+                settings.multiple_hits, pbar.get(), "Constrained Test K=" + std::to_string(K),
+                settings.error_sink, settings.error_sink_max_weight,
+                &res.shared_distributions.test_distribution, &res.shared_distributions.test_distribution
+            );
+
+            // 3. Fit Constrained Background Model (M_null_B: omega_K^(T) >= 1, omega_K^(B) = 1)
+            res.constrained_background = fit_two_set_model(
+                false, true, K, settings.refine_branch_lengths, settings.srv, settings.num_syn_rate_classes,
+                settings.multiple_hits, pbar.get(), "Constrained Background K=" + std::to_string(K),
+                settings.error_sink, settings.error_sink_max_weight,
+                &res.shared_distributions.test_distribution, &res.shared_distributions.test_distribution
+            );
+
+            // 4. Fit Unconstrained Two-Set Model (M_unconstrained: omega_K^(T) >= 1, omega_K^(B) >= 1)
+            // Warm-start from the best nested model's Test/Background distributions
+            const BUSTEDRateDistribution* warm_t = &res.constrained_background.test_distribution;
+            const BUSTEDRateDistribution* warm_b = &res.constrained.background_distribution;
+            res.unconstrained = fit_two_set_model(
+                false, false, K, settings.refine_branch_lengths, settings.srv, settings.num_syn_rate_classes,
+                settings.multiple_hits, pbar.get(), "Unconstrained Two-Set K=" + std::to_string(K),
+                settings.error_sink, settings.error_sink_max_weight,
+                warm_t, warm_b
+            );
+
+            // Ensure proper nesting of log-likelihoods
+            Scalar max_nested_ll = std::max({
+                res.constrained.log_likelihood,
+                res.constrained_background.log_likelihood,
+                res.shared_distributions.log_likelihood
+            });
+            if (res.unconstrained.log_likelihood < max_nested_ll) {
+                res.unconstrained.log_likelihood = max_nested_ll;
+            }
+
+            // Test 1: Foreground / Test selection (LRT_T)
+            res.lrt = std::max(0.0, 2.0 * (res.unconstrained.log_likelihood - res.constrained.log_likelihood));
+            res.p_value = (res.lrt > 0.0) ? (0.5 * std::exp(-res.lrt / 2.0)) : 0.5;
+
+            // Test 2: Background / Comparison selection (LRT_B)
+            res.background_lrt = std::max(0.0, 2.0 * (res.unconstrained.log_likelihood - res.constrained_background.log_likelihood));
+            res.background_p_value = (res.background_lrt > 0.0) ? (0.5 * std::exp(-res.background_lrt / 2.0)) : 0.5;
+
+            // Test 3: Shared vs Separate Distributions (LRT_shared ~ chi^2_{2K-1})
+            res.shared_lrt = std::max(0.0, 2.0 * (res.unconstrained.log_likelihood - res.shared_distributions.log_likelihood));
+            res.shared_p_value = busted_chi2_p_value(res.shared_lrt, static_cast<Scalar>(res.shared_df));
+
+            // Canonical BUSTED-PH Testing Procedure:
+            // Step 1: Union-Intersection Test (UIT) on (p_FG, p_diff) -> p_UIT = max(p_FG, p_diff) <= alpha
+            // Step 2: Lack of evidence for background selection via AIC-c:
+            //         Delta AICc = AICc(Constrained BG) - AICc(Unconstrained) <= 2.0
+            //         (asymptotically equivalent to LRT_B <= 4.0 <=> p_BG > 0.5 * exp(-2) ≈ 0.068)
+            Scalar alpha = settings.p_value_threshold;
+            res.union_intersection_p_value = std::max(res.p_value, res.shared_p_value);
+            res.background_delta_aicc = res.constrained_background.aicc - res.unconstrained.aicc;
+            res.background_neutral_supported = (res.background_delta_aicc <= 2.0) || (res.background_p_value > 0.068);
+            res.ranking_score = -std::log10(std::max(1e-8, res.p_value))
+                                - std::log10(std::max(1e-8, res.shared_p_value))
+                                + std::log10(std::max(1e-8, res.background_p_value));
+
+            if (res.union_intersection_p_value <= alpha) {
+                if (res.background_neutral_supported) {
+                    res.phenotype_associated = true;
+                    res.phenotype_verdict =
+                        "The composite null hypothesis (no FG selection or no FG/BG difference) is rejected (p_UIT <= alpha), "
+                        "and the neutral model for background branches is sufficiently supported by AIC-c: "
+                        "statistical evidence that selection is associated with the trait.";
+                } else {
+                    res.phenotype_associated = false;
+                    res.phenotype_verdict =
+                        "The composite null hypothesis (no FG selection or no FG/BG difference) is rejected (p_UIT <= alpha), "
+                        "but the neutral model for background branches is not supported by AIC-c: "
+                        "selection is acting broadly on the tree, not just on branches with the trait.";
+                }
+            } else {
+                res.phenotype_associated = false;
+                res.phenotype_verdict =
+                    "The composite null hypothesis for no selection on foreground or no difference between foreground and background "
+                    "could not be rejected (p_UIT = max(p_FG, p_diff) > alpha): no statistical evidence that selection is associated with the trait.";
+            }
+        } else if (settings.auto_select_k) {
             auto [opt_k, null_fits] = select_optimal_k(
                 settings.max_k,
                 settings.refine_branch_lengths,
@@ -1851,20 +3169,29 @@ public:
             );
         }
 
-        // Compute LRT and p-value
-        if (res.unconstrained.log_likelihood < res.constrained.log_likelihood) {
-            res.unconstrained.log_likelihood = res.constrained.log_likelihood;
-            res.lrt = 0.0;
-            res.p_value = 0.5;
-        } else {
-            res.lrt = 2.0 * (res.unconstrained.log_likelihood - res.constrained.log_likelihood);
-            // Asymptotic null: 0.5 * chi^2_0 + 0.5 * chi^2_2
-            res.p_value = 0.5 * std::exp(-res.lrt / 2.0);
+        if (!settings.phenotype_mode) {
+            // Compute LRT and p-value
+            if (res.unconstrained.log_likelihood < res.constrained.log_likelihood) {
+                res.unconstrained.log_likelihood = res.constrained.log_likelihood;
+                res.lrt = 0.0;
+                res.p_value = 0.5;
+            } else {
+                res.lrt = 2.0 * (res.unconstrained.log_likelihood - res.constrained.log_likelihood);
+                // Asymptotic null: 0.5 * chi^2_0 + 0.5 * chi^2_2
+                res.p_value = 0.5 * std::exp(-res.lrt / 2.0);
+            }
         }
 
         if (pbar) {
             std::ostringstream summary;
-            if (res.p_value <= settings.p_value_threshold) {
+            if (settings.phenotype_mode) {
+                summary << (res.phenotype_associated ? "\033[1;32m" : "")
+                        << (res.phenotype_associated ? "Phenotype-associated selection detected" : "No phenotype-specific selection")
+                        << (res.phenotype_associated ? "\033[0m" : "")
+                        << " (p_UIT=" << std::fixed << std::setprecision(4) << res.union_intersection_p_value
+                        << ", ΔAICc_BG=" << std::setprecision(2) << res.background_delta_aicc
+                        << ", p_BG=" << std::setprecision(4) << res.background_p_value << ")";
+            } else if (res.p_value <= settings.p_value_threshold) {
                 summary << "\033[1;32mEvidence of episodic diversifying selection\033[0m: LRT = "
                         << std::fixed << std::setprecision(2) << res.lrt
                         << ", p = " << std::setprecision(4) << res.p_value;
@@ -1935,6 +3262,39 @@ public:
             {"p-value", res.p_value},
             {"optimal_k", res.optimal_k}
         };
+        if (res.has_background_test) {
+            j["test results background"] = {
+                {"LRT", res.background_lrt},
+                {"p-value", res.background_p_value},
+                {"delta AIC-c", res.background_delta_aicc}
+            };
+            j["test results shared distributions"] = {
+                {"LRT", res.shared_lrt},
+                {"p-value", res.shared_p_value},
+                {"df", res.shared_df}
+            };
+            j["BUSTED-PH"] = {
+                {"Uncorrected P-value", {
+                    {"FG", res.p_value},
+                    {"BG", res.background_p_value},
+                    {"Comparative", res.shared_p_value}
+                }},
+                {"union_intersection_p_value", res.union_intersection_p_value},
+                {"background_delta_aicc", res.background_delta_aicc},
+                {"background_neutral_supported", res.background_neutral_supported},
+                {"ranking_score", res.ranking_score},
+                {"Level", res.settings.p_value_threshold},
+                {"Summary", res.phenotype_verdict}
+            };
+            j["phenotype association"] = {
+                {"associated", res.phenotype_associated},
+                {"union_intersection_p_value", res.union_intersection_p_value},
+                {"background_delta_aicc", res.background_delta_aicc},
+                {"background_neutral_supported", res.background_neutral_supported},
+                {"ranking_score", res.ranking_score},
+                {"verdict", res.phenotype_verdict}
+            };
+        }
 
         // Fits
         nlohmann::json fits;
@@ -1994,6 +3354,9 @@ public:
         };
 
         nlohmann::json unc_rates = {{"Test", format_distro(res.unconstrained.test_distribution)}};
+        if (res.unconstrained.has_background_distribution) {
+            unc_rates["Background"] = format_distro(res.unconstrained.background_distribution);
+        }
         if (!res.unconstrained.test_distribution.syn_rates.empty() && res.unconstrained.test_distribution.syn_rates.size() > 1) {
             unc_rates["Synonymous site-to-site rates"] = format_srv_distro(res.unconstrained.test_distribution);
         }
@@ -2013,6 +3376,9 @@ public:
         fits["Unconstrained model"] = unc_fit;
 
         nlohmann::json con_rates = {{"Test", format_distro(res.constrained.test_distribution)}};
+        if (res.constrained.has_background_distribution) {
+            con_rates["Background"] = format_distro(res.constrained.background_distribution);
+        }
         if (!res.constrained.test_distribution.syn_rates.empty() && res.constrained.test_distribution.syn_rates.size() > 1) {
             con_rates["Synonymous site-to-site rates"] = format_srv_distro(res.constrained.test_distribution);
         }
@@ -2031,6 +3397,28 @@ public:
         }
         fits["Constrained model"] = con_fit;
 
+        if (res.has_background_test) {
+            nlohmann::json con_bg_rates = {
+                {"Test", format_distro(res.constrained_background.test_distribution)},
+                {"Background", format_distro(res.constrained_background.background_distribution)}
+            };
+            fits["Constrained model (background)"] = {
+                {"AIC-c", res.constrained_background.aicc},
+                {"Log Likelihood", res.constrained_background.log_likelihood},
+                {"Rate Distributions", con_bg_rates}
+            };
+
+            nlohmann::json shared_rates = {
+                {"Test", format_distro(res.shared_distributions.test_distribution)},
+                {"Background", format_distro(res.shared_distributions.background_distribution)}
+            };
+            fits["Unconstrained model with shared distributions"] = {
+                {"AIC-c", res.shared_distributions.aicc},
+                {"Log Likelihood", res.shared_distributions.log_likelihood},
+                {"Rate Distributions", shared_rates}
+            };
+        }
+
         j["fits"] = fits;
 
         // Branch attributes
@@ -2046,8 +3434,8 @@ public:
                     b_entry["constrained"] = res.constrained.branch_lengths[node.id];
                 }
                 branch_attr[node.name] = b_entry;
-                bool is_test = (static_cast<size_t>(node.id) < is_test_branch.size()) ? is_test_branch[node.id] : true;
-                tested_map[node.name] = is_test ? "test" : "background";
+                int part = (static_cast<size_t>(node.id) < branch_partition.size()) ? branch_partition[node.id] : (is_test_branch[node.id] ? 0 : 1);
+                tested_map[node.name] = (part == 0) ? "test" : ((part == 1) ? "background" : "unclassified");
             }
         }
         j["branch attributes"] = {{"0", branch_attr}};
@@ -2072,6 +3460,18 @@ public:
             {"unconstrained", {unc_site_ll}},
             {"constrained", {con_site_ll}}
         };
+        if (res.has_background_test &&
+            res.constrained_background.site_log_likelihoods.size() == aln.patterns.size() &&
+            res.shared_distributions.site_log_likelihoods.size() == aln.patterns.size()) {
+            std::vector<Scalar> con_bg_ll(aln.num_codons), shared_ll(aln.num_codons);
+            for (size_t s = 0; s < aln.num_codons; ++s) {
+                size_t p = aln.site_to_pattern[s];
+                con_bg_ll[s] = res.constrained_background.site_log_likelihoods[p];
+                shared_ll[s] = res.shared_distributions.site_log_likelihoods[p];
+            }
+            j["Site Log Likelihood"]["constrained_background"] = {con_bg_ll};
+            j["Site Log Likelihood"]["shared_distributions"] = {shared_ll};
+        }
 
         j["runtime"] = res.runtime_seconds;
         return j;
@@ -2084,11 +3484,15 @@ public:
         j["schema_version"] = "3.0.0";
 
         // Analysis block
-        j["analysis"]["id"] = "busted";
-        j["analysis"]["name"] = "Branch-Site Unrestricted Statistical Test for Episodic Diversification";
+        j["analysis"]["id"] = res.settings.phenotype_mode ? "busted-ph" : "busted";
+        j["analysis"]["name"] = res.settings.phenotype_mode
+            ? "BUSTED-Phenotype: Branch-Site Unrestricted Statistical Test for Episodic Diversification Associated with a Phenotype"
+            : "Branch-Site Unrestricted Statistical Test for Episodic Diversification";
         j["analysis"]["version"] = "3.0.0";
         j["analysis"]["category"] = "gene_selection";
-        j["analysis"]["description"] = "BUSTED uses a random effects likelihood approach to test whether a gene has experienced positive selection at any site on specified (or all) branches of a phylogeny.";
+        j["analysis"]["description"] = res.settings.phenotype_mode
+            ? "BUSTED-PH tests whether episodic positive selection is specifically associated with a foreground phenotype/trait using a Union-Intersection Test on foreground selection and regime difference, followed by an AIC-c lack-of-evidence check on background selection."
+            : "BUSTED uses a random effects likelihood approach to test whether a gene has experienced positive selection at any site on specified (or all) branches of a phylogeny.";
         j["analysis"]["citations"] = nlohmann::json::array({
             {
                 {"citation", "Murrell B, Weaver S, Smith MD, Wertheim JO, Murrell S, Aylward A, Eren K, Pollner T, Martin DP, Frost SDW, Kosakovsky Pond SL (2015). Gene-Wide Identification of Episodic Selection. Mol Biol Evol 32(5): 1365-1371."},
@@ -2103,6 +3507,10 @@ public:
         j["analysis"]["settings"]["auto_k"] = res.settings.auto_select_k;
         j["analysis"]["settings"]["multiple_hits"] = res.settings.multiple_hits;
         j["analysis"]["settings"]["error_sink"] = res.settings.error_sink;
+        j["analysis"]["settings"]["phenotype_mode"] = res.settings.phenotype_mode;
+        if (!res.settings.comparison_branches.empty()) {
+            j["analysis"]["settings"]["comparison_branches"] = res.settings.comparison_branches;
+        }
         if (res.settings.error_sink) {
             j["analysis"]["settings"]["error_sink_max_weight"] = res.settings.error_sink_max_weight;
             j["analysis"]["settings"]["error_sink_bf_threshold"] = res.settings.error_sink_bf_threshold;
@@ -2124,7 +3532,7 @@ public:
             j["provenance"] = prov.to_json();
         } else {
             Provenance auto_prov;
-            auto_prov.invocation.cli_command = "hyphy3 busted";
+            auto_prov.invocation.cli_command = res.settings.phenotype_mode ? "hyphy3 busted-ph" : "hyphy3 busted";
             auto_prov.invocation.working_directory = Provenance::get_cwd();
             auto_prov.execution.start_time = Provenance::current_iso8601();
             auto_prov.execution.end_time = Provenance::current_iso8601();
@@ -2173,8 +3581,9 @@ public:
             nlohmann::json node_entry;
             node_entry["type"] = node.children.empty() ? "leaf" : "internal";
             if (node.id != tree.root_id) {
-                bool is_test = (static_cast<size_t>(node.id) < is_test_branch.size()) ? is_test_branch[node.id] : true;
-                node_entry["tested"] = is_test;
+                int part = (static_cast<size_t>(node.id) < branch_partition.size()) ? branch_partition[node.id] : (is_test_branch[node.id] ? 0 : 1);
+                node_entry["tested"] = (part == 0);
+                node_entry["partition"] = (part == 0) ? "test" : ((part == 1) ? "background" : "unclassified");
             }
 
             if (!res.unconstrained.branch_lengths.empty() && node.id >= 0 && static_cast<size_t>(node.id) < res.unconstrained.branch_lengths.size()) {
@@ -2212,6 +3621,19 @@ public:
             }
             f["rate_distributions"]["test"] = test_dist;
 
+            if (fit.has_background_distribution && !fit.background_distribution.omegas.empty()) {
+                Scalar bio_scale_bg = res.settings.error_sink ? (1.0 - fit.background_distribution.error_sink_weight) : 1.0;
+                nlohmann::json bg_dist = nlohmann::json::array();
+                for (size_t k = 0; k < fit.background_distribution.omegas.size(); ++k) {
+                    bg_dist.push_back({
+                        {"class", static_cast<int>(k + 1)},
+                        {"omega", fit.background_distribution.omegas[k]},
+                        {"proportion", bio_scale_bg * fit.background_distribution.weights[k]}
+                    });
+                }
+                f["rate_distributions"]["background"] = bg_dist;
+            }
+
             if (res.settings.error_sink) {
                 f["error_sink"] = {
                     {"type", "saturation_replacement"},
@@ -2245,7 +3667,15 @@ public:
         };
 
         j["model_fits"]["unconstrained"] = format_fit_modern(res.unconstrained, "Unconstrained BUSTED mixture model allowing omega_k > 1");
-        j["model_fits"]["constrained"] = format_fit_modern(res.constrained, "Constrained null BUSTED model fixing omega_k <= 1");
+        j["model_fits"]["constrained"] = format_fit_modern(res.constrained, "Constrained null BUSTED model fixing omega_k <= 1 on test branches");
+        if (res.has_background_test) {
+            j["model_fits"]["constrained_background"] = format_fit_modern(
+                res.constrained_background, "Constrained background BUSTED-PH model fixing omega_k <= 1 on background/comparison branches"
+            );
+            j["model_fits"]["shared_distributions"] = format_fit_modern(
+                res.shared_distributions, "Shared-distribution BUSTED-PH model forcing identical omega distributions on test and background branches"
+            );
+        }
 
         if (has_gtr_fit) {
             j["model_fits"]["nucleotide_gtr"]["description"] = "General Time Reversible nucleotide model with empirical frequencies";
@@ -2286,6 +3716,55 @@ public:
             {"decision", (res.p_value <= res.settings.p_value_threshold) ? "Episodic diversifying selection detected" : "No evidence of episodic diversifying selection"},
             {"optimal_k", static_cast<int>(res.optimal_k)}
         };
+        if (res.has_background_test) {
+            j["statistical_tests"]["background_selection"] = {
+                {"method", "AIC-c Lack-of-Evidence Screen & LRT"},
+                {"test_statistic", "LRT"},
+                {"statistic_value", res.background_lrt},
+                {"delta_aicc", res.background_delta_aicc},
+                {"neutral_supported_by_aicc", res.background_neutral_supported},
+                {"distribution", "0.5 * chi^2_0 + 0.5 * chi^2_2"},
+                {"degrees_of_freedom", 2},
+                {"null_hypothesis", "omega_k <= 1 for all k on background/comparison branches"},
+                {"alternative_hypothesis", "omega_k > 1 for at least one k on background/comparison branches"},
+                {"p_value", res.background_p_value},
+                {"decision", res.background_neutral_supported
+                    ? "Neutral/constrained model for background branches is sufficiently supported by AIC-c"
+                    : "Neutral/constrained model for background branches is not supported by AIC-c (evidence of background selection)"}
+            };
+            j["statistical_tests"]["shared_distributions"] = {
+                {"method", "Likelihood Ratio Test (LRT)"},
+                {"test_statistic", "LRT"},
+                {"statistic_value", res.shared_lrt},
+                {"distribution", "chi^2_" + std::to_string(res.shared_df)},
+                {"degrees_of_freedom", res.shared_df},
+                {"null_hypothesis", "Identical omega rate distributions on test and background branches (D_T == D_B)"},
+                {"alternative_hypothesis", "Distinct omega rate distributions on test and background branches (D_T != D_B)"},
+                {"p_value", res.shared_p_value},
+                {"decision", (res.shared_p_value <= res.settings.p_value_threshold) ? "Selective regimes differ significantly between test and background" : "No significant difference between test and background selective regimes"}
+            };
+            j["statistical_tests"]["union_intersection"] = {
+                {"method", "Union-Intersection Test (UIT)"},
+                {"null_hypothesis", "(omega_K^(FG) <= 1) U (D_FG == D_BG)"},
+                {"alternative_hypothesis", "(omega_K^(FG) > 1) n (D_FG != D_BG)"},
+                {"p_value_fg", res.p_value},
+                {"p_value_diff", res.shared_p_value},
+                {"p_value", res.union_intersection_p_value},
+                {"rejected", (res.union_intersection_p_value <= res.settings.p_value_threshold)}
+            };
+            j["statistical_tests"]["phenotype_association"] = {
+                {"associated", res.phenotype_associated},
+                {"verdict", res.phenotype_verdict},
+                {"union_intersection_p_value", res.union_intersection_p_value},
+                {"background_delta_aicc", res.background_delta_aicc},
+                {"background_neutral_supported", res.background_neutral_supported},
+                {"ranking_score", res.ranking_score},
+                {"p_value_test", res.p_value},
+                {"p_value_background", res.background_p_value},
+                {"p_value_shared", res.shared_p_value},
+                {"threshold", res.settings.p_value_threshold}
+            };
+        }
 
         if (res.auto_diagnostics.enabled) {
             j["auto_model_selection"] = {
