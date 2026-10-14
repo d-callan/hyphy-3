@@ -138,6 +138,7 @@ public:
                 node.branch_length *= conversion_factor;
             }
         }
+        tree.scale_bridge_lengths(conversion_factor);
     }
 
     MEMESiteResult analyze_pattern(

@@ -333,12 +333,8 @@ public:
                 }
                 node_log_scale[node_id] = 0.0;
             } else {
-                node_L[node_id].setOnes();
                 double child_scale_sum = 0.0;
-                for (int32_t child_id : node.children) {
-                    node_L[node_id].array() *= (P_branches[child_id] * node_L[child_id]).array();
-                    child_scale_sum += node_log_scale[child_id];
-                }
+                tree.eval_internal_node(node_id, P_branches, node_L, node_log_scale, node_L[node_id], child_scale_sum);
 
                 double max_val = node_L[node_id].maxCoeff();
                 int boost_count = 0;
@@ -485,6 +481,7 @@ public:
         for (size_t i = 0; i < M; ++i) {
             if (static_cast<int32_t>(i) != orig_tree.root_id) {
                 int32_t p = orig_tree.nodes[i].parent_id;
+                if (p < 0) continue;
                 Scalar len = orig_tree.nodes[i].branch_length;
                 adj[p].push_back({static_cast<int32_t>(i), len});
                 adj[i].push_back({p, len});
@@ -625,10 +622,12 @@ public:
     ) {
         AutoRootResult result;
         result.strategy = settings.root_strategy;
-        if (settings.root_strategy == "keep") {
+        if (settings.root_strategy == "keep" || input_tree.has_wheatstone_bridges()) {
             result.best_tree = input_tree;
             result.chosen_candidate_idx = 0;
-            result.chosen_branch_name = "User Input Root (Preserved)";
+            result.chosen_branch_name = input_tree.has_wheatstone_bridges()
+                ? "Ohmic Network Root (Preserved)"
+                : "User Input Root (Preserved)";
             result.chosen_log_l = 0.0;
             result.chosen_weight = 1.0;
             return result;
@@ -640,6 +639,7 @@ public:
         for (size_t i = 0; i < M; ++i) {
             if (static_cast<int32_t>(i) != input_tree.root_id) {
                 int32_t p = input_tree.nodes[i].parent_id;
+                if (p < 0) continue;
                 Scalar len = input_tree.nodes[i].branch_length;
                 adj[p].push_back({static_cast<int32_t>(i), len});
                 adj[i].push_back({p, len});
@@ -1060,6 +1060,7 @@ public:
                 node.branch_length *= conversion_factor;
             }
         }
+        tree.scale_bridge_lengths(conversion_factor);
 
         // Precompute branch transition matrices for reconstruction
         branch_transition_matrices.resize(num_nodes);
@@ -1413,6 +1414,7 @@ public:
         for (size_t nid = 0; nid < num_nodes; ++nid) {
             if (static_cast<int32_t>(nid) == tree.root_id) continue;
             const auto& node = tree.nodes[nid];
+            if (node.parent_id < 0) continue;
             int8_t p_st = reconstructed[node.parent_id];
             int8_t ch_st = reconstructed[nid];
 

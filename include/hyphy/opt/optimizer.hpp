@@ -79,6 +79,7 @@ public:
                 int32_t nid = branch_node_ids[b];
                 t_scale.nodes[nid].branch_length *= s;
             }
+            t_scale.scale_bridge_lengths(s);
             return -eval_tree_lnl(t_scale, params);
         };
 
@@ -87,6 +88,7 @@ public:
             int32_t nid = branch_node_ids[b];
             curr_tree.nodes[nid].branch_length *= opt_s;
         }
+        curr_tree.scale_bridge_lengths(opt_s);
 
         // Stage 2 & 3: Alternating coordinate-wise optimization of GTR rates and individual branch lengths
         int total_evals = 0;
@@ -125,6 +127,12 @@ public:
                 auto [best_bl, _] = Brent1D::minimize(bl_obj, 1e-6, std::max(init_bl, 1e-4), 5.0, 1e-3, 20);
                 curr_tree.nodes[nid].branch_length = best_bl;
                 total_evals += 20;
+            }
+        }
+        for (auto& br : curr_tree.bridges) {
+            if (br.bridge_node_id >= 0 && static_cast<size_t>(br.bridge_node_id) < curr_tree.nodes.size() &&
+                br.bridge_node_id != br.hub_node_id) {
+                br.branch_lengths[0] = curr_tree.nodes[br.bridge_node_id].branch_length;
             }
         }
 
@@ -185,6 +193,7 @@ public:
                 int32_t nid = branch_node_ids[b];
                 t_scale.nodes[nid].branch_length *= s;
             }
+            t_scale.scale_bridge_lengths(s);
             return -eval_tree_lnl(t_scale);
         };
 
@@ -193,6 +202,7 @@ public:
             int32_t nid = branch_node_ids[b];
             curr_tree.nodes[nid].branch_length *= opt_s;
         }
+        curr_tree.scale_bridge_lengths(opt_s);
 
         // Stage 2: Coordinate sweeps
         for (int p = 0; p < passes; ++p) {
@@ -208,6 +218,12 @@ public:
                 };
                 auto [best_bl, _] = Brent1D::minimize(bl_obj, 1e-6, std::max(init_bl, static_cast<Scalar>(1e-4)), 5.0, 1e-3, 15);
                 curr_tree.nodes[nid].branch_length = best_bl;
+            }
+        }
+        for (auto& br : curr_tree.bridges) {
+            if (br.bridge_node_id >= 0 && static_cast<size_t>(br.bridge_node_id) < curr_tree.nodes.size() &&
+                br.bridge_node_id != br.hub_node_id) {
+                br.branch_lengths[0] = curr_tree.nodes[br.bridge_node_id].branch_length;
             }
         }
 
@@ -346,6 +362,7 @@ public:
                     node.branch_length *= (s * conv);
                 }
             }
+            t_eval.scale_bridge_lengths(s * conv);
 
             return -LikelihoodEngine::compute_mg94_log_likelihood(t_eval, aln, mg);
         };
@@ -367,6 +384,7 @@ public:
                 node.branch_length *= opt_pt.b;
             }
         }
+        res.tree.scale_bridge_lengths(opt_pt.b);
         res.params = base_params;
         res.params.alpha = 1.0;
         res.params.beta = opt_pt.a;

@@ -1,0 +1,1640 @@
+#pragma once
+
+#include "hyphy/core/types.hpp"
+#include "hyphy/core/alignment.hpp"
+#include "hyphy/core/tree.hpp"
+#include "hyphy/core/neighbor_joining.hpp"
+#include <Eigen/Eigenvalues>
+#include <array>
+#include <vector>
+#include <algorithm>
+#include <cmath>
+#include <numeric>
+#include <unordered_map>
+#include <unordered_set>
+#include <stdexcept>
+#include <cassert>
+#include <cstdio>
+#include <cstdlib>
+#include <filesystem>
+
+namespace hyphy::core {
+
+enum class OhmicScaleMode {
+    Auto,             // ExactDense if M <= 512 and M <= 1.5 * L_eff, else ScalableWoodbury
+    ExactDense,       // Full N x N Laplacian pseudoinverse + exact Foster resistances
+    ScalableWoodbury  // O(N log N) Equipotential Busbars + Rank-p Woodbury + R^p NJ
+};
+
+struct OhmicSettings {
+    OhmicScaleMode scale_mode = OhmicScaleMode::Auto;
+    size_t dense_switch_threshold = 512;       // Switch to ScalableWoodbury above M = 512
+    Scalar rank_ratio_threshold = 1.5;         // Switch if M > 256 and M / num_patterns > 1.5
+    size_t woodbury_rank = 256;                // Number of Nystrom landmarks p (or 384 with HyphAeon)
+    Scalar min_shunt_stress = 0.05;            // Minimum tau_Ohm to promote a Wheatstone bridge
+    size_t max_bridges = 64;                   // Maximum disjoint Wheatstone bridges K
+    bool collapse_ohmic_polytomies = true;     // Collapse zero-signal branches (t <= 0.5/L) into busbars
+    bool include_tertiary = false;             // Include 3rd quartet resolution w_3
+    bool use_hamming_distance = false;         // Optional raw p-distance (for closed-form benchmarks)
+    Scalar fixed_sigma = -1.0;                 // Optional fixed scale bandwidth sigma (> 0 overrides median)
+    Scalar epsilon_0 = 1e-3;                   // Conductance kernel regularization epsilon_0
+    bool use_hyphaeon_transformer = false;     // Extract 384D HyphAeon (192D dS + 192D dN) via aeon_core
+    std::string embeddings_filepath = "";      // Optional path to precomputed [N x 384] embeddings
+};
+
+struct OhmicNetwork {
+    Tree backbone_tree;                        // Standard binary tree T_0 (with 2N-2 nodes)
+    Tree collapsed_tree;                       // Tree with 3-child bridge hubs AND Ohmic Polytomy busbars
+    std::vector<WheatstoneBridge> bridges;     // K disjoint 4-way Wheatstone bridges
+    std::vector<int32_t> node_to_bridge_idx;   // Maps hub_node_id -> index in `bridges` (-1 if standard node)
+    OhmicScaleMode active_mode = OhmicScaleMode::ExactDense;
+    size_t num_super_nodes = 0;                // M <= N equipotential representatives
+    size_t num_collapsed_polytomies = 0;       // Count of zero-signal branches collapsed into busbars
+    bool used_hyphaeon_embeddings = false;     // True if 384D HyphAeon (192D dS + 192D dN) was fused
+    Matrix hyphaeon_embeddings;                // [N x 384] latent representations when extracted/loaded
+
+    // Populated in ExactDense mode (empty in ScalableWoodbury mode to save O(N^2) RAM):
+    Matrix D_tn93;                             // Pairwise TN93 distance matrix (ExactDense)
+    Matrix Omega;                              // Pairwise effective resistance matrix (ExactDense)
+    Matrix P_edge;                             // Foster marginal edge probability matrix (ExactDense)
+    Scalar foster_sum = 0.0;                   // Sum_{i<j} P_edge(i, j) == N - 1
+
+    // Populated in ScalableWoodbury mode (M x p coordinates, O(M * p) RAM):
+    Vector inv_aug_degrees;                    // \tilde{d}_i^{-1} [M]
+    Matrix Z_resistance_coords;                // Explicit p-dim resistance coordinates Z [M x p]
+
+    // Evaluate O(1) or O(p) effective resistance between two representative indices (i, j)
+    Scalar effective_resistance(size_t i, size_t j) const {
+        if (i == j) return 0.0;
+        if (active_mode == OhmicScaleMode::ExactDense) {
+            return Omega(static_cast<Eigen::Index>(i), static_cast<Eigen::Index>(j));
+        }
+        return inv_aug_degrees(static_cast<Eigen::Index>(i)) +
+               inv_aug_degrees(static_cast<Eigen::Index>(j)) +
+               (Z_resistance_coords.row(static_cast<Eigen::Index>(i)) -
+                Z_resistance_coords.row(static_cast<Eigen::Index>(j))).squaredNorm();
+    }
+
+    // Helper: compute pairwise Hamming or TN93 distance between two taxa (i, j) in O(L) time
+    static Scalar compute_pair_distance(
+        const Alignment& aln,
+        size_t i,
+        size_t j,
+        const Vector4& pi,
+        Scalar k1_denom,
+        Scalar k2_denom,
+        Scalar k3_denom,
+        bool use_hamming
+    ) {
+        if (i == j) return 0.0;
+        const std::string& seq_i = aln.sequences[i].raw_seq;
+        const std::string& seq_j = aln.sequences[j].raw_seq;
+        size_t L = std::min(seq_i.size(), seq_j.size());
+
+        size_t valid_sites = 0;
+        size_t ag_transitions = 0;
+        size_t ct_transitions = 0;
+        size_t transversions = 0;
+
+        for (size_t s = 0; s < L; ++s) {
+            int b1 = char_to_nuc(seq_i[s]);
+            int b2 = char_to_nuc(seq_j[s]);
+            if (b1 < 0 || b2 < 0) continue;
+            valid_sites++;
+            if (b1 != b2) {
+                bool p1 = (b1 == 0 || b1 == 2);
+                bool p2 = (b2 == 0 || b2 == 2);
+                if (p1 && p2) {
+                    ag_transitions++;
+                } else if (!p1 && !p2) {
+                    ct_transitions++;
+                } else {
+                    transversions++;
+                }
+            }
+        }
+
+        if (valid_sites == 0) return 0.0;
+        Scalar P1 = static_cast<Scalar>(ag_transitions) / valid_sites;
+        Scalar P2 = static_cast<Scalar>(ct_transitions) / valid_sites;
+        Scalar Q = static_cast<Scalar>(transversions) / valid_sites;
+        Scalar raw_p = P1 + P2 + Q;
+
+        if (use_hamming) {
+            return raw_p;
+        }
+
+        Scalar arg1 = 1.0 - P1 / k1_denom - Q / (2.0 * (pi(0) + pi(2)));
+        Scalar arg2 = 1.0 - P2 / k2_denom - Q / (2.0 * (pi(1) + pi(3)));
+        Scalar arg3 = 1.0 - Q / k3_denom;
+
+        Scalar d = 0.0;
+        if (arg1 <= 0.05 || arg2 <= 0.05 || arg3 <= 0.05) {
+            Scalar jc_arg = 1.0 - (4.0 / 3.0) * raw_p;
+            if (jc_arg <= 0.05) {
+                d = 3.0;
+            } else {
+                d = -0.75 * std::log(jc_arg);
+            }
+        } else {
+            d = -k1_denom * std::log(arg1)
+                - k2_denom * std::log(arg2)
+                - (k3_denom - (pi(0) + pi(2)) * k1_denom / (2.0 * pi(0) * pi(2)) * 2.0 * pi(0) * pi(2)
+                   - (pi(1) + pi(3)) * k2_denom / (2.0 * pi(1) * pi(3)) * 2.0 * pi(1) * pi(3)) * 0.0;
+            Scalar gR = pi(0) + pi(2);
+            Scalar gY = pi(1) + pi(3);
+            Scalar term1 = (2.0 * pi(0) * pi(2) / gR) * std::log(arg1);
+            Scalar term2 = (2.0 * pi(1) * pi(3) / gY) * std::log(arg2);
+            Scalar term3 = 2.0 * (gR * gY - (pi(0) * pi(2) * gY / gR) - (pi(1) * pi(3) * gR / gY)) * std::log(arg3);
+            d = -(term1 + term2 + term3);
+        }
+        return std::max<Scalar>(0.0, d);
+    }
+
+    static Matrix compute_hamming_distances(const Alignment& aln) {
+        size_t N = aln.num_taxa;
+        Matrix D = Matrix::Zero(static_cast<Eigen::Index>(N), static_cast<Eigen::Index>(N));
+        Vector4 dummy_pi = Vector4::Constant(0.25);
+        for (size_t i = 0; i < N; ++i) {
+            for (size_t j = i + 1; j < N; ++j) {
+                Scalar d = compute_pair_distance(aln, i, j, dummy_pi, 0.25, 0.25, 0.5, true);
+                D(static_cast<Eigen::Index>(i), static_cast<Eigen::Index>(j)) = d;
+                D(static_cast<Eigen::Index>(j), static_cast<Eigen::Index>(i)) = d;
+            }
+        }
+        return D;
+    }
+
+    // Split bitmask representation
+    using SplitMask = std::vector<uint64_t>;
+
+    static SplitMask make_canonical_split(const std::vector<int>& members, size_t N) {
+        size_t num_words = (N + 63) / 64;
+        SplitMask mask(num_words, 0ULL);
+        for (int idx : members) {
+            if (idx >= 0 && static_cast<size_t>(idx) < N) {
+                mask[static_cast<size_t>(idx) / 64] |= (1ULL << (static_cast<size_t>(idx) % 64));
+            }
+        }
+        // Canonical orientation: taxon 0 must have bit 0 == 0 (taxon 0 in B)
+        if (mask[0] & 1ULL) {
+            for (size_t w = 0; w < num_words; ++w) {
+                mask[w] = ~mask[w];
+            }
+            size_t rem = N % 64;
+            if (rem != 0) {
+                mask[num_words - 1] &= ((1ULL << rem) - 1ULL);
+            }
+        }
+        return mask;
+    }
+
+    static size_t split_popcount(const SplitMask& mask) {
+        size_t cnt = 0;
+        for (uint64_t w : mask) {
+            cnt += static_cast<size_t>(__builtin_popcountll(w));
+        }
+        return cnt;
+    }
+
+    static bool is_nontrivial_split(const SplitMask& mask, size_t N) {
+        size_t a = split_popcount(mask);
+        return (a >= 2 && (N - a) >= 2);
+    }
+
+    static bool are_splits_compatible(const SplitMask& s1, const SplitMask& s2, size_t N) {
+        size_t num_words = s1.size();
+        bool a1_a2 = false, a1_b2 = false, b1_a2 = false, b1_b2 = false;
+        for (size_t w = 0; w < num_words; ++w) {
+            uint64_t valid_bits = ~0ULL;
+            if (w + 1 == num_words && (N % 64) != 0) {
+                valid_bits = (1ULL << (N % 64)) - 1ULL;
+            }
+            uint64_t m1 = s1[w] & valid_bits;
+            uint64_t m2 = s2[w] & valid_bits;
+            uint64_t n1 = (~s1[w]) & valid_bits;
+            uint64_t n2 = (~s2[w]) & valid_bits;
+            if (m1 & m2) a1_a2 = true;
+            if (m1 & n2) a1_b2 = true;
+            if (n1 & m2) b1_a2 = true;
+            if (n1 & n2) b1_b2 = true;
+        }
+        return !(a1_a2 && a1_b2 && b1_a2 && b1_b2);
+    }
+
+    // Collect descendant leaf taxon indices (0..N-1) for every node in a tree
+    static std::vector<std::vector<int>> collect_subtree_taxa(
+        const Tree& tree,
+        const Alignment& aln
+    ) {
+        size_t num_nodes = tree.num_nodes();
+        std::vector<std::vector<int>> clade_taxa(num_nodes);
+        for (int32_t nid : tree.post_order) {
+            const auto& node = tree.nodes[nid];
+            if (node.is_leaf) {
+                auto it = aln.taxon_to_index.find(node.name);
+                if (it != aln.taxon_to_index.end()) {
+                    clade_taxa[nid].push_back(static_cast<int>(it->second));
+                }
+            } else {
+                for (int32_t cid : node.children) {
+                    clade_taxa[nid].insert(
+                        clade_taxa[nid].end(),
+                        clade_taxa[cid].begin(),
+                        clade_taxa[cid].end()
+                    );
+                }
+            }
+        }
+        return clade_taxa;
+    }
+
+    // Convert an unrooted/trifurcating NJ tree into a rooted tree where every internal edge
+    // is represented as a parent-child pair (u, v) with u having sibling C and upward/root context D
+    static Tree normalize_root_orientation(const Tree& raw_tree) {
+        if (raw_tree.root_id == INVALID_INDEX || raw_tree.nodes.empty()) return raw_tree;
+        const auto& root = raw_tree.nodes[raw_tree.root_id];
+        if (root.children.size() <= 2) return raw_tree;
+
+        // If root has 3 children {c0, c1, c2} and at least one is an internal node,
+        // ensure that internal children are visited cleanly; if root has 3 leaf children (e.g. N=3), keep as-is.
+        return raw_tree;
+    }
+
+    // Load precomputed [N x D] (default D=384) HyphAeon embeddings from .bin, .npy, or text (.tsv/.csv)
+    static Matrix load_embeddings_file(const std::string& filepath, size_t expected_N) {
+        std::ifstream f(filepath, std::ios::binary);
+        if (!f.is_open()) {
+            throw std::runtime_error("OhmicNetwork::load_embeddings_file: Cannot open " + filepath);
+        }
+
+        f.seekg(0, std::ios::end);
+        size_t file_bytes = static_cast<size_t>(f.tellg());
+        f.seekg(0, std::ios::beg);
+
+        // Case 1: Binary file with 8-byte header [uint32_t rows, uint32_t cols] followed by float64
+        if (file_bytes >= 8) {
+            uint32_t hdr[2] = {0, 0};
+            f.read(reinterpret_cast<char*>(hdr), 8);
+            if (hdr[0] == expected_N && hdr[1] > 0 &&
+                file_bytes == 8 + static_cast<size_t>(hdr[0]) * static_cast<size_t>(hdr[1]) * sizeof(double)) {
+                Matrix M(hdr[0], hdr[1]);
+                std::vector<double> buf(static_cast<size_t>(hdr[0]) * hdr[1]);
+                f.read(reinterpret_cast<char*>(buf.data()), buf.size() * sizeof(double));
+                for (size_t r = 0; r < hdr[0]; ++r) {
+                    for (size_t c = 0; c < hdr[1]; ++c) {
+                        M(static_cast<Eigen::Index>(r), static_cast<Eigen::Index>(c)) = buf[r * hdr[1] + c];
+                    }
+                }
+                return M;
+            }
+        }
+
+        // Case 2: Raw float64 [expected_N x 384] or float32 [expected_N x 384]
+        if (expected_N > 0 && (file_bytes % (expected_N * sizeof(double))) == 0) {
+            size_t cols = file_bytes / (expected_N * sizeof(double));
+            if (cols == 384 || cols == 192 || cols == 256) {
+                f.seekg(0, std::ios::beg);
+                std::vector<double> buf(expected_N * cols);
+                f.read(reinterpret_cast<char*>(buf.data()), file_bytes);
+                Matrix M(static_cast<Eigen::Index>(expected_N), static_cast<Eigen::Index>(cols));
+                for (size_t r = 0; r < expected_N; ++r) {
+                    for (size_t c = 0; c < cols; ++c) {
+                        M(static_cast<Eigen::Index>(r), static_cast<Eigen::Index>(c)) = buf[r * cols + c];
+                    }
+                }
+                return M;
+            }
+        }
+        if (expected_N > 0 && (file_bytes % (expected_N * sizeof(float))) == 0) {
+            size_t cols = file_bytes / (expected_N * sizeof(float));
+            if (cols == 384 || cols == 192 || cols == 256) {
+                f.seekg(0, std::ios::beg);
+                std::vector<float> buf(expected_N * cols);
+                f.read(reinterpret_cast<char*>(buf.data()), file_bytes);
+                Matrix M(static_cast<Eigen::Index>(expected_N), static_cast<Eigen::Index>(cols));
+                for (size_t r = 0; r < expected_N; ++r) {
+                    for (size_t c = 0; c < cols; ++c) {
+                        M(static_cast<Eigen::Index>(r), static_cast<Eigen::Index>(c)) = static_cast<Scalar>(buf[r * cols + c]);
+                    }
+                }
+                return M;
+            }
+        }
+
+        // Case 3: Whitespace or comma-separated text file
+        f.clear();
+        f.seekg(0, std::ios::beg);
+        std::vector<std::vector<Scalar>> rows;
+        std::string line;
+        while (std::getline(f, line)) {
+            for (char& ch : line) {
+                if (ch == ',' || ch == '\t') ch = ' ';
+            }
+            std::istringstream iss(line);
+            std::vector<Scalar> vals;
+            Scalar v;
+            while (iss >> v) vals.push_back(v);
+            if (!vals.empty()) rows.push_back(std::move(vals));
+        }
+        if (rows.size() == expected_N && !rows[0].empty()) {
+            size_t cols = rows[0].size();
+            Matrix M = Matrix::Zero(static_cast<Eigen::Index>(expected_N), static_cast<Eigen::Index>(cols));
+            for (size_t r = 0; r < expected_N; ++r) {
+                for (size_t c = 0; c < std::min(cols, rows[r].size()); ++c) {
+                    M(static_cast<Eigen::Index>(r), static_cast<Eigen::Index>(c)) = rows[r][c];
+                }
+            }
+            return M;
+        }
+        throw std::runtime_error("OhmicNetwork::load_embeddings_file: Unrecognized format or row count mismatch in " + filepath);
+    }
+
+    // Extract [N x 384] HyphAeon Multi-Scale Transformer representations (192D dS + 192D dN) via aeon_core
+    static Matrix extract_hyphaeon_embeddings(const Alignment& aln) {
+        size_t N = aln.num_taxa;
+        if (N == 0) return Matrix();
+
+        auto tmp_dir = std::filesystem::temp_directory_path();
+        std::string pid_str = std::to_string(reinterpret_cast<uintptr_t>(&aln));
+        std::string tmp_fasta = (tmp_dir / ("hyphy3_hyphaeon_" + pid_str + ".fasta")).string();
+        std::string tmp_bin   = (tmp_dir / ("hyphy3_hyphaeon_" + pid_str + ".bin")).string();
+
+        {
+            std::ofstream out(tmp_fasta);
+            for (size_t i = 0; i < N; ++i) {
+                out << ">" << aln.taxon_names[i] << "\n" << aln.sequences[i].raw_seq << "\n";
+            }
+        }
+
+        std::string py_bin = "/Users/sergei/miniconda3/bin/python3";
+        if (!std::filesystem::exists(py_bin)) {
+            py_bin = "python3";
+        }
+
+        std::string cmd = py_bin +
+            " -c \""
+            "import sys, struct, numpy as np, torch; "
+            "sys.path.insert(0, '/Users/sergei/Projects/stupid-trees/src'); "
+            "from aeon_core.inference import load_model, get_device; "
+            "from aeon_core.dataset import load_alignment_and_tree; "
+            "from stupid_trees.diffusion_batched import extract_chunked_multiscale_representations; "
+            "device = get_device(cpu=False); "
+            "model = load_model(device=device); "
+            "c_t, a_t, d_t, z_t, _, taxa, _ = load_alignment_and_tree('" + tmp_fasta + "', use_tn93=True, prune_duplicates=False); "
+            "dist_mat = d_t.squeeze(0).cpu().numpy().astype(np.float64); "
+            "mds_coords = z_t.squeeze(0).cpu().numpy(); "
+            "tc = model.precompute_tree_cache(dist_mat, mds_coords); "
+            "_, t_repr = extract_chunked_multiscale_representations(model, c_t, a_t, tc, device=device, chunk_size=16); "
+            "arr = np.asarray(t_repr, dtype=np.float64); "
+            "f = open('" + tmp_bin + "', 'wb'); "
+            "f.write(struct.pack('<II', arr.shape[0], arr.shape[1])); "
+            "f.write(arr.tobytes()); "
+            "f.close()"
+            "\" > /dev/null 2>&1";
+
+        int rc = std::system(cmd.c_str());
+        std::filesystem::remove(tmp_fasta);
+        if (rc != 0 || !std::filesystem::exists(tmp_bin)) {
+            std::filesystem::remove(tmp_bin);
+            return Matrix();
+        }
+
+        Matrix emb = load_embeddings_file(tmp_bin, N);
+        std::filesystem::remove(tmp_bin);
+        return emb;
+    }
+
+    // Split [N x 2d] HyphAeon embeddings into L2-normalized 192D dS and 192D dN tracks
+    static void split_and_normalize_hyphaeon(const Matrix& H, Matrix& norm_ds, Matrix& norm_dn) {
+        Eigen::Index rows = H.rows();
+        Eigen::Index half = H.cols() / 2;
+        norm_ds = H.leftCols(half);
+        norm_dn = H.rightCols(H.cols() - half);
+        for (Eigen::Index i = 0; i < rows; ++i) {
+            Scalar n1 = norm_ds.row(i).norm();
+            if (n1 > 1e-12) norm_ds.row(i) /= n1;
+            Scalar n2 = norm_dn.row(i).norm();
+            if (n2 > 1e-12) norm_dn.row(i) /= n2;
+        }
+    }
+
+    // Convenience helper for all CLI tools to resolve --tree / --ohmic / --hyphaeon / --embeddings or tree-free FASTA
+    static Tree resolve_tree(
+        const Alignment& aln,
+        const std::string& tree_file,
+        bool force_ohmic,
+        bool use_hyphaeon = true,
+        const std::string& embeddings_file = "",
+        OhmicNetwork* out_net = nullptr,
+        std::string* out_source_desc = nullptr
+    ) {
+        bool need_ohmic = force_ohmic || !embeddings_file.empty() ||
+                          (tree_file.empty() && aln.embedded_tree_newick.empty());
+        if (!need_ohmic) {
+            if (!tree_file.empty()) {
+                if (out_source_desc) *out_source_desc = tree_file;
+                return Tree::from_newick_file(tree_file);
+            }
+            if (out_source_desc) *out_source_desc = "Embedded in alignment";
+            return Tree::from_newick(aln.embedded_tree_newick);
+        }
+
+        OhmicSettings settings;
+        settings.use_hyphaeon_transformer = use_hyphaeon;
+        settings.embeddings_filepath = embeddings_file;
+        OhmicNetwork net = infer(aln, settings);
+        if (out_source_desc) {
+            std::string mode_str = (net.active_mode == OhmicScaleMode::ExactDense) ? "ExactDense" : "ScalableWoodbury";
+            std::string tr_str = net.used_hyphaeon_embeddings ? "+HyphAeon384D" : "";
+            *out_source_desc = "OhmicNetwork(" + mode_str + tr_str + ", bridges=" +
+                               std::to_string(net.bridges.size()) + ", polytomies=" +
+                               std::to_string(net.num_collapsed_polytomies) + ")";
+        }
+        Tree res = net.collapsed_tree;
+        if (out_net) *out_net = std::move(net);
+        return res;
+    }
+
+    static Tree resolve_tree(
+        const Alignment& aln,
+        const std::string& tree_file,
+        bool force_ohmic,
+        bool use_hyphaeon,
+        const std::string& embeddings_file,
+        std::string* out_source_desc
+    ) {
+        return resolve_tree(aln, tree_file, force_ohmic, use_hyphaeon, embeddings_file, nullptr, out_source_desc);
+    }
+
+    static OhmicNetwork infer(
+        const Alignment& aln,
+        const OhmicSettings& settings = {},
+        const Matrix* external_hyphaeon_embeddings = nullptr
+    ) {
+        OhmicNetwork net;
+        size_t N = aln.num_taxa;
+        if (N < 4) {
+            net.backbone_tree = NeighborJoining::infer(aln);
+            net.collapsed_tree = net.backbone_tree;
+            net.node_to_bridge_idx.assign(net.collapsed_tree.num_nodes(), -1);
+            net.collapsed_tree.node_to_bridge_idx = net.node_to_bridge_idx;
+            net.num_super_nodes = N;
+            return net;
+        }
+
+        // Resolve optional 384D HyphAeon embeddings (from pointer, file, or live aeon_core transformer)
+        if (external_hyphaeon_embeddings != nullptr &&
+            static_cast<size_t>(external_hyphaeon_embeddings->rows()) == N &&
+            external_hyphaeon_embeddings->cols() >= 2) {
+            net.hyphaeon_embeddings = *external_hyphaeon_embeddings;
+            net.used_hyphaeon_embeddings = true;
+        } else if (!settings.embeddings_filepath.empty()) {
+            net.hyphaeon_embeddings = load_embeddings_file(settings.embeddings_filepath, N);
+            net.used_hyphaeon_embeddings = (net.hyphaeon_embeddings.rows() == static_cast<Eigen::Index>(N));
+        } else if (settings.use_hyphaeon_transformer) {
+            net.hyphaeon_embeddings = extract_hyphaeon_embeddings(aln);
+            net.used_hyphaeon_embeddings = (net.hyphaeon_embeddings.rows() == static_cast<Eigen::Index>(N) &&
+                                            net.hyphaeon_embeddings.cols() >= 2);
+        }
+
+        Matrix norm_ds, norm_dn;
+        if (net.used_hyphaeon_embeddings) {
+            split_and_normalize_hyphaeon(net.hyphaeon_embeddings, norm_ds, norm_dn);
+        }
+
+        size_t L_eff = std::max<size_t>(1, aln.patterns.size());
+        size_t L_nuc = aln.num_nucleotides > 0 ? aln.num_nucleotides : (aln.num_codons * 3);
+        if (L_nuc == 0 && !aln.sequences.empty()) {
+            L_nuc = aln.sequences[0].raw_seq.size();
+        }
+        Scalar eps_L = 0.5 / static_cast<Scalar>(std::max<size_t>(1, L_nuc));
+
+        // =========================================================================
+        // Stage A: O(N * L_eff) Equipotential Busbar Compression (N -> M Super-Nodes)
+        // =========================================================================
+        std::vector<size_t> super_node_reps;
+        std::vector<std::vector<size_t>> super_node_members;
+        std::vector<size_t> taxon_to_super_node(N, 0);
+
+        // Compute 64-bit FNV-1a hash over pattern states for each taxon
+        std::unordered_map<uint64_t, std::vector<size_t>> hash_buckets;
+        hash_buckets.reserve(N);
+        for (size_t i = 0; i < N; ++i) {
+            uint64_t h = 14695981039346656037ULL;
+            if (!aln.patterns.empty()) {
+                for (const auto& pat : aln.patterns) {
+                    uint8_t st = static_cast<uint8_t>(pat.states[i] + 2);
+                    h ^= st;
+                    h *= 1099511628211ULL;
+                }
+            } else {
+                for (char c : aln.sequences[i].raw_seq) {
+                    h ^= static_cast<uint8_t>(c);
+                    h *= 1099511628211ULL;
+                }
+            }
+            hash_buckets[h].push_back(i);
+        }
+
+        // Verify exact pattern equality within each hash bucket to form M super-nodes
+        for (size_t i = 0; i < N; ++i) {
+            taxon_to_super_node[i] = static_cast<size_t>(-1);
+        }
+        for (size_t i = 0; i < N; ++i) {
+            if (taxon_to_super_node[i] != static_cast<size_t>(-1)) continue;
+            uint64_t h = 14695981039346656037ULL;
+            if (!aln.patterns.empty()) {
+                for (const auto& pat : aln.patterns) {
+                    uint8_t st = static_cast<uint8_t>(pat.states[i] + 2);
+                    h ^= st;
+                    h *= 1099511628211ULL;
+                }
+            } else {
+                for (char c : aln.sequences[i].raw_seq) {
+                    h ^= static_cast<uint8_t>(c);
+                    h *= 1099511628211ULL;
+                }
+            }
+            size_t m_idx = super_node_reps.size();
+            super_node_reps.push_back(i);
+            super_node_members.push_back({i});
+            taxon_to_super_node[i] = m_idx;
+
+            for (size_t j : hash_buckets[h]) {
+                if (j <= i || taxon_to_super_node[j] != static_cast<size_t>(-1)) continue;
+                bool identical = true;
+                if (!aln.patterns.empty()) {
+                    for (const auto& pat : aln.patterns) {
+                        if (pat.states[i] != pat.states[j]) {
+                            identical = false;
+                            break;
+                        }
+                    }
+                } else {
+                    identical = (aln.sequences[i].raw_seq == aln.sequences[j].raw_seq);
+                }
+                if (identical) {
+                    super_node_members[m_idx].push_back(j);
+                    taxon_to_super_node[j] = m_idx;
+                }
+            }
+        }
+
+        size_t M = super_node_reps.size();
+        net.num_super_nodes = M;
+
+        // Automatic Switchover Rule (Section 3.6.1)
+        OhmicScaleMode mode = settings.scale_mode;
+        if (mode == OhmicScaleMode::Auto) {
+            Scalar ratio = static_cast<Scalar>(M) / static_cast<Scalar>(L_eff);
+            if (M <= settings.dense_switch_threshold &&
+                !(M > 256 && ratio > settings.rank_ratio_threshold)) {
+                mode = OhmicScaleMode::ExactDense;
+            } else {
+                mode = OhmicScaleMode::ScalableWoodbury;
+            }
+        }
+        net.active_mode = mode;
+
+        // =========================================================================
+        // Regime 1: ExactDense Solver (Full N x N Laplacian Pseudoinverse & Foster)
+        // =========================================================================
+        if (mode == OhmicScaleMode::ExactDense) {
+            net.D_tn93 = settings.use_hamming_distance
+                ? compute_hamming_distances(aln)
+                : NeighborJoining::compute_tn93_distances(aln);
+
+            // If 384D HyphAeon embeddings (192D dS + 192D dN) are active, fuse cosine distances
+            // matching OhmTrees (ohmtrees.py lines 68-82)
+            Matrix sim_ds_mat, sim_dn_mat;
+            if (net.used_hyphaeon_embeddings) {
+                sim_ds_mat = ((norm_ds * norm_ds.transpose()).array() + 1.0) * 0.5;
+                sim_ds_mat = sim_ds_mat.cwiseMax(0.0).cwiseMin(1.0);
+                sim_dn_mat = ((norm_dn * norm_dn.transpose()).array() + 1.0) * 0.5;
+                sim_dn_mat = sim_dn_mat.cwiseMax(0.0).cwiseMin(1.0);
+
+                Matrix d_ds = Matrix::Ones(static_cast<Eigen::Index>(N), static_cast<Eigen::Index>(N)) - sim_ds_mat;
+                Matrix d_dn = Matrix::Ones(static_cast<Eigen::Index>(N), static_cast<Eigen::Index>(N)) - sim_dn_mat;
+                d_ds.diagonal().setZero();
+                d_dn.diagonal().setZero();
+
+                Scalar sum_d = 0.0, sum_ds = 0.0, sum_dn = 0.0;
+                size_t cnt_d = 0, cnt_ds = 0, cnt_dn = 0;
+                for (size_t i = 0; i < N; ++i) {
+                    for (size_t j = i + 1; j < N; ++j) {
+                        Eigen::Index ii = static_cast<Eigen::Index>(i), jj = static_cast<Eigen::Index>(j);
+                        if (net.D_tn93(ii, jj) > 0.0) { sum_d += net.D_tn93(ii, jj); cnt_d++; }
+                        if (d_ds(ii, jj) > 0.0) { sum_ds += d_ds(ii, jj); cnt_ds++; }
+                        if (d_dn(ii, jj) > 0.0) { sum_dn += d_dn(ii, jj); cnt_dn++; }
+                    }
+                }
+                Scalar mean_d = (cnt_d > 0) ? (sum_d / cnt_d) : 0.1;
+                Scalar mean_ds = (cnt_ds > 0) ? (sum_ds / cnt_ds) : 1.0;
+                Scalar mean_dn = (cnt_dn > 0) ? (sum_dn / cnt_dn) : 1.0;
+                d_ds *= (mean_d / std::max<Scalar>(1e-6, mean_ds));
+                d_dn *= (mean_d / std::max<Scalar>(1e-6, mean_dn));
+
+                net.D_tn93 = 0.50 * net.D_tn93 + 0.25 * d_ds + 0.25 * d_dn;
+            }
+
+            // Compute median of upper-triangular distances
+            std::vector<Scalar> upper_d;
+            upper_d.reserve(N * (N - 1) / 2);
+            for (size_t i = 0; i < N; ++i) {
+                for (size_t j = i + 1; j < N; ++j) {
+                    Scalar d = net.D_tn93(static_cast<Eigen::Index>(i), static_cast<Eigen::Index>(j));
+                    if (d > 0.0) upper_d.push_back(d);
+                }
+            }
+            Scalar sigma = 0.1;
+            if (settings.fixed_sigma > 0.0) {
+                sigma = settings.fixed_sigma;
+            } else if (!upper_d.empty()) {
+                std::sort(upper_d.begin(), upper_d.end());
+                size_t mid = upper_d.size() / 2;
+                sigma = (upper_d.size() % 2 == 1)
+                    ? upper_d[mid]
+                    : 0.5 * (upper_d[mid - 1] + upper_d[mid]);
+                sigma = std::max<Scalar>(sigma, 1e-6);
+            }
+
+            Scalar eps0 = settings.epsilon_0;
+            Matrix W = Matrix::Zero(static_cast<Eigen::Index>(N), static_cast<Eigen::Index>(N));
+            for (size_t i = 0; i < N; ++i) {
+                for (size_t j = i + 1; j < N; ++j) {
+                    Eigen::Index ii = static_cast<Eigen::Index>(i);
+                    Eigen::Index jj = static_cast<Eigen::Index>(j);
+                    Scalar d = net.D_tn93(ii, jj);
+                    Scalar w = std::exp(-d / sigma) / (d + eps0);
+                    if (net.used_hyphaeon_embeddings) {
+                        w *= (0.50 + 0.25 * sim_ds_mat(ii, jj) + 0.25 * sim_dn_mat(ii, jj));
+                    }
+                    W(ii, jj) = w;
+                    W(jj, ii) = w;
+                }
+            }
+
+            Vector deg = W.rowwise().sum();
+            Matrix L = Matrix(deg.asDiagonal()) - W;
+            L = 0.5 * (L + L.transpose());
+
+            Eigen::SelfAdjointEigenSolver<Matrix> eig(L);
+            if (eig.info() != Eigen::Success) {
+                throw std::runtime_error("OhmicNetwork::infer: Graph Laplacian eigendecomposition failed");
+            }
+
+            const Vector& evals = eig.eigenvalues();
+            const Matrix& evecs = eig.eigenvectors();
+            Matrix L_pinv = Matrix::Zero(static_cast<Eigen::Index>(N), static_cast<Eigen::Index>(N));
+            for (Eigen::Index m = 0; m < evals.size(); ++m) {
+                if (evals(m) > 1e-10) {
+                    L_pinv.noalias() += (1.0 / evals(m)) * (evecs.col(m) * evecs.col(m).transpose());
+                }
+            }
+
+            net.Omega = Matrix::Zero(static_cast<Eigen::Index>(N), static_cast<Eigen::Index>(N));
+            net.P_edge = Matrix::Zero(static_cast<Eigen::Index>(N), static_cast<Eigen::Index>(N));
+            Scalar foster_acc = 0.0;
+            for (size_t i = 0; i < N; ++i) {
+                for (size_t j = i + 1; j < N; ++j) {
+                    Eigen::Index ii = static_cast<Eigen::Index>(i);
+                    Eigen::Index jj = static_cast<Eigen::Index>(j);
+                    Scalar om = std::max<Scalar>(0.0, L_pinv(ii, ii) + L_pinv(jj, jj) - 2.0 * L_pinv(ii, jj));
+                    net.Omega(ii, jj) = om;
+                    net.Omega(jj, ii) = om;
+                    Scalar pedge = W(ii, jj) * om;
+                    net.P_edge(ii, jj) = pedge;
+                    net.P_edge(jj, ii) = pedge;
+                    foster_acc += pedge;
+                }
+            }
+            net.foster_sum = foster_acc;
+            assert(std::abs(net.foster_sum - static_cast<Scalar>(N - 1)) < 1e-4);
+
+            // Normalize D and Omega for hybrid multi-scale combinations
+            Scalar mean_D = 0.0, mean_Omega = 0.0;
+            size_t num_pairs = N * (N - 1) / 2;
+            for (size_t i = 0; i < N; ++i) {
+                for (size_t j = i + 1; j < N; ++j) {
+                    mean_D += net.D_tn93(static_cast<Eigen::Index>(i), static_cast<Eigen::Index>(j));
+                    mean_Omega += net.Omega(static_cast<Eigen::Index>(i), static_cast<Eigen::Index>(j));
+                }
+            }
+            mean_D = std::max<Scalar>(1e-12, mean_D / std::max<size_t>(1, num_pairs));
+            mean_Omega = std::max<Scalar>(1e-12, mean_Omega / std::max<size_t>(1, num_pairs));
+
+            Matrix D_hat = net.D_tn93 / mean_D;
+            Matrix Omega_hat = net.Omega / mean_Omega;
+            Matrix Omega_tilde = 0.5 * Omega_hat + 0.5 * D_hat;
+
+            // Primary backbone tree from NJ on D_tn93 (with branch lengths measured in evolutionary distance D)
+            net.backbone_tree = NeighborJoining::infer_from_distances(net.D_tn93, aln.taxon_names);
+
+            // Build collapsed_tree and extract node-disjoint Wheatstone bridges
+            build_bridges_and_collapsed_tree(net, aln, settings, eps_L, true);
+            return net;
+        }
+
+        // =========================================================================
+        // Regime 2: ScalableWoodbury O(N log N) Solver
+        // =========================================================================
+        // Estimate global nucleotide frequencies for TN93
+        Vector4 pi = aln.nuc_frequencies;
+        if (pi.sum() < 0.99) {
+            pi = Vector4::Constant(0.25);
+        }
+        for (int b = 0; b < 4; ++b) {
+            if (pi(b) < 1e-4) pi(b) = 1e-4;
+        }
+        pi /= pi.sum();
+        Scalar gR = pi(0) + pi(2);
+        Scalar gY = pi(1) + pi(3);
+        Scalar k1_denom = 2.0 * pi(0) * pi(2) / gR;
+        Scalar k2_denom = 2.0 * pi(1) * pi(3) / gY;
+        Scalar k3_denom = 2.0 * gR * gY;
+
+        // 1. Farthest-Point Landmark Selection in O(M * p) time
+        size_t p = std::min<size_t>(M, settings.woodbury_rank);
+        std::vector<size_t> landmarks;
+        landmarks.reserve(p);
+        std::vector<Scalar> min_dist(M, 1e30);
+        std::vector<bool> is_landmark(M, false);
+
+        Matrix D_Mp = Matrix::Zero(static_cast<Eigen::Index>(M), static_cast<Eigen::Index>(p));
+        size_t cur_lm = 0;
+        for (size_t k = 0; k < p; ++k) {
+            landmarks.push_back(cur_lm);
+            is_landmark[cur_lm] = true;
+            size_t rep_lm = super_node_reps[cur_lm];
+
+            Scalar max_d = -1.0;
+            size_t next_lm = 0;
+            for (size_t i = 0; i < M; ++i) {
+                Scalar d = (i == cur_lm) ? 0.0 : compute_pair_distance(
+                    aln, super_node_reps[i], rep_lm, pi, k1_denom, k2_denom, k3_denom, settings.use_hamming_distance
+                );
+                D_Mp(static_cast<Eigen::Index>(i), static_cast<Eigen::Index>(k)) = d;
+                if (d < min_dist[i]) {
+                    min_dist[i] = d;
+                }
+                if (!is_landmark[i] && min_dist[i] > max_d) {
+                    max_d = min_dist[i];
+                    next_lm = i;
+                }
+            }
+            cur_lm = next_lm;
+        }
+
+        Matrix D_pp = Matrix::Zero(static_cast<Eigen::Index>(p), static_cast<Eigen::Index>(p));
+        std::vector<Scalar> lm_upper;
+        lm_upper.reserve(p * (p - 1) / 2);
+        for (size_t a = 0; a < p; ++a) {
+            for (size_t b = 0; b < p; ++b) {
+                Scalar d = D_Mp(static_cast<Eigen::Index>(landmarks[a]), static_cast<Eigen::Index>(b));
+                D_pp(static_cast<Eigen::Index>(a), static_cast<Eigen::Index>(b)) = d;
+                if (a < b && d > 0.0) lm_upper.push_back(d);
+            }
+        }
+        D_pp = 0.5 * (D_pp + D_pp.transpose());
+
+        Scalar sigma = 0.1;
+        if (settings.fixed_sigma > 0.0) {
+            sigma = settings.fixed_sigma;
+        } else if (!lm_upper.empty()) {
+            std::sort(lm_upper.begin(), lm_upper.end());
+            size_t mid = lm_upper.size() / 2;
+            sigma = (lm_upper.size() % 2 == 1)
+                ? lm_upper[mid]
+                : 0.5 * (lm_upper[mid - 1] + lm_upper[mid]);
+            sigma = std::max<Scalar>(sigma, 1e-6);
+        }
+
+        // 2. Low-Rank Nystrom Conductance Feature Map Phi [M x p_total]
+        Scalar eps0 = settings.epsilon_0;
+        Matrix K_Mp(static_cast<Eigen::Index>(M), static_cast<Eigen::Index>(p));
+        for (size_t i = 0; i < M; ++i) {
+            for (size_t k = 0; k < p; ++k) {
+                Scalar d = D_Mp(static_cast<Eigen::Index>(i), static_cast<Eigen::Index>(k));
+                K_Mp(static_cast<Eigen::Index>(i), static_cast<Eigen::Index>(k)) = std::exp(-d / sigma) / (d + eps0);
+            }
+        }
+        Matrix K_pp(static_cast<Eigen::Index>(p), static_cast<Eigen::Index>(p));
+        for (size_t a = 0; a < p; ++a) {
+            K_pp.row(static_cast<Eigen::Index>(a)) = K_Mp.row(static_cast<Eigen::Index>(landmarks[a]));
+        }
+        K_pp = 0.5 * (K_pp + K_pp.transpose());
+
+        Eigen::SelfAdjointEigenSolver<Matrix> eig_K(K_pp);
+        Vector evals_K = eig_K.eigenvalues().cwiseMax(1e-6);
+        Vector inv_sqrt_K = evals_K.array().rsqrt();
+        Matrix Phi = K_Mp * eig_K.eigenvectors() * inv_sqrt_K.asDiagonal();
+
+        // Concatenate normalized 384D HyphAeon (192D dS + 192D dN) columns into Phi (Section 3.6.2 Stage B)
+        if (net.used_hyphaeon_embeddings) {
+            Eigen::Index ds_cols = norm_ds.cols();
+            Eigen::Index dn_cols = norm_dn.cols();
+            Eigen::Index ext_cols = ds_cols + dn_cols;
+            Scalar phi_scale = std::sqrt(std::max<Scalar>(1.0, Phi.rowwise().squaredNorm().mean()) * 0.25);
+            Matrix Phi_aug(static_cast<Eigen::Index>(M), Phi.cols() + ext_cols);
+            Phi_aug.leftCols(Phi.cols()) = Phi;
+            for (size_t i = 0; i < M; ++i) {
+                Eigen::Index rep_i = static_cast<Eigen::Index>(super_node_reps[i]);
+                Phi_aug.block(static_cast<Eigen::Index>(i), Phi.cols(), 1, ds_cols) =
+                    phi_scale * norm_ds.row(rep_i);
+                Phi_aug.block(static_cast<Eigen::Index>(i), Phi.cols() + ds_cols, 1, dn_cols) =
+                    phi_scale * norm_dn.row(rep_i);
+            }
+            Phi = std::move(Phi_aug);
+        }
+
+        Eigen::Index p_eff = Phi.cols();
+
+        // 3. Exact Matrix-Free Row Degrees d_tilde [M] in O(M * p) time
+        Vector s_Phi = Phi.colwise().sum().transpose();
+        Vector row_sq_norm = Phi.rowwise().squaredNorm();
+        Vector d_tilde = (Phi * s_Phi).cwiseMax((row_sq_norm.array() + 1e-6).matrix());
+        net.inv_aug_degrees = d_tilde.cwiseInverse();
+
+        // 4. Woodbury Capacitance Matrix C_inv = (1 + mu_reg) I_p - Phi^T * D_tilde^{-1} * Phi
+        const Scalar mu_reg = 1e-4;
+        Matrix scaled_Phi = net.inv_aug_degrees.asDiagonal() * Phi;
+        Matrix C_inv = (1.0 + mu_reg) * Matrix::Identity(p_eff, p_eff) - (Phi.transpose() * scaled_Phi);
+        C_inv = 0.5 * (C_inv + C_inv.transpose());
+
+        Eigen::SelfAdjointEigenSolver<Matrix> eig_C(C_inv);
+        Vector evals_C = eig_C.eigenvalues();
+        const Matrix& evecs_C = eig_C.eigenvectors();
+
+        // Deflate the smallest nullspace mode (corresponding to 1_M) and clamp remaining modes
+        Matrix R = Matrix::Zero(p_eff, p_eff);
+        for (Eigen::Index k = 0; k < p_eff; ++k) {
+            if (k == 0 && evals_C(k) < 5.0 * mu_reg) {
+                continue;
+            }
+            Scalar lam = std::max<Scalar>(evals_C(k), 1e-6);
+            R.col(k) = evecs_C.col(k) * (1.0 / std::sqrt(lam));
+        }
+
+        net.Z_resistance_coords = scaled_Phi * R;
+        // Center Z rows so mean(z) = 0 (preserves all pairwise ||z_i - z_j||^2 exactly)
+        Eigen::RowVectorXd z_mean = net.Z_resistance_coords.colwise().mean();
+        net.Z_resistance_coords.rowwise() -= z_mean;
+
+        // =========================================================================
+        // Stage C: O(M * p * log M) Matrix-Free Neighbor-Joining in R^p Space
+        // =========================================================================
+        Tree super_tree = infer_woodbury_nj(
+            net.inv_aug_degrees,
+            net.Z_resistance_coords,
+            aln,
+            super_node_reps,
+            pi, k1_denom, k2_denom, k3_denom,
+            settings.use_hamming_distance
+        );
+
+        // Expand any Equipotential Super-Node C_m with |C_m| > 1 into a multifurcating busbar
+        // and also produce a resolved binary backbone_tree for reference
+        expand_super_nodes_into_trees(
+            net, super_tree, aln, super_node_reps, super_node_members
+        );
+
+        // Stage D: Quartet SNR evaluation, Wheatstone bridge promotion, and Ohmic Polytomy collapse
+        build_bridges_and_collapsed_tree(net, aln, settings, eps_L, false);
+        return net;
+    }
+
+private:
+    // Stage C: Fast O(M * p) per-step Matrix-Free Neighbor-Joining using exact global accumulators
+    static Tree infer_woodbury_nj(
+        const Vector& inv_aug_deg,
+        const Matrix& Z_coords,
+        const Alignment& aln,
+        const std::vector<size_t>& super_node_reps,
+        const Vector4& pi,
+        Scalar k1_denom,
+        Scalar k2_denom,
+        Scalar k3_denom,
+        bool use_hamming
+    ) {
+        size_t M = super_node_reps.size();
+        Eigen::Index p = Z_coords.cols();
+
+        Tree tree;
+        if (M == 1) {
+            TreeNode root;
+            root.id = 0;
+            root.name = aln.taxon_names[super_node_reps[0]];
+            root.is_leaf = true;
+            root.branch_length = 0.0;
+            tree.nodes.push_back(root);
+            tree.root_id = 0;
+            tree.leaf_name_to_id[root.name] = 0;
+            tree.compute_post_order();
+            return tree;
+        }
+        if (M == 2) {
+            Scalar d01 = compute_pair_distance(
+                aln, super_node_reps[0], super_node_reps[1], pi, k1_denom, k2_denom, k3_denom, use_hamming
+            );
+            for (size_t i = 0; i < 2; ++i) {
+                TreeNode leaf;
+                leaf.id = static_cast<int32_t>(i);
+                leaf.name = aln.taxon_names[super_node_reps[i]];
+                leaf.is_leaf = true;
+                leaf.branch_length = std::max<Scalar>(1e-6, 0.5 * d01);
+                leaf.parent_id = 2;
+                tree.nodes.push_back(leaf);
+                tree.leaf_name_to_id[leaf.name] = leaf.id;
+            }
+            TreeNode root;
+            root.id = 2;
+            root.name = "Root";
+            root.is_leaf = false;
+            root.children = {0, 1};
+            tree.nodes.push_back(root);
+            tree.root_id = 2;
+            tree.compute_post_order();
+            return tree;
+        }
+
+        tree.nodes.reserve(2 * M - 2);
+        for (size_t i = 0; i < M; ++i) {
+            TreeNode leaf;
+            leaf.id = static_cast<int32_t>(i);
+            leaf.name = aln.taxon_names[super_node_reps[i]];
+            leaf.is_leaf = true;
+            tree.nodes.push_back(leaf);
+            tree.leaf_name_to_id[leaf.name] = leaf.id;
+        }
+
+        // Maintain active cluster coordinates (inv_d[c], z[c], z_sq[c]) and representative taxon index
+        size_t max_clusters = 2 * M;
+        std::vector<Scalar> c_inv_d(max_clusters, 0.0);
+        std::vector<Scalar> c_z_sq(max_clusters, 0.0);
+        Matrix c_Z = Matrix::Zero(static_cast<Eigen::Index>(max_clusters), p);
+        std::vector<size_t> c_rep_taxon(max_clusters, 0);
+        std::vector<Scalar> c_internal_depth(max_clusters, 0.0);
+        std::vector<int32_t> active(M);
+
+        Scalar S_d = 0.0;
+        Scalar S_z2 = 0.0;
+        Vector s_z = Vector::Zero(p);
+
+        for (size_t i = 0; i < M; ++i) {
+            active[i] = static_cast<int32_t>(i);
+            c_inv_d[i] = inv_aug_deg(static_cast<Eigen::Index>(i));
+            c_Z.row(static_cast<Eigen::Index>(i)) = Z_coords.row(static_cast<Eigen::Index>(i));
+            c_z_sq[i] = c_Z.row(static_cast<Eigen::Index>(i)).squaredNorm();
+            c_rep_taxon[i] = super_node_reps[i];
+
+            S_d += c_inv_d[i];
+            S_z2 += c_z_sq[i];
+            s_z.noalias() += c_Z.row(static_cast<Eigen::Index>(i)).transpose();
+        }
+
+        auto eval_omega = [&](int32_t a, int32_t b) -> Scalar {
+            if (a == b) return 0.0;
+            Scalar sq = c_z_sq[a] + c_z_sq[b]
+                      - 2.0 * c_Z.row(a).dot(c_Z.row(b));
+            return std::max<Scalar>(0.0, c_inv_d[a] + c_inv_d[b] + sq);
+        };
+
+        // Precompute initial k-NN candidate lists in Z-space using random-projection KD-split
+        const size_t k_knn = std::min<size_t>(32, M - 1);
+        std::vector<std::vector<int32_t>> knn_list(max_clusters);
+        build_rp_knn(c_Z, active, k_knn, knn_list);
+
+        int internal_counter = 1;
+        std::vector<Scalar> R(max_clusters, 0.0);
+
+        while (active.size() > 3) {
+            size_t m = active.size();
+            Scalar m_minus_2 = static_cast<Scalar>(m - 2);
+
+            // 1. Compute exact row sums R_i in O(m * p) time via global accumulators!
+            Vector Z_dot_sz(static_cast<Eigen::Index>(m));
+            for (size_t idx = 0; idx < m; ++idx) {
+                int32_t cid = active[idx];
+                Scalar z_dot = c_Z.row(cid).dot(s_z);
+                R[cid] = m_minus_2 * c_inv_d[cid] + S_d
+                       + static_cast<Scalar>(m) * c_z_sq[cid] + S_z2
+                       - 2.0 * z_dot;
+            }
+
+            // Find top-16 highest R_j outlier clusters
+            std::vector<int32_t> top_outliers = active;
+            size_t num_out = std::min<size_t>(16, m);
+            std::partial_sort(
+                top_outliers.begin(),
+                top_outliers.begin() + static_cast<std::ptrdiff_t>(num_out),
+                top_outliers.end(),
+                [&](int32_t a, int32_t b) { return R[a] > R[b]; }
+            );
+            top_outliers.resize(num_out);
+
+            // 2. Find minimum Q_{ij} over k-NN + outlier candidates
+            Scalar min_Q = 1e30;
+            size_t best_ia = 0, best_ib = 1;
+
+            // Map active IDs to their index in `active`
+            std::unordered_map<int32_t, size_t> active_pos;
+            active_pos.reserve(m * 2);
+            for (size_t idx = 0; idx < m; ++idx) {
+                active_pos[active[idx]] = idx;
+            }
+
+            for (size_t ia = 0; ia < m; ++ia) {
+                int32_t ca = active[ia];
+                // Check k-NN list
+                for (int32_t cb : knn_list[ca]) {
+                    if (cb == ca) continue;
+                    auto it = active_pos.find(cb);
+                    if (it == active_pos.end()) continue;
+                    size_t ib = it->second;
+                    Scalar om = eval_omega(ca, cb);
+                    Scalar q = m_minus_2 * om - R[ca] - R[cb];
+                    if (q < min_Q) {
+                        min_Q = q;
+                        best_ia = std::min(ia, ib);
+                        best_ib = std::max(ia, ib);
+                    }
+                }
+                // Check top-16 global R outliers
+                for (int32_t cb : top_outliers) {
+                    if (cb == ca) continue;
+                    size_t ib = active_pos[cb];
+                    Scalar om = eval_omega(ca, cb);
+                    Scalar q = m_minus_2 * om - R[ca] - R[cb];
+                    if (q < min_Q) {
+                        min_Q = q;
+                        best_ia = std::min(ia, ib);
+                        best_ib = std::max(ia, ib);
+                    }
+                }
+            }
+
+            int32_t u_id = active[best_ia];
+            int32_t v_id = active[best_ib];
+            Scalar om_uv = eval_omega(u_id, v_id);
+
+            // Compute evolutionary branch lengths using exact sequence distance between cluster reps
+            Scalar d_uv = compute_pair_distance(
+                aln, c_rep_taxon[u_id], c_rep_taxon[v_id], pi, k1_denom, k2_denom, k3_denom, use_hamming
+            );
+            Scalar delta_r = (R[u_id] - R[v_id]) / (2.0 * m_minus_2);
+            Scalar ratio_u = (om_uv > 1e-12) ? std::clamp<Scalar>(0.5 + delta_r / om_uv, 0.05, 0.95) : 0.5;
+            Scalar net_d = std::max<Scalar>(0.0, d_uv - c_internal_depth[u_id] - c_internal_depth[v_id]);
+            Scalar len_u = std::max<Scalar>(1e-6, ratio_u * net_d);
+            Scalar len_v = std::max<Scalar>(1e-6, (1.0 - ratio_u) * net_d);
+
+            tree.nodes[u_id].branch_length = len_u;
+            tree.nodes[v_id].branch_length = len_v;
+
+            int32_t w_id = static_cast<int32_t>(tree.nodes.size());
+            TreeNode w_node;
+            w_node.id = w_id;
+            w_node.name = "Node" + std::to_string(internal_counter++);
+            w_node.is_leaf = false;
+            w_node.children = {u_id, v_id};
+            tree.nodes.push_back(w_node);
+            tree.nodes[u_id].parent_id = w_id;
+            tree.nodes[v_id].parent_id = w_id;
+
+            // Exact Parallelogram Update for cluster w_id in R^p space (Section 3.6.2)
+            Scalar diff_z_sq = (c_Z.row(u_id) - c_Z.row(v_id)).squaredNorm();
+            c_Z.row(w_id) = 0.5 * (c_Z.row(u_id) + c_Z.row(v_id));
+            c_z_sq[w_id] = c_Z.row(w_id).squaredNorm();
+            c_inv_d[w_id] = 0.5 * (c_inv_d[u_id] + c_inv_d[v_id]) - 0.5 * om_uv + 0.25 * diff_z_sq;
+            c_rep_taxon[w_id] = c_rep_taxon[u_id];
+            c_internal_depth[w_id] = 0.5 * (c_internal_depth[u_id] + len_u + c_internal_depth[v_id] + len_v);
+
+            // Merge k-NN lists of u_id and v_id for w_id
+            knn_list[w_id].reserve(knn_list[u_id].size() + knn_list[v_id].size());
+            for (int32_t nb : knn_list[u_id]) {
+                if (nb != u_id && nb != v_id) knn_list[w_id].push_back(nb);
+            }
+            for (int32_t nb : knn_list[v_id]) {
+                if (nb != u_id && nb != v_id) knn_list[w_id].push_back(nb);
+            }
+
+            // Update global accumulators in O(p) time!
+            S_d += c_inv_d[w_id] - c_inv_d[u_id] - c_inv_d[v_id];
+            S_z2 += c_z_sq[w_id] - c_z_sq[u_id] - c_z_sq[v_id];
+            s_z.noalias() += (c_Z.row(w_id) - c_Z.row(u_id) - c_Z.row(v_id)).transpose();
+
+            active[best_ia] = w_id;
+            active.erase(active.begin() + static_cast<std::ptrdiff_t>(best_ib));
+        }
+
+        // Join final 3 clusters into trifurcating root
+        int32_t n0 = active[0], n1 = active[1], n2 = active[2];
+        Scalar d01 = std::max<Scalar>(0.0, compute_pair_distance(aln, c_rep_taxon[n0], c_rep_taxon[n1], pi, k1_denom, k2_denom, k3_denom, use_hamming) - c_internal_depth[n0] - c_internal_depth[n1]);
+        Scalar d02 = std::max<Scalar>(0.0, compute_pair_distance(aln, c_rep_taxon[n0], c_rep_taxon[n2], pi, k1_denom, k2_denom, k3_denom, use_hamming) - c_internal_depth[n0] - c_internal_depth[n2]);
+        Scalar d12 = std::max<Scalar>(0.0, compute_pair_distance(aln, c_rep_taxon[n1], c_rep_taxon[n2], pi, k1_denom, k2_denom, k3_denom, use_hamming) - c_internal_depth[n1] - c_internal_depth[n2]);
+
+        tree.nodes[n0].branch_length = std::max<Scalar>(1e-6, 0.5 * (d01 + d02 - d12));
+        tree.nodes[n1].branch_length = std::max<Scalar>(1e-6, 0.5 * (d01 + d12 - d02));
+        tree.nodes[n2].branch_length = std::max<Scalar>(1e-6, 0.5 * (d02 + d12 - d01));
+
+        int32_t root_id = static_cast<int32_t>(tree.nodes.size());
+        TreeNode root;
+        root.id = root_id;
+        root.name = "Root";
+        root.is_leaf = false;
+        root.children = {n0, n1, n2};
+        tree.nodes.push_back(root);
+        tree.nodes[n0].parent_id = root_id;
+        tree.nodes[n1].parent_id = root_id;
+        tree.nodes[n2].parent_id = root_id;
+        tree.root_id = root_id;
+
+        tree.compute_post_order();
+        return tree;
+    }
+
+    // Build initial k-NN lists in O(M * p * log M) using recursive random-projection tree leaves
+    static void build_rp_knn(
+        const Matrix& Z,
+        const std::vector<int32_t>& active,
+        size_t k_knn,
+        std::vector<std::vector<int32_t>>& knn_list
+    ) {
+        size_t M = active.size();
+        if (M <= 96) {
+            // Direct leaf bucket for small M
+            for (size_t i = 0; i < M; ++i) {
+                int32_t ca = active[i];
+                std::vector<std::pair<Scalar, int32_t>> dists;
+                dists.reserve(M - 1);
+                for (size_t j = 0; j < M; ++j) {
+                    if (i == j) continue;
+                    int32_t cb = active[j];
+                    Scalar d2 = (Z.row(ca) - Z.row(cb)).squaredNorm();
+                    dists.push_back({d2, cb});
+                }
+                size_t k = std::min(k_knn, dists.size());
+                std::partial_sort(dists.begin(), dists.begin() + static_cast<std::ptrdiff_t>(k), dists.end());
+                knn_list[ca].resize(k);
+                for (size_t r = 0; r < k; ++r) knn_list[ca][r] = dists[r].second;
+            }
+            return;
+        }
+
+        // Recursive coordinate-variance split into buckets of size <= 64
+        auto recurse = [&](auto& self, const std::vector<int32_t>& subset, int depth) -> void {
+            if (subset.size() <= 64 || depth >= 12) {
+                for (size_t i = 0; i < subset.size(); ++i) {
+                    int32_t ca = subset[i];
+                    for (size_t j = 0; j < subset.size(); ++j) {
+                        if (i != j) knn_list[ca].push_back(subset[j]);
+                    }
+                }
+                return;
+            }
+            // Pick coordinate with largest spread among first 16 dims
+            Eigen::Index best_col = depth % Z.cols();
+            std::vector<std::pair<Scalar, int32_t>> proj(subset.size());
+            for (size_t i = 0; i < subset.size(); ++i) {
+                proj[i] = {Z(subset[i], best_col), subset[i]};
+            }
+            size_t mid = proj.size() / 2;
+            std::nth_element(proj.begin(), proj.begin() + static_cast<std::ptrdiff_t>(mid), proj.end());
+            // Overlapping split (15% overlap) to preserve boundary neighbors
+            size_t overlap = std::max<size_t>(4, subset.size() / 8);
+            size_t left_end = std::min(proj.size(), mid + overlap);
+            size_t right_start = (mid > overlap) ? (mid - overlap) : 0;
+
+            std::vector<int32_t> left_sub, right_sub;
+            left_sub.reserve(left_end);
+            right_sub.reserve(proj.size() - right_start);
+            for (size_t i = 0; i < left_end; ++i) left_sub.push_back(proj[i].second);
+            for (size_t i = right_start; i < proj.size(); ++i) right_sub.push_back(proj[i].second);
+
+            self(self, left_sub, depth + 1);
+            self(self, right_sub, depth + 1);
+        };
+
+        recurse(recurse, active, 0);
+
+        // Deduplicate and keep top k_knn closest in Z-space per node
+        for (int32_t ca : active) {
+            auto& vec = knn_list[ca];
+            std::sort(vec.begin(), vec.end());
+            vec.erase(std::unique(vec.begin(), vec.end()), vec.end());
+            if (vec.size() > k_knn) {
+                std::partial_sort(
+                    vec.begin(),
+                    vec.begin() + static_cast<std::ptrdiff_t>(k_knn),
+                    vec.end(),
+                    [&](int32_t a, int32_t b) {
+                        return (Z.row(ca) - Z.row(a)).squaredNorm() <
+                               (Z.row(ca) - Z.row(b)).squaredNorm();
+                    }
+                );
+                vec.resize(k_knn);
+            }
+        }
+    }
+
+    // Expand super-nodes with |C_m| > 1 into terminal busbars (for collapsed_tree)
+    // and resolved zero-length binary ladders (for backbone_tree)
+    static void expand_super_nodes_into_trees(
+        OhmicNetwork& net,
+        const Tree& super_tree,
+        const Alignment& aln,
+        const std::vector<size_t>& super_node_reps,
+        const std::vector<std::vector<size_t>>& super_node_members
+    ) {
+        size_t M = super_node_reps.size();
+        size_t N = aln.num_taxa;
+        if (M == N) {
+            net.backbone_tree = super_tree;
+            net.collapsed_tree = super_tree;
+            return;
+        }
+
+        std::unordered_map<std::string, size_t> rep_name_to_m;
+        for (size_t m = 0; m < M; ++m) {
+            rep_name_to_m[aln.taxon_names[super_node_reps[m]]] = m;
+        }
+
+        // 1. Build collapsed_tree with native k-way multifurcating busbars for |C_m| > 1
+        Tree col = super_tree;
+        for (size_t nid = 0; nid < super_tree.nodes.size(); ++nid) {
+            if (!col.nodes[nid].is_leaf) continue;
+            auto it = rep_name_to_m.find(col.nodes[nid].name);
+            if (it == rep_name_to_m.end()) continue;
+            size_t m = it->second;
+            const auto& members = super_node_members[m];
+            if (members.size() <= 1) continue;
+
+            // Convert leaf node `nid` into an internal busbar hub with |members| leaf children
+            col.leaf_name_to_id.erase(col.nodes[nid].name);
+            col.nodes[nid].is_leaf = false;
+            col.nodes[nid].name = "Busbar_" + std::to_string(m + 1);
+            col.nodes[nid].children.clear();
+
+            for (size_t tax_idx : members) {
+                int32_t child_id = static_cast<int32_t>(col.nodes.size());
+                TreeNode leaf;
+                leaf.id = child_id;
+                leaf.name = aln.taxon_names[tax_idx];
+                leaf.is_leaf = true;
+                leaf.parent_id = static_cast<int32_t>(nid);
+                leaf.branch_length = 1e-6;
+                col.nodes.push_back(leaf);
+                col.nodes[nid].children.push_back(child_id);
+                col.leaf_name_to_id[leaf.name] = child_id;
+            }
+            net.num_collapsed_polytomies += (members.size() - 2);
+        }
+        col.compute_post_order();
+        net.collapsed_tree = col;
+
+        // 2. Build resolved binary backbone_tree by binary-resolving each super-node cluster
+        Tree bin = super_tree;
+        for (size_t nid = 0; nid < super_tree.nodes.size(); ++nid) {
+            if (!bin.nodes[nid].is_leaf) continue;
+            auto it = rep_name_to_m.find(bin.nodes[nid].name);
+            if (it == rep_name_to_m.end()) continue;
+            size_t m = it->second;
+            const auto& members = super_node_members[m];
+            if (members.size() <= 1) continue;
+
+            bin.leaf_name_to_id.erase(bin.nodes[nid].name);
+            int32_t cur_hub = static_cast<int32_t>(nid);
+            for (size_t k = 0; k + 1 < members.size(); ++k) {
+                bin.nodes[cur_hub].is_leaf = false;
+                bin.nodes[cur_hub].name = "BusBin_" + std::to_string(m + 1) + "_" + std::to_string(k + 1);
+                bin.nodes[cur_hub].children.clear();
+
+                // Left child: leaf members[k]
+                int32_t leaf_id = static_cast<int32_t>(bin.nodes.size());
+                TreeNode leaf;
+                leaf.id = leaf_id;
+                leaf.name = aln.taxon_names[members[k]];
+                leaf.is_leaf = true;
+                leaf.parent_id = cur_hub;
+                leaf.branch_length = 1e-6;
+                bin.nodes.push_back(leaf);
+                bin.leaf_name_to_id[leaf.name] = leaf_id;
+
+                // Right child: either final leaf (if k + 2 == members.size()) or next internal node
+                int32_t right_id = static_cast<int32_t>(bin.nodes.size());
+                TreeNode right_node;
+                right_node.id = right_id;
+                right_node.parent_id = cur_hub;
+                right_node.branch_length = 1e-6;
+                if (k + 2 == members.size()) {
+                    right_node.is_leaf = true;
+                    right_node.name = aln.taxon_names[members[k + 1]];
+                    bin.nodes.push_back(right_node);
+                    bin.leaf_name_to_id[right_node.name] = right_id;
+                } else {
+                    right_node.is_leaf = false;
+                    right_node.name = "BusBin_" + std::to_string(m + 1) + "_" + std::to_string(k + 2);
+                    bin.nodes.push_back(right_node);
+                }
+
+                bin.nodes[cur_hub].children = {leaf_id, right_id};
+                cur_hub = right_id;
+            }
+        }
+        bin.compute_post_order();
+        net.backbone_tree = bin;
+    }
+
+    // Score quartet conductances and build node-disjoint 4-way Wheatstone bridges + Ohmic Polytomies
+    static void build_bridges_and_collapsed_tree(
+        OhmicNetwork& net,
+        const Alignment& aln,
+        const OhmicSettings& settings,
+        Scalar eps_L,
+        bool is_dense_mode
+    ) {
+        if (is_dense_mode) {
+            net.collapsed_tree = net.backbone_tree;
+        }
+        Tree& tree = net.collapsed_tree;
+        size_t N = aln.num_taxa;
+
+        auto clade_taxa = collect_subtree_taxa(tree, aln);
+        std::vector<int> all_taxa(N);
+        std::iota(all_taxa.begin(), all_taxa.end(), 0);
+
+        // Helper to compute mean pairwise distance between two taxon subsets C1, C2
+        auto mean_inter_dist = [&](const std::vector<int>& C1, const std::vector<int>& C2) -> Scalar {
+            if (C1.empty() || C2.empty()) return 0.0;
+            if (is_dense_mode) {
+                Scalar sum = 0.0;
+                for (int i : C1) {
+                    for (int j : C2) {
+                        sum += net.D_tn93(i, j);
+                    }
+                }
+                return sum / static_cast<Scalar>(C1.size() * C2.size());
+            } else {
+                // Sample up to 8 representatives per clade in ScalableWoodbury mode for O(1) evaluation
+                size_t s1 = std::min<size_t>(C1.size(), 8);
+                size_t s2 = std::min<size_t>(C2.size(), 8);
+                Scalar sum = 0.0;
+                Vector4 dummy_pi = Vector4::Constant(0.25);
+                for (size_t a = 0; a < s1; ++a) {
+                    size_t idx1 = C1[(a * C1.size()) / s1];
+                    for (size_t b = 0; b < s2; ++b) {
+                        size_t idx2 = C2[(b * C2.size()) / s2];
+                        sum += compute_pair_distance(aln, idx1, idx2, dummy_pi, 0.25, 0.25, 0.5, true);
+                    }
+                }
+                return sum / static_cast<Scalar>(s1 * s2);
+            }
+        };
+
+        struct CandidateBridge {
+            int32_t u_id = INVALID_INDEX;
+            int32_t v_id = INVALID_INDEX;
+            int32_t id_A = INVALID_INDEX;
+            int32_t id_B = INVALID_INDEX;
+            int32_t id_C = INVALID_INDEX;
+            std::array<Scalar, 3> weights{1.0, 0.0, 0.0};
+            std::array<Scalar, 3> lengths{0.01, 0.01, 0.01};
+            Scalar ohmic_support = 1.0;
+            Scalar shunt_stress = 0.0;
+            bool is_polytomy_noise = false;
+        };
+
+        std::vector<CandidateBridge> candidates;
+
+        for (const auto& v_node : tree.nodes) {
+            if (v_node.is_leaf || v_node.id == tree.root_id) continue;
+            if (v_node.children.size() != 2) continue;
+
+            int32_t v_id = v_node.id;
+            int32_t u_id = v_node.parent_id;
+            if (u_id == INVALID_INDEX) continue;
+            const auto& u_node = tree.nodes[u_id];
+
+            // Identify sibling C under u_id and complement D
+            // For a binary non-root u_id: u_node has 2 children {v_id, id_C}, and D is outside u_id.
+            // For a 3-child root u_id: u_node has 3 children {v_id, c_sib1, c_sib2}; pick the sibling
+            // that maximizes the secondary quartet excess as C, and the other as D.
+            int32_t id_A = v_node.children[0];
+            int32_t id_B = v_node.children[1];
+
+            std::vector<int32_t> u_other_children;
+            for (int32_t cid : u_node.children) {
+                if (cid != v_id) u_other_children.push_back(cid);
+            }
+            if (u_other_children.empty()) continue;
+
+            // Complement of u_node (if u_id != root_id)
+            std::vector<bool> in_u(N, false);
+            for (int t : clade_taxa[u_id]) in_u[static_cast<size_t>(t)] = true;
+            std::vector<int> outside_u;
+            for (size_t t = 0; t < N; ++t) {
+                if (!in_u[t]) outside_u.push_back(static_cast<int>(t));
+            }
+
+            int32_t best_C = INVALID_INDEX;
+            CandidateBridge best_cand;
+            Scalar best_stress = -1.0;
+
+            for (int32_t cand_C : u_other_children) {
+                const auto& taxa_A = clade_taxa[id_A];
+                const auto& taxa_B = clade_taxa[id_B];
+                const auto& taxa_C = clade_taxa[cand_C];
+
+                // Taxa D = all taxa not in A, B, C
+                std::vector<bool> in_abc(N, false);
+                for (int t : taxa_A) in_abc[static_cast<size_t>(t)] = true;
+                for (int t : taxa_B) in_abc[static_cast<size_t>(t)] = true;
+                for (int t : taxa_C) in_abc[static_cast<size_t>(t)] = true;
+                std::vector<int> taxa_D;
+                for (size_t t = 0; t < N; ++t) {
+                    if (!in_abc[t]) taxa_D.push_back(static_cast<int>(t));
+                }
+                if (taxa_A.empty() || taxa_B.empty() || taxa_C.empty() || taxa_D.empty()) continue;
+
+                // Evaluate 4x4 inter-cluster distances
+                Scalar d_AB = mean_inter_dist(taxa_A, taxa_B);
+                Scalar d_CD = mean_inter_dist(taxa_C, taxa_D);
+                Scalar d_AC = mean_inter_dist(taxa_A, taxa_C);
+                Scalar d_BD = mean_inter_dist(taxa_B, taxa_D);
+                Scalar d_AD = mean_inter_dist(taxa_A, taxa_D);
+                Scalar d_BC = mean_inter_dist(taxa_B, taxa_C);
+
+                Scalar q1 = d_AB + d_CD; // Primary: AB | CD
+                Scalar q2 = d_AC + d_BD; // Secondary: AC | BD
+                Scalar q3 = d_AD + d_BC; // Tertiary: AD | BC (or BC | AD)
+
+                // Order A and B so that AC | BD has at least as much support as BC | AD (q2 <= q3)
+                int32_t cur_A = id_A;
+                int32_t cur_B = id_B;
+                if (q3 < q2) {
+                    std::swap(q2, q3);
+                    std::swap(cur_A, cur_B);
+                }
+
+                Scalar q_max = std::max({q1, q2, q3});
+                Scalar delta1 = std::max<Scalar>(0.0, q_max - q1);
+                Scalar delta2 = std::max<Scalar>(0.0, q_max - q2);
+                Scalar delta3 = settings.include_tertiary ? std::max<Scalar>(0.0, q_max - q3) : 0.0;
+
+                // Stage D check for unresolved equipotential noise
+                if (v_node.branch_length <= eps_L && delta1 <= 2.0 * eps_L && delta2 <= 2.0 * eps_L) {
+                    CandidateBridge poly_cand;
+                    poly_cand.u_id = u_id;
+                    poly_cand.v_id = v_id;
+                    poly_cand.is_polytomy_noise = true;
+                    best_cand = poly_cand;
+                    best_C = cand_C;
+                    break;
+                }
+
+                Scalar G1 = delta1;
+                Scalar G2 = delta2;
+                Scalar G3 = delta3;
+                Scalar G_sum = G1 + G2 + G3;
+                if (G_sum <= 1e-12) continue;
+
+                Scalar tau = G2 / (G1 + 1e-12);
+                if (tau > best_stress) {
+                    best_stress = tau;
+                    best_C = cand_C;
+                    best_cand.u_id = u_id;
+                    best_cand.v_id = v_id;
+                    best_cand.id_A = cur_A;
+                    best_cand.id_B = cur_B;
+                    best_cand.id_C = cand_C;
+                    best_cand.weights = {G1 / G_sum, G2 / G_sum, G3 / G_sum};
+                    Scalar t1 = v_node.branch_length;
+                    Scalar t2 = std::max<Scalar>(1e-5, 0.5 * delta2);
+                    Scalar t3 = std::max<Scalar>(1e-5, 0.5 * delta3);
+                    best_cand.lengths = {t1, t2, t3};
+                    best_cand.ohmic_support = G1 / G_sum;
+                    best_cand.shunt_stress = tau;
+                    best_cand.is_polytomy_noise = false;
+                }
+            }
+
+            if (best_C != INVALID_INDEX) {
+                candidates.push_back(best_cand);
+            }
+        }
+
+        // Sort bridge candidates by descending shunt_stress
+        std::sort(candidates.begin(), candidates.end(), [](const CandidateBridge& a, const CandidateBridge& b) {
+            return a.shunt_stress > b.shunt_stress;
+        });
+
+        std::unordered_set<int32_t> used_nodes;
+        std::vector<CandidateBridge> selected_bridges;
+        std::vector<CandidateBridge> selected_polytomies;
+
+        for (const auto& cand : candidates) {
+            if (cand.is_polytomy_noise) {
+                if (settings.collapse_ohmic_polytomies &&
+                    used_nodes.find(cand.u_id) == used_nodes.end() &&
+                    used_nodes.find(cand.v_id) == used_nodes.end()) {
+                    selected_polytomies.push_back(cand);
+                    used_nodes.insert(cand.v_id);
+                }
+                continue;
+            }
+            if (cand.shunt_stress < settings.min_shunt_stress) continue;
+            if (selected_bridges.size() >= settings.max_bridges) continue;
+
+            // Node-disjointness constraint: u_id, v_id, id_A, id_B, id_C must not be a hub or bridge of another bridge
+            // Specifically, u_id must have exactly 2 children (or if u_id is 3-child root, we insert an intermediate 2-child hub)
+            if (used_nodes.count(cand.u_id) || used_nodes.count(cand.v_id) ||
+                used_nodes.count(cand.id_A) || used_nodes.count(cand.id_B) || used_nodes.count(cand.id_C)) {
+                continue;
+            }
+            // If u_id has > 2 children (e.g. trifurcating root), only allow if u_id has 2 children or we create a dedicated hub
+            selected_bridges.push_back(cand);
+            used_nodes.insert(cand.u_id);
+            used_nodes.insert(cand.v_id);
+        }
+
+        // Apply selected Wheatstone bridges to `collapsed_tree`
+        for (const auto& sb : selected_bridges) {
+            int32_t hub_id = sb.u_id;
+            int32_t v_id = sb.v_id;
+
+            // If hub_id has > 2 children (e.g. trifurcating root with {v_id, id_C, id_D}),
+            // reuse v_id as the 3-child Wheatstone hub under root so root keeps {v_id, id_D}!
+            if (tree.nodes[hub_id].children.size() > 2) {
+                // Make v_id the 3-child hub containing {id_A, id_B, id_C}, and remove id_C from hub_id.children
+                auto& root_ch = tree.nodes[hub_id].children;
+                root_ch.erase(std::remove(root_ch.begin(), root_ch.end(), sb.id_C), root_ch.end());
+                tree.nodes[v_id].children = {sb.id_A, sb.id_B, sb.id_C};
+                tree.nodes[sb.id_A].parent_id = v_id;
+                tree.nodes[sb.id_B].parent_id = v_id;
+                tree.nodes[sb.id_C].parent_id = v_id;
+                // The branch from root (hub_id) to v_id has zero additional length beyond D's own branch
+                tree.nodes[v_id].branch_length = 0.0;
+
+                WheatstoneBridge wb;
+                wb.hub_node_id = v_id;
+                wb.bridge_node_id = v_id;
+                wb.children = {sb.id_A, sb.id_B, sb.id_C};
+                wb.weights = sb.weights;
+                wb.branch_lengths = sb.lengths;
+                wb.ohmic_support = sb.ohmic_support;
+                wb.shunt_stress = sb.shunt_stress;
+                net.bridges.push_back(wb);
+            } else {
+                // Standard binary parent u_id with children {v_id, id_C}:
+                // Collapse v_id into u_id so u_id becomes the 3-child hub {id_A, id_B, id_C}
+                tree.nodes[hub_id].children = {sb.id_A, sb.id_B, sb.id_C};
+                tree.nodes[sb.id_A].parent_id = hub_id;
+                tree.nodes[sb.id_B].parent_id = hub_id;
+                tree.nodes[sb.id_C].parent_id = hub_id;
+                tree.nodes[v_id].children.clear();
+                tree.nodes[v_id].parent_id = INVALID_INDEX;
+
+                WheatstoneBridge wb;
+                wb.hub_node_id = hub_id;
+                wb.bridge_node_id = v_id;
+                wb.children = {sb.id_A, sb.id_B, sb.id_C};
+                wb.weights = sb.weights;
+                wb.branch_lengths = sb.lengths;
+                wb.ohmic_support = sb.ohmic_support;
+                wb.shunt_stress = sb.shunt_stress;
+                net.bridges.push_back(wb);
+            }
+        }
+
+        // Apply selected Ohmic Polytomy collapses (Stage D Case 2)
+        for (const auto& poly : selected_polytomies) {
+            int32_t u_id = poly.u_id;
+            int32_t v_id = poly.v_id;
+            if (tree.nodes[v_id].children.empty()) continue;
+            auto& u_ch = tree.nodes[u_id].children;
+            auto it = std::find(u_ch.begin(), u_ch.end(), v_id);
+            if (it == u_ch.end()) continue;
+            u_ch.erase(it);
+            for (int32_t cid : tree.nodes[v_id].children) {
+                u_ch.push_back(cid);
+                tree.nodes[cid].parent_id = u_id;
+            }
+            tree.nodes[v_id].children.clear();
+            tree.nodes[v_id].parent_id = INVALID_INDEX;
+            net.num_collapsed_polytomies++;
+        }
+
+        tree.compute_post_order();
+        net.node_to_bridge_idx.assign(tree.num_nodes(), -1);
+        for (size_t k = 0; k < net.bridges.size(); ++k) {
+            int32_t hid = net.bridges[k].hub_node_id;
+            if (hid >= 0 && static_cast<size_t>(hid) < net.node_to_bridge_idx.size()) {
+                net.node_to_bridge_idx[hid] = static_cast<int32_t>(k);
+            }
+        }
+        tree.bridges = net.bridges;
+        tree.node_to_bridge_idx = net.node_to_bridge_idx;
+    }
+};
+
+} // namespace hyphy::core

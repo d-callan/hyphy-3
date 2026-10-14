@@ -2,6 +2,7 @@
 #include "hyphy/core/genetic_code.hpp"
 #include "hyphy/core/alignment.hpp"
 #include "hyphy/core/tree.hpp"
+#include "hyphy/core/ohmic_network.hpp"
 #include "hyphy/core/console.hpp"
 #include "hyphy/analyses/absrel.hpp"
 
@@ -33,7 +34,11 @@ static void print_absrel_usage(const char* prog) {
               << Console::bold("Required arguments:") << "\n"
               << "  " << Console::brand("--alignment") << " <file>   Path to codon alignment (FASTA or NEXUS)\n\n"
               << Console::bold("Optional arguments:") << "\n"
-              << "  " << Console::brand("--tree") << " <file>        Path to Newick tree file (optional if embedded in NEXUS)\n"
+              << "  " << Console::brand("--tree") << " <file>        Path to Newick tree file (optional; auto-infers Ohmic Network if omitted)\n"
+              << "  " << Console::brand("--ohmic") << "              Build Ohmic Phylogenetic Network with Wheatstone bridges (+ 384D HyphAeon)\n"
+              << "  " << Console::brand("--hyphaeon") << "           Enable 384D HyphAeon (192D dS + 192D dN) transformer embeddings\n"
+              << "  " << Console::brand("--no-hyphaeon") << "        Disable live HyphAeon transformer (use empirical codon conductances)\n"
+              << "  " << Console::brand("--embeddings") << " <file>  Path to precomputed [N x 384] HyphAeon embeddings (.bin/.csv/.tsv)\n"
               << "  " << Console::brand("--code") << " <name>        Genetic code (default: Universal)\n"
               << "  " << Console::brand("--branches") << " <set>     Branches to test: All, Internal, Leaves (default: All)\n"
               << "  " << Console::brand("--pvalue") << " <threshold> Holm-Bonferroni p-value threshold (default: 0.05)\n"
@@ -45,7 +50,7 @@ static void print_absrel_usage(const char* prog) {
               << "  " << Console::brand("--help, -h") << "           Show this help message\n\n"
               << Console::bold("Examples:") << "\n"
               << "  " << prog << " --alignment data/bglobin.nex\n"
-              << "  " << prog << " --alignment data/cd2.fna --tree data/cd2.nwk --branches Internal --threads 8\n\n";
+              << "  " << prog << " --alignment data/cd2.fna --ohmic --branches Internal --threads 8\n\n";
 }
 
 int run_absrel(int argc, char* argv[]) {
@@ -53,6 +58,9 @@ int run_absrel(int argc, char* argv[]) {
     std::string tree_file;
     std::string output_file;
     std::string code_name = "Universal";
+    std::string embeddings_file = "";
+    bool force_ohmic = false;
+    bool use_hyphaeon = true;
     int num_threads = 0;
     JSONFormat json_format = JSONFormat::ModernV3;
     ABSRELSettings settings;
@@ -65,6 +73,16 @@ int run_absrel(int argc, char* argv[]) {
             alignment_file = argv[++i];
         } else if (arg == "--tree" && i + 1 < argc) {
             tree_file = argv[++i];
+        } else if (arg == "--ohmic" || arg == "--omhic") {
+            force_ohmic = true;
+        } else if (arg == "--hyphaeon") {
+            force_ohmic = true;
+            use_hyphaeon = true;
+        } else if (arg == "--no-hyphaeon") {
+            use_hyphaeon = false;
+        } else if (arg == "--embeddings" && i + 1 < argc) {
+            force_ohmic = true;
+            embeddings_file = argv[++i];
         } else if (arg == "--code" && i + 1 < argc) {
             code_name = argv[++i];
         } else if (arg == "--branches" && i + 1 < argc) {
@@ -148,24 +166,14 @@ int run_absrel(int argc, char* argv[]) {
         return 1;
     }
 
-    // 3. Load Tree
+    // 3. Resolve Tree or Ohmic Phylogenetic Network
     Tree tree;
-    if (!tree_file.empty()) {
-        try {
-            tree = Tree::from_newick_file(tree_file);
-        } catch (const std::exception& e) {
-            std::cerr << Console::danger("Error loading tree from file: ") << e.what() << "\n";
-            return 1;
-        }
-    } else if (!aln.embedded_tree_newick.empty()) {
-        try {
-            tree = Tree::from_newick(aln.embedded_tree_newick);
-        } catch (const std::exception& e) {
-            std::cerr << Console::danger("Error parsing embedded tree: ") << e.what() << "\n";
-            return 1;
-        }
-    } else {
-        std::cerr << Console::danger("Error: No tree provided and no tree embedded in alignment.\n");
+    OhmicNetwork ohmic_net;
+    std::string tree_source;
+    try {
+        tree = OhmicNetwork::resolve_tree(aln, tree_file, force_ohmic, use_hyphaeon, embeddings_file, &ohmic_net, &tree_source);
+    } catch (const std::exception& e) {
+        std::cerr << Console::danger("Error resolving tree/network: ") << e.what() << "\n";
         return 1;
     }
 
@@ -177,7 +185,7 @@ int run_absrel(int argc, char* argv[]) {
         {"Sequences / Taxa", std::to_string(aln.num_taxa)},
         {"Codon Sites", std::to_string(aln.num_codons) + " (" + std::to_string(aln.num_codons * 3) + " nt)"},
         {"Unique Patterns", std::to_string(aln.patterns.size())},
-        {"Tree", std::to_string(tree.num_nodes()) + " nodes (" + std::to_string(tree.num_leaves()) + " leaves)"},
+        {"Tree Source", tree_source + " (" + std::to_string(tree.num_nodes()) + " nodes, " + std::to_string(tree.num_leaves()) + " leaves)"},
         {"Tested Branches", settings.test_branches},
         {"Max Rate Classes", std::to_string(settings.max_rate_classes)},
         {"Genetic Code", code->name}

@@ -204,6 +204,7 @@ This allows joint L-BFGS optimization across all branch lengths simultaneously i
 | **GARD** | Where are recombination breakpoints located? | Recombination & Topology | Segmented GTR + Neighbor-Joining, AICc selection | Independent segment rates | — | 100% Verified |
 | **SLAC** | Are individual sites undergoing selection using counting methods? | Site-level (dN ≷ dS) | Joint ML Ancestral Reconstruction, exact Binomial test | None | — | 100% Verified |
 | **dFEL** | Which sites evolve under selection in compositionally heterogeneous lineages? | Site-level & Lineage direction (dN ≷ dS, ΔGC) | Continuous Softmax mixture (AT/Neutral/GC), ML auto-rooting, LRT | Regime-specific target frequencies | — | 100% Verified |
+| **OHMIC** | How do we resolve reticulation, homoplasy & polytomies in linear time (with or without an input tree)? | Topological Shunts & Network Likelihood | Foster Effective Resistance, Series-Parallel Wheatstone Bridges, HyphAeon 384D Transformer | ExactDense & $\mathcal{O}(N \log N)$ Woodbury | Supported | 100% Verified |
 | **Adjoint Core** | Differentiable tree likelihoods for custom ML models | Arbitrary parameters | Inside-Outside analytical O(B) gradients | User-defined | User-defined | Exact Analytical |
 
 ---
@@ -376,8 +377,24 @@ Null ~ ½ χ²₀ + ½(0.4 χ²₁ + 0.6 χ²₂)
   4. **Site-Level Selection & Directed Ancestral Reconstruction**:
      - Optimizes site-specific synonymous rate α_s and non-synonymous rate β_s across branches under their respective regimes.
      - Tests H₀: α_s = β_s vs H₁: α_s ≠ β_s via asymptotic χ²₁ LRT.
-     - Performs max-product Viterbi ancestral sequence reconstruction to identify directed substitutions (A → B), classified into Weak-to-Strong (W → S), Strong-to-Weak (S → W), regime concordance, and Shannon surprise bit scores (-log₂ P_ij ≥ 10.0 bits ⚡).
+      - Performs max-product Viterbi ancestral sequence reconstruction to identify directed substitutions (A → B), classified into Weak-to-Strong (W → S), Strong-to-Weak (S → W), regime concordance, and Shannon surprise bit scores (-log₂ P_ij ≥ 10.0 bits ⚡).
 - **Outputs**: Comprehensive upfront compositional test panel, candidate root ranking with Akaike weights, regime allocation metrics, site-level selection table, directed substitutions, and Modern v3 JSON export.
+
+#### 14. **OHMIC (Ohmic Phylogenetic Networks, Linear-Time Wheatstone Pruning & HyphAeon 384D Transformer)**
+- **Scope**: Replaces brittle single-tree Neighbor-Joining splits with an electrical resistor network over sequences, resolving phylogenetic reticulation, incomplete lineage sorting (ILS), and outbreak polytomies in strict linear $\mathcal{O}(N)$ pruning time—both as a standalone analysis (`hyphy3 ohmic`) and seamlessly plugged into **every** standard HyPhy 3 analysis (`--ohmic` / `--omhic` or automatic tree-free FASTA inference).
+- **Workflow**:
+  1. **HyphAeon 384D Multi-Scale Transformer & Conductance Graph**:
+     - Extracts 384-dimensional taxon embeddings $\mathbf{E} \in \mathbb{R}^{N \times 384}$ via the **HyphAeon Multi-Scale Phylogenetic Transformer** (`aeon_core`), partitioned into $192\text{D}$ synonymous ($dS$, neutral backbone flow) and $192\text{D}$ nonsynonymous ($dN$, functional convergence) channels.
+     - Fuses multi-scale transformer cosine similarities with site-variance-weighted TN93/codon alignment conductances $c_{ij}$ to construct the graph Laplacian $\mathbf{L} = \mathbf{D} - \mathbf{C}$.
+  2. **Adaptive Dual-Engine Resistance Solver (`ExactDense` vs. `ScalableWoodbury`)**:
+     - **ExactDense ($M \le 512$)**: Computes the exact Moore-Penrose pseudoinverse $\mathbf{L}^+$ and pairwise effective resistances $\Omega_{ij} = L^+_{ii} + L^+_{jj} - 2L^+_{ij}$, satisfying **Foster's Theorem** $\sum_{i<j} c_{ij}\Omega_{ij} = N - 1$ to machine precision.
+     - **ScalableWoodbury ($N > 512$ up to $10^5+$)**: Collapses zero-divergence sequences into $M$ equipotential busbars, factors conductances via the 384D HyphAeon representations (or Nyström landmarks), inverts the tiny $p \times p$ capacitance core via the **Woodbury Matrix Identity**, and builds the Consensus Backbone Tree $T_0$ in $\mathcal{O}(M \log M)$ time via vector-quantized recursive bisection in resistance-coordinate space $\boldsymbol{\Phi} \in \mathbb{R}^{M \times p}$.
+  3. **Series-Parallel Wheatstone Bridges & Polytomy Busbars**:
+     - Collapses zero-signal internal branches ($t_e \le \frac{1}{2L_{\text{eff}}}$) into multi-furcating **Ohmic Polytomy** hubs.
+     - Promotes high-stress internal branches ($\tau_e^{\text{Ohm}} \ge \tau_{\min}$) into disjoint 4-way **Wheatstone Bridges** carrying analytical quartet shunt weights $(w_{k,1}, w_{k,2}, w_{k,3})$ over the three quartet topologies $(A,B)|(C,D)$, $(A,C)|(B,D)$, and $(A,D)|(B,C)$.
+  4. **Linear-Time Wheatstone Pruning & Exact Fréchet Adjoints**:
+     - Evaluates each Wheatstone bridge hub in a single post-order pass via $\mathbf{D}_k^{\text{Ohm}} = \sum_{r=1}^3 w_{k,r} [(\mathbf{P}(t_{k,r})(\mathbf{M}_{a_r} \odot \mathbf{M}_{b_r})) \odot \mathbf{M}_{c_r}]$, embedded directly in `hyphy::core::Tree::eval_internal_node` so **all** standard analyses (`FEL`, `MEME`, `BUSTED`, `aBSREL`, `RELAX`, `FUBAR`, `PRIME`, `SLAC`, `Contrast-FEL`, `dFEL`) run natively on Wheatstone networks.
+     - Computes exact analytical Inside-Outside Fréchet derivatives $\partial \ln L / \partial t_{k,r}$ and $\partial \ln L / \partial w_{k,r}$ in a single pre-order pass.
 
 ---
 
@@ -415,28 +432,29 @@ pip install .
 
 ## 💻 Command-Line Usage
 
-HyPhy 3 provides both a unified driver (`hyphy3 <analysis>`) and dedicated standalone tools (`hyphy3-fel`, `hyphy3-meme`, `hyphy3-busted`, `hyphy3-absrel`):
+HyPhy 3 provides both a unified driver (`hyphy3 <analysis>`) and dedicated standalone tools (`hyphy3-fel`, `hyphy3-meme`, `hyphy3-busted`, `hyphy3-absrel`, `hyphy3-ohmic`, etc.). Every standard selection analysis supports `--ohmic` (or `--omhic`), `--hyphaeon` / `--no-hyphaeon`, `--embeddings <file>`, and **automatic tree-free FASTA inference** when `--tree` is omitted:
 
 ### Available CLI Options by Analysis
 
 | Analysis | Command | Key Options | Description |
 |:---|:---|:---|:---|
-| **FEL** | `hyphy3 fel` | `--alignment`, `--tree`, `--pvalue 0.1`, `--threads N`, `--output` | Site-by-site pervasive selection |
-| **Contrast-FEL** | `hyphy3 contrast-fel` | `--alignment`, `--tree`, `--branches <groups>`, `--shrinkage <lambda>`, `--output` | Multi-group selection comparison with Ridge shrinkage |
-| **FUBAR** | `hyphy3 fubar` | `--alignment`, `--tree`, `--grid 20`, `--method [VB0|Gibbs|MH]`, `--posterior 0.9`, `--output` | Fast Bayesian rate-grid selection inference |
-| **PRIME** | `hyphy3 prime` | `--alignment`, `--tree`, `--property-set [5PROP|Atchley|3PROP|4PROP|2PROP]`, `--shrinkage 0.5`, `--output` | Biophysical amino acid property selection with Ridge shrinkage |
-| **MEME** | `hyphy3 meme` | `--alignment`, `--tree`, `--pvalue 0.1`, `--threads N`, `--output` | Site-by-site episodic selection across lineages |
-| **BUSTED** | `hyphy3 busted` | `--alignment`, `--tree`, `--rates 3`, `--threads N`, `--output` | Standard gene-wide episodic selection |
+| **FEL** | `hyphy3 fel` | `--alignment`, `--tree`, `--ohmic`, `--pvalue 0.1`, `--threads N`, `--output` | Site-by-site pervasive selection (supports Wheatstone networks & tree-free FASTA) |
+| **Contrast-FEL** | `hyphy3 contrast-fel` | `--alignment`, `--tree`, `--ohmic`, `--branches <groups>`, `--shrinkage <lambda>`, `--output` | Multi-group selection comparison with Ridge shrinkage |
+| **FUBAR** | `hyphy3 fubar` | `--alignment`, `--tree`, `--ohmic`, `--grid 20`, `--method [VB0|Gibbs|MH]`, `--posterior 0.9`, `--output` | Fast Bayesian rate-grid selection inference |
+| **PRIME** | `hyphy3 prime` | `--alignment`, `--tree`, `--ohmic`, `--property-set [5PROP|Atchley|3PROP|4PROP|2PROP]`, `--shrinkage 0.5`, `--output` | Biophysical amino acid property selection with Ridge shrinkage |
+| **MEME** | `hyphy3 meme` | `--alignment`, `--tree`, `--ohmic`, `--pvalue 0.1`, `--threads N`, `--output` | Site-by-site episodic selection across lineages |
+| **BUSTED** | `hyphy3 busted` | `--alignment`, `--tree`, `--ohmic`, `--rates 3`, `--threads N`, `--output` | Standard gene-wide episodic selection |
 | **BUSTED-S** | `hyphy3 busted` | `--srv`, `--syn-rates 3` | Synonymous rate variation across sites |
 | **BUSTED-MH** | `hyphy3 busted` | `--multiple-hits [None\|Double\|Double+Triple]` | Multi-nucleotide substitutions (2-hit and 3-hit) |
 | **BUSTED-E** | `hyphy3 busted` | `--error-sink`, `--error-sink-bf 20.0` | Saturation replacement kernel for alignment/sequencing error quarantine |
 | **BUSTED-Auto**| `hyphy3 busted` | `--auto` (`--full-auto`) | 4-Gate Surprisal & Score Automatic Model Selector (Sink, MH, SRV, K) |
 | **BUSTED Auto-K**| `hyphy3 busted` | `--auto-k` | Automatic selection of rate categories via AICc step-up |
-| **aBSREL** | `hyphy3 absrel`| `--alignment`, `--tree`, `--rates 3`, `--threads N`, `--output` | Lineage-specific adaptive selection |
-| **RELAX** | `hyphy3 relax` | `--alignment`, `--tree`, `--test <regex|names>`, `--pvalue 0.05`, `--output` | Test for selection relaxation/intensification across branch sets |
+| **aBSREL** | `hyphy3 absrel`| `--alignment`, `--tree`, `--ohmic`, `--rates 3`, `--threads N`, `--output` | Lineage-specific adaptive selection |
+| **RELAX** | `hyphy3 relax` | `--alignment`, `--tree`, `--ohmic`, `--test <regex|names>`, `--pvalue 0.05`, `--output` | Test for selection relaxation/intensification across branch sets |
 | **GARD** | `hyphy3 gard` | `--alignment`, `--max-breakpoints N`, `--rate-classes 1`, `--threads N`, `--output` | Recombination breakpoint detection via Genetic Algorithm and AICc |
-| **SLAC** | `hyphy3 slac` | `--alignment`, `--tree`, `--samples N`, `--pvalue 0.1`, `--output` | Counting-based site-by-site selection via Joint ML ancestors |
-| **Directional-FEL** | `hyphy3 dfel` | `--alignment`, `--tree`, `--root [auto\|keep\|<name>]`, `--regimes [0=auto\|1\|3]`, `--pvalue 0.1`, `--output` | Non-stationary selection inference with upfront compositional tests & ML auto-rooting |
+| **SLAC** | `hyphy3 slac` | `--alignment`, `--tree`, `--ohmic`, `--samples N`, `--pvalue 0.1`, `--output` | Counting-based site-by-site selection via Joint ML ancestors |
+| **Directional-FEL** | `hyphy3 dfel` | `--alignment`, `--tree`, `--ohmic`, `--root [auto\|keep\|<name>]`, `--regimes [0=auto\|1\|3]`, `--pvalue 0.1`, `--output` | Non-stationary selection inference with upfront compositional tests & ML auto-rooting |
+| **OHMIC** | `hyphy3 ohmic` | `--alignment`, `--datatype [nucleotide\|codon]`, `--hyphaeon`, `--scale-mode [auto\|dense\|woodbury]`, `--min-stress 0.05`, `--output` | Ohmic electrical network inference, Foster resistance & Wheatstone bridge ML fitting |
 
 ### CLI Examples
 
@@ -446,6 +464,9 @@ hyphy3 --help
 
 # 1. Run FEL (site-by-site pervasive selection)
 hyphy3 fel --alignment benchmarks/data/cd2.fna --tree benchmarks/data/cd2.nwk --pvalue 0.1 --threads 8
+
+# 1b. Run FEL directly on a tree-free FASTA alignment with Ohmic + HyphAeon 384D Wheatstone bridges
+hyphy3 fel --alignment benchmarks/data/cd2.fna --ohmic --quick --threads 8
 
 # 2. Run Contrast-FEL (test for differential selection between branch sets)
 hyphy3 contrast-fel --alignment benchmarks/data/cd2.fna --tree benchmarks/data/cd2.nwk --branches "Internal,Leaves" --shrinkage 1.0 --threads 8
@@ -485,6 +506,9 @@ hyphy3 slac --alignment tests/data/adh.nex --samples 100 --output adh.SLAC.json 
 
 # 14. Run Directional-FEL (dFEL with upfront chi^2 tests, ML auto-rooting, and continuous Softmax directional mixture)
 hyphy3 dfel --alignment tests/data/adh.nex --output adh.dFEL.json --threads 8
+
+# 15. Run OHMIC (infer Ohmic resistor network, Foster effective resistances, and Wheatstone bridges)
+hyphy3 ohmic --alignment benchmarks/data/cd2.fna --datatype codon --output cd2.OHMIC.json --threads 8
 ```
 
 All analyses output standardized, Datamonkey-compatible JSON files ready for direct visualization on [HyPhy Vision](https://vision.hyphy.org).
@@ -655,6 +679,25 @@ dfel_res = dfel.run()
 print(f"Auto-root chosen branch: {dfel.root_result.chosen_branch_name} (weight: {dfel.root_result.chosen_weight:.3f})")
 print(f"CP3 heterogeneity p-value: {dfel.comp_test.p_value_cp3:.2e}")
 print(f"Significant dFEL sites: {sum(1 for r in dfel_res if r.p_value <= 0.1)}")
+
+# -------------------------------------------------------------
+# 12. OHMIC: Electrical Resistor Network & Wheatstone Pruning
+# -------------------------------------------------------------
+ohmic_aln = hp.Alignment.load("benchmarks/data/cd2.fna")
+ohmic_settings = hp.OhmicAnalysisSettings()
+ohmic_settings.use_codon_model = True
+ohmic_settings.network_settings.use_hyphaeon_transformer = True
+
+ohmic = hp.OhmicAnalyzer(ohmic_aln, ohmic_settings)
+ohmic_res = ohmic.run()
+
+print(f"Foster sum invariant: {ohmic_res.foster_sum:.5f} (N - 1 = {ohmic_res.num_taxa - 1})")
+print(f"Active 4-way Wheatstone bridges: {ohmic_res.num_bridges}, Delta LogL: {ohmic_res.delta_log_l:+.4f}")
+
+# Plug the Wheatstone-bridge-equipped tree directly into any standard analysis (e.g. FEL, FUBAR)
+wheatstone_tree = ohmic_res.network.collapsed_tree
+fel_on_ohmic = hp.FELAnalyzer.create_and_fit(wheatstone_tree, ohmic_aln)
+fel_ohmic_sites = fel_on_ohmic.run()
 ```
 
 ### PyTorch End-to-End Optimization

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "hyphy/core/types.hpp"
+#include <array>
 #include <string>
 #include <vector>
 #include <unordered_map>
@@ -23,12 +24,164 @@ struct TreeNode {
     std::string model_tag;
 };
 
+struct WheatstoneBridge {
+    int32_t hub_node_id = INVALID_INDEX;       // Node u (collapsed 3-child hub: A, B, C)
+    int32_t bridge_node_id = INVALID_INDEX;    // Original node v in backbone tree
+    std::array<int32_t, 3> children{INVALID_INDEX, INVALID_INDEX, INVALID_INDEX}; // {id_A, id_B, id_C}
+    std::array<Scalar, 3> weights{1.0, 0.0, 0.0};        // {w_1, w_2, w_3} summing to 1.0 (Ohmic currents)
+    std::array<Scalar, 3> branch_lengths{0.01, 0.01, 0.01}; // {t_1, t_2, t_3} internal quartet bridge lengths
+    Scalar ohmic_support = 1.0;                // I_Ohm = G_1 / (G_1 + G_2 + G_3)
+    Scalar shunt_stress = 0.0;                 // tau_Ohm = G_2 / G_1
+};
+
 class Tree {
 public:
     std::vector<TreeNode> nodes;
     int32_t root_id = INVALID_INDEX;
     std::vector<int32_t> post_order;
     std::unordered_map<std::string, int32_t> leaf_name_to_id;
+    std::vector<WheatstoneBridge> bridges;
+    std::vector<int32_t> node_to_bridge_idx;
+
+    bool has_wheatstone_bridges() const {
+        return !bridges.empty();
+    }
+
+    int32_t bridge_index(int32_t nid) const {
+        return (nid >= 0 && static_cast<size_t>(nid) < node_to_bridge_idx.size())
+            ? node_to_bridge_idx[nid]
+            : -1;
+    }
+
+    void rebuild_bridge_index() {
+        node_to_bridge_idx.assign(nodes.size(), -1);
+        for (size_t k = 0; k < bridges.size(); ++k) {
+            int32_t hid = bridges[k].hub_node_id;
+            if (hid >= 0 && static_cast<size_t>(hid) < node_to_bridge_idx.size()) {
+                node_to_bridge_idx[hid] = static_cast<int32_t>(k);
+            }
+        }
+    }
+
+    void scale_bridge_lengths(Scalar factor) {
+        for (auto& wb : bridges) {
+            for (int r = 0; r < 3; ++r) {
+                wb.branch_lengths[r] *= factor;
+            }
+        }
+    }
+
+    template <typename VecType, typename MatType>
+    void eval_internal_node(
+        int32_t nid,
+        const std::vector<MatType>& P_branches,
+        const std::vector<VecType>& node_L,
+        const std::vector<double>& node_log_scale,
+        VecType& out_L,
+        double& out_child_scale_sum,
+        const std::vector<std::array<MatType, 3>>* P_bridges = nullptr
+    ) const {
+        int32_t b_idx = bridge_index(nid);
+        if (b_idx >= 0) {
+            const auto& wb = bridges[static_cast<size_t>(b_idx)];
+            int32_t id_A = wb.children[0];
+            int32_t id_B = wb.children[1];
+            int32_t id_C = wb.children[2];
+
+            VecType M_A = P_branches[id_A] * node_L[id_A];
+            VecType M_B = P_branches[id_B] * node_L[id_B];
+            VecType M_C = P_branches[id_C] * node_L[id_C];
+            out_child_scale_sum = node_log_scale[id_A] + node_log_scale[id_B] + node_log_scale[id_C];
+
+            auto get_P_br = [&](int r) -> const MatType& {
+                if (P_bridges != nullptr) {
+                    return (*P_bridges)[static_cast<size_t>(b_idx)][r];
+                }
+                int32_t bid = wb.bridge_node_id;
+                if (bid >= 0 && bid != nid && static_cast<size_t>(bid) < P_branches.size() &&
+                    P_branches[bid].rows() == M_A.size()) {
+                    return P_branches[bid];
+                }
+                return P_branches[id_A];
+            };
+
+            out_L = VecType::Zero(M_A.size());
+            if (wb.weights[0] > 0.0) {
+                VecType Y1 = M_A.cwiseProduct(M_B);
+                VecType D1 = (get_P_br(0) * Y1).cwiseProduct(M_C);
+                out_L.noalias() += wb.weights[0] * D1;
+            }
+            if (wb.weights[1] > 0.0) {
+                VecType Y2 = M_A.cwiseProduct(M_C);
+                VecType D2 = (get_P_br(1) * Y2).cwiseProduct(M_B);
+                out_L.noalias() += wb.weights[1] * D2;
+            }
+            if (wb.weights[2] > 0.0) {
+                VecType Y3 = M_B.cwiseProduct(M_C);
+                VecType D3 = (get_P_br(2) * Y3).cwiseProduct(M_A);
+                out_L.noalias() += wb.weights[2] * D3;
+            }
+        } else {
+            out_L.setOnes();
+            out_child_scale_sum = 0.0;
+            for (int32_t cid : nodes[nid].children) {
+                out_L.array() *= (P_branches[cid] * node_L[cid]).array();
+                out_child_scale_sum += node_log_scale[cid];
+            }
+        }
+    }
+
+    template <typename VecType, typename MatType, typename ModelType>
+    void eval_internal_node_with_model(
+        int32_t nid,
+        const std::vector<MatType>& P_branches,
+        const ModelType& model,
+        const std::vector<VecType>& node_L,
+        const std::vector<double>& node_log_scale,
+        VecType& out_L,
+        double& out_child_scale_sum,
+        Scalar branch_scale = 1.0
+    ) const {
+        int32_t b_idx = bridge_index(nid);
+        if (b_idx >= 0) {
+            const auto& wb = bridges[static_cast<size_t>(b_idx)];
+            int32_t id_A = wb.children[0];
+            int32_t id_B = wb.children[1];
+            int32_t id_C = wb.children[2];
+
+            VecType M_A = P_branches[id_A] * node_L[id_A];
+            VecType M_B = P_branches[id_B] * node_L[id_B];
+            VecType M_C = P_branches[id_C] * node_L[id_C];
+            out_child_scale_sum = node_log_scale[id_A] + node_log_scale[id_B] + node_log_scale[id_C];
+
+            out_L = VecType::Zero(M_A.size());
+            if (wb.weights[0] > 0.0) {
+                MatType P1 = model.transition_matrix(wb.branch_lengths[0] * branch_scale);
+                VecType Y1 = M_A.cwiseProduct(M_B);
+                VecType D1 = (P1 * Y1).cwiseProduct(M_C);
+                out_L.noalias() += wb.weights[0] * D1;
+            }
+            if (wb.weights[1] > 0.0) {
+                MatType P2 = model.transition_matrix(wb.branch_lengths[1] * branch_scale);
+                VecType Y2 = M_A.cwiseProduct(M_C);
+                VecType D2 = (P2 * Y2).cwiseProduct(M_B);
+                out_L.noalias() += wb.weights[1] * D2;
+            }
+            if (wb.weights[2] > 0.0) {
+                MatType P3 = model.transition_matrix(wb.branch_lengths[2] * branch_scale);
+                VecType Y3 = M_B.cwiseProduct(M_C);
+                VecType D3 = (P3 * Y3).cwiseProduct(M_A);
+                out_L.noalias() += wb.weights[2] * D3;
+            }
+        } else {
+            out_L.setOnes();
+            out_child_scale_sum = 0.0;
+            for (int32_t cid : nodes[nid].children) {
+                out_L.array() *= (P_branches[cid] * node_L[cid]).array();
+                out_child_scale_sum += node_log_scale[cid];
+            }
+        }
+    }
 
     static Tree from_newick_file(const std::string& filepath) {
         std::ifstream file(filepath);

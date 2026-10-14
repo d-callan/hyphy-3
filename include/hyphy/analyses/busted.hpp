@@ -301,6 +301,7 @@ public:
         #pragma omp parallel
         {
             std::vector<Vector> node_L(num_nodes, Vector::Zero(S));
+            std::vector<double> node_log_scale(num_nodes, 0.0);
             #pragma omp for reduction(+:total_log_l) schedule(dynamic)
             for (size_t p = 0; p < num_patterns; ++p) {
                 const auto& pattern = aln.patterns[p];
@@ -322,15 +323,17 @@ public:
                             } else {
                                 node_L[node_id].setOnes();
                             }
+                            node_log_scale[node_id] = 0.0;
                         } else {
-                            node_L[node_id].setOnes();
-                            for (int32_t child_id : node.children) {
-                                Vector child_msg = P_mix[m][child_id] * node_L[child_id];
-                                node_L[node_id] = node_L[node_id].cwiseProduct(child_msg);
-                            }
+                            double child_scale_sum = 0.0;
+                            tree.eval_internal_node(node_id, P_mix[m], node_L, node_log_scale, node_L[node_id], child_scale_sum);
+                            node_log_scale[node_id] = child_scale_sum;
                         }
                     }
                     Scalar cond_L = aln.codon_frequencies_f3x4.dot(node_L[tree.root_id]);
+                    if (cond_L > 0.0 && node_log_scale[tree.root_id] != 0.0) {
+                        cond_L *= std::exp(node_log_scale[tree.root_id]);
+                    }
                     pat_L += syn_weights[m] * cond_L;
                 }
 

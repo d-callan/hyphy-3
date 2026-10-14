@@ -613,6 +613,7 @@ public:
         #pragma omp parallel
         {
             std::vector<Vector> node_L(num_nodes, Vector::Zero(S));
+            std::vector<double> node_log_scale(num_nodes, 0.0);
 
             #pragma omp for reduction(+:total_lnl) schedule(dynamic)
             for (size_t p = 0; p < num_patterns; ++p) {
@@ -637,16 +638,19 @@ public:
                             } else {
                                 node_L[nid].setOnes();
                             }
+                            node_log_scale[nid] = 0.0;
                         } else {
-                            node_L[nid].setOnes();
-                            for (int32_t child_id : node.children) {
-                                node_L[nid].array() *= (P_branches[c][child_id] * node_L[child_id]).array();
-                            }
+                            double child_scale_sum = 0.0;
+                            t.eval_internal_node(nid, P_branches[c], node_L, node_log_scale, node_L[nid], child_scale_sum);
+                            node_log_scale[nid] = child_scale_sum;
                         }
                     }
 
                     Scalar class_L = eq_freqs.dot(node_L[t.root_id]);
                     if (class_L > 0.0) {
+                        if (node_log_scale[t.root_id] != 0.0) {
+                            class_L *= std::exp(node_log_scale[t.root_id]);
+                        }
                         pat_L += weights[c] * class_L;
                     }
                 }

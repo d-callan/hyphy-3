@@ -80,6 +80,7 @@ public:
         #pragma omp parallel
         {
             std::vector<Vector4> node_L(num_nodes);
+            std::vector<double> node_log_scale(num_nodes, 0.0);
             #pragma omp for reduction(+:total_log_l) schedule(dynamic)
             for (size_t p = 0; p < num_patterns; ++p) {
                 const auto& pattern = aln.patterns[p];
@@ -100,18 +101,17 @@ public:
                         } else {
                             node_L[node_id].setOnes();
                         }
+                        node_log_scale[node_id] = 0.0;
                     } else {
-                        node_L[node_id].setOnes();
-                        for (int32_t child_id : node.children) {
-                            Vector4 child_msg = P_branches[child_id] * node_L[child_id];
-                            node_L[node_id] = node_L[node_id].cwiseProduct(child_msg);
-                        }
+                        double child_scale_sum = 0.0;
+                        tree.eval_internal_node(node_id, P_branches, node_L, node_log_scale, node_L[node_id], child_scale_sum);
+                        node_log_scale[node_id] = child_scale_sum;
                     }
                 }
 
                 Scalar pattern_likelihood = gtr_model.pi.dot(node_L[tree.root_id]);
                 if (pattern_likelihood > 0.0) {
-                    total_log_l += pattern.weight * std::log(pattern_likelihood);
+                    total_log_l += pattern.weight * (std::log(pattern_likelihood) + node_log_scale[tree.root_id]);
                 } else {
                     total_log_l += pattern.weight * (-1e20);
                 }
@@ -194,12 +194,8 @@ public:
                         }
                         node_log_scale[node_id] = 0.0;
                     } else {
-                        node_L[node_id].setOnes();
                         double child_scale_sum = 0.0;
-                        for (int32_t child_id : node.children) {
-                            node_L[node_id].array() *= (P_branches[child_id] * node_L[child_id]).array();
-                            child_scale_sum += node_log_scale[child_id];
-                        }
+                        tree.eval_internal_node(node_id, P_branches, node_L, node_log_scale, node_L[node_id], child_scale_sum);
 
                         double max_val = node_L[node_id].maxCoeff();
                         int boost_count = 0;
@@ -272,13 +268,11 @@ public:
                 node_log_scale[nid] = 0.0;
                 B[nid] = 1.0;
             } else {
-                res.D[nid].setOnes();
                 double child_scale_sum = 0.0;
                 for (int32_t cid : node.children) {
                     P_D[cid] = P_branches[cid] * res.D[cid];
-                    res.D[nid].array() *= P_D[cid].array();
-                    child_scale_sum += node_log_scale[cid];
                 }
+                tree.eval_internal_node(nid, P_branches, res.D, node_log_scale, res.D[nid], child_scale_sum);
 
                 double max_val = res.D[nid].maxCoeff();
                 int boost_count = 0;

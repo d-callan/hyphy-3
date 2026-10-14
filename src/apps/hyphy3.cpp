@@ -18,6 +18,7 @@ int run_prime(int argc, char* argv[]);
 int run_gard(int argc, char* argv[]);
 int run_slac(int argc, char* argv[]);
 int run_dfel(int argc, char* argv[]);
+int run_ohmic(int argc, char* argv[]);
 
 void print_hyphy3_banner() {
     Panel::print_banner(
@@ -45,7 +46,8 @@ void print_hyphy3_usage(const char* prog) {
               << "  " << Console::brand("prime        ") << "  PRoperty Informed Models of Evolution (biophysical property selection)\n"
               << "  " << Console::brand("gard         ") << "  Genetic Algorithm for Recombination Detection (breakpoint screening)\n"
               << "  " << Console::brand("slac         ") << "  Single-Likelihood Ancestor Counting (counting site selection)\n"
-              << "  " << Console::brand("dfel         ") << "  Directional FEL (non-stationary selection & auto-rooting)\n\n";
+              << "  " << Console::brand("dfel         ") << "  Directional FEL (non-stationary selection & auto-rooting)\n"
+              << "  " << Console::brand("ohmic        ") << "  Ohmic Phylogenetic Networks & Wheatstone Pruning\n\n";
 
     std::cout << Console::bold("General Options:") << "\n"
               << "  " << Console::brand("--help, -h   ") << "  Show this help message\n"
@@ -54,6 +56,7 @@ void print_hyphy3_usage(const char* prog) {
     std::cout << Console::bold("Examples:") << "\n"
               << "  " << prog << " fel --alignment data/cd2.fna --tree data/cd2.nwk\n"
               << "  " << prog << " dfel --alignment tests/data/adh.nex --root auto\n"
+              << "  " << prog << " ohmic --alignment tests/data/cd2.fna\n"
               << "  " << prog << " meme --alignment tests/data/adh.nex --threads 8\n"
               << "  " << prog << " busted --alignment tests/data/adh.nex --auto-k --threads 8\n"
               << "  " << prog << " absrel --alignment tests/data/adh.nex --threads 8\n"
@@ -111,6 +114,8 @@ int main(int argc, char* argv[]) {
         return run_slac(sub_argc, sub_argv.data());
     } else if (cmd == "dfel" || cmd == "directional-fel" || cmd == "directional_fel") {
         return run_dfel(sub_argc, sub_argv.data());
+    } else if (cmd == "ohmic" || cmd == "OHMIC" || cmd == "--ohmic") {
+        return run_ohmic(sub_argc, sub_argv.data());
     } else {
         std::cerr << "Error: Unknown analysis '" << cmd << "'.\n\n";
         print_hyphy3_usage(argv[0]);

@@ -1,4 +1,5 @@
 #include "hyphy/analyses/directional_fel.hpp"
+#include "hyphy/core/ohmic_network.hpp"
 #include "hyphy/core/console.hpp"
 #include <iostream>
 #include <iomanip>
@@ -26,7 +27,10 @@ void print_dfel_usage(const char* prog) {
               << "  " << Console::brand("--alignment, -a  ") << "  Path to in-frame codon alignment (FASTA or NEXUS)\n\n";
 
     std::cout << Console::bold("Model & Rooting Options:") << "\n"
-              << "  " << Console::brand("--tree, -t       ") << "  Path to Newick phylogenetic tree (optional if embedded in NEXUS)\n"
+              << "  " << Console::brand("--tree, -t       ") << "  Path to Newick phylogenetic tree (optional; auto-inferred via Ohmic if omitted)\n"
+              << "  " << Console::brand("--ohmic, --omhic ") << "  Infer Ohmic network & Wheatstone bridges via HyphAeon 384D transformer\n"
+              << "  " << Console::brand("--no-hyphaeon    ") << "  Use empirical codon conductances instead of HyphAeon 384D transformer\n"
+              << "  " << Console::brand("--embeddings <f> ") << "  Path to precomputed [N x D] taxon embeddings TSV/CSV for Ohmic\n"
               << "  " << Console::brand("--root, -r       ") << "  Rooting strategy: 'auto' (ML auto-rooting, default), 'keep' (input root), or <taxon>\n"
               << "  " << Console::brand("--heterogeneity  ") << "  P-value threshold to trigger directional regimes (default: 0.05)\n"
               << "  " << Console::brand("--regimes, -k    ") << "  Compositional regimes: 'auto' (default: 3 if heterogeneous, 1 if homogeneous), 1, or 3\n"
@@ -83,6 +87,7 @@ int run_dfel(int argc, char* argv[]) {
     std::string code_name = "Universal";
     std::string root_strategy = "auto";
     std::string regimes_opt = "auto";
+    std::string embeddings_file;
     int num_threads = 0;
     Scalar pvalue_threshold = 0.1;
     Scalar het_threshold = 0.05;
@@ -90,6 +95,8 @@ int run_dfel(int argc, char* argv[]) {
     bool force_progress = false;
     bool full_model = true;
     bool all_sites = false;
+    bool use_ohmic = false;
+    bool use_hyphaeon = true;
     JSONFormat json_format = JSONFormat::ModernV3;
 
     for (int i = 1; i < argc; ++i) {
@@ -98,6 +105,15 @@ int run_dfel(int argc, char* argv[]) {
             alignment_file = argv[++i];
         } else if ((arg == "--tree" || arg == "-t") && i + 1 < argc) {
             tree_file = argv[++i];
+        } else if (arg == "--ohmic" || arg == "--omhic") {
+            use_ohmic = true;
+        } else if (arg == "--hyphaeon") {
+            use_hyphaeon = true;
+        } else if (arg == "--no-hyphaeon") {
+            use_hyphaeon = false;
+        } else if (arg == "--embeddings" && i + 1 < argc) {
+            embeddings_file = argv[++i];
+            use_ohmic = true;
         } else if ((arg == "--code" || arg == "-c") && i + 1 < argc) {
             code_name = argv[++i];
         } else if ((arg == "--root" || arg == "-r") && i + 1 < argc) {
@@ -174,28 +190,13 @@ int run_dfel(int argc, char* argv[]) {
         return 1;
     }
 
-    // 2. Load Tree
+    // 2. Load or Infer Tree (supports --ohmic / --omhic and tree-free FASTA alignments)
     Tree tree;
     std::string tree_source;
-    if (!tree_file.empty()) {
-        try {
-            tree = Tree::from_newick_file(tree_file);
-            tree_source = tree_file;
-        } catch (const std::exception& e) {
-            std::cerr << Console::danger("Error loading tree: ") << e.what() << "\n";
-            return 1;
-        }
-    } else if (!aln.embedded_tree_newick.empty()) {
-        try {
-            tree = Tree::from_newick(aln.embedded_tree_newick);
-            tree_source = "embedded in NEXUS";
-        } catch (const std::exception& e) {
-            std::cerr << Console::danger("Error parsing embedded tree: ") << e.what() << "\n";
-            return 1;
-        }
-    } else {
-        std::cerr << Console::danger("Error: No tree provided via --tree and no embedded tree found in alignment.\n\n");
-        print_dfel_usage(argv[0]);
+    try {
+        tree = OhmicNetwork::resolve_tree(aln, tree_file, use_ohmic, use_hyphaeon, embeddings_file, &tree_source);
+    } catch (const std::exception& e) {
+        std::cerr << Console::danger("Error resolving phylogeny: ") << e.what() << "\n";
         return 1;
     }
 

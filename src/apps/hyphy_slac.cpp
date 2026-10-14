@@ -2,6 +2,7 @@
 #include "hyphy/core/genetic_code.hpp"
 #include "hyphy/core/alignment.hpp"
 #include "hyphy/core/tree.hpp"
+#include "hyphy/core/ohmic_network.hpp"
 #include "hyphy/core/rate_matrix.hpp"
 #include "hyphy/core/likelihood.hpp"
 #include "hyphy/core/console.hpp"
@@ -40,7 +41,10 @@ static void print_usage(const char* prog) {
               << Console::bold("Required arguments:") << "\n"
               << "  " << Console::brand("--alignment") << " <file>   Path to codon alignment (FASTA or NEXUS)\n\n"
               << Console::bold("Optional arguments:") << "\n"
-              << "  " << Console::brand("--tree") << " <file>        Path to Newick tree file (optional if embedded in NEXUS)\n"
+              << "  " << Console::brand("--tree") << " <file>        Path to Newick tree file (optional; auto-inferred via Ohmic if omitted)\n"
+              << "  " << Console::brand("--ohmic, --omhic") << "     Infer Ohmic network & Wheatstone bridges via HyphAeon 384D transformer\n"
+              << "  " << Console::brand("--no-hyphaeon") << "        Use empirical codon conductances instead of HyphAeon 384D transformer\n"
+              << "  " << Console::brand("--embeddings") << " <file>  Path to precomputed [N x D] taxon embeddings TSV/CSV for Ohmic\n"
               << "  " << Console::brand("--code") << " <name>        Genetic code (default: Universal; e.g. Vertebrate-mtDNA)\n"
               << "  " << Console::brand("--branches") << " <set>     Branches to test: 'All' (default), 'Internal', 'Leaves', 'Unlabeled', tag name, or comma-separated names\n"
               << "  " << Console::brand("--branch-regex") << " <reg> Regular expression to match branch names to test\n"
@@ -70,6 +74,7 @@ int run_slac(int argc, char* argv[]) {
     std::string code_name = "Universal";
     std::string test_branches = "All";
     std::string test_branch_regex = "";
+    std::string embeddings_file;
     int num_threads = 0;
     size_t samples = 100;
     Scalar pvalue_threshold = 0.1;
@@ -77,6 +82,8 @@ int run_slac(int argc, char* argv[]) {
     bool force_progress = false;
     bool full_model = true;
     bool all_sites = false;
+    bool use_ohmic = false;
+    bool use_hyphaeon = true;
     JSONFormat json_format = JSONFormat::ModernV3;
 
     for (int i = 1; i < argc; ++i) {
@@ -85,6 +92,15 @@ int run_slac(int argc, char* argv[]) {
             alignment_file = argv[++i];
         } else if (arg == "--tree" && i + 1 < argc) {
             tree_file = argv[++i];
+        } else if (arg == "--ohmic" || arg == "--omhic") {
+            use_ohmic = true;
+        } else if (arg == "--hyphaeon") {
+            use_hyphaeon = true;
+        } else if (arg == "--no-hyphaeon") {
+            use_hyphaeon = false;
+        } else if (arg == "--embeddings" && i + 1 < argc) {
+            embeddings_file = argv[++i];
+            use_ohmic = true;
         } else if (arg == "--code" && i + 1 < argc) {
             code_name = argv[++i];
         } else if ((arg == "--branches" || arg == "--test-branches") && i + 1 < argc) {
@@ -157,19 +173,12 @@ int run_slac(int argc, char* argv[]) {
     }
 
     Tree tree;
-    if (!tree_file.empty()) {
-        std::cout << Console::bold("Loading phylogeny:") << " " << tree_file << "\n";
-        try {
-            tree = Tree::from_newick_file(tree_file);
-        } catch (const std::exception& e) {
-            std::cerr << "Error loading tree: " << e.what() << "\n";
-            return 1;
-        }
-    } else if (!aln.embedded_tree_newick.empty()) {
-        std::cout << Console::bold("Using embedded phylogeny from NEXUS file\n");
-        tree = Tree::from_newick(aln.embedded_tree_newick);
-    } else {
-        std::cerr << "Error: No tree specified and no tree embedded in NEXUS file.\n";
+    std::string tree_source;
+    try {
+        tree = OhmicNetwork::resolve_tree(aln, tree_file, use_ohmic, use_hyphaeon, embeddings_file, &tree_source);
+        std::cout << Console::bold("Phylogeny:") << " " << tree_source << "\n";
+    } catch (const std::exception& e) {
+        std::cerr << "Error resolving tree: " << e.what() << "\n";
         return 1;
     }
 

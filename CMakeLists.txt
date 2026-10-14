@@ -108,8 +108,12 @@ add_executable(hyphy_dfel_test tests/test_dfel.cpp)
 target_link_libraries(hyphy_dfel_test PRIVATE hyphy3_core)
 add_test(NAME DirectionalFELTest COMMAND hyphy_dfel_test)
 
+add_executable(hyphy_ohmic_test tests/test_ohmic.cpp)
+target_link_libraries(hyphy_ohmic_test PRIVATE hyphy3_core)
+add_test(NAME OhmicTest COMMAND hyphy_ohmic_test)
 
-# Unified HyPhy 3 CLI Driver (hyphy3 fel ..., hyphy3 meme ..., hyphy3 busted ..., hyphy3 absrel ..., hyphy3 relax ..., hyphy3 fubar ..., hyphy3 prime ..., hyphy3 gard ..., hyphy3 slac ..., hyphy3 dfel ...)
+
+# Unified HyPhy 3 CLI Driver (hyphy3 fel ..., hyphy3 meme ..., hyphy3 busted ..., hyphy3 absrel ..., hyphy3 relax ..., hyphy3 fubar ..., hyphy3 prime ..., hyphy3 gard ..., hyphy3 slac ..., hyphy3 dfel ..., hyphy3 ohmic ...)
 add_executable(hyphy3
     src/apps/hyphy3.cpp
     src/apps/hyphy_fel.cpp
@@ -123,6 +127,7 @@ add_executable(hyphy3
     src/apps/hyphy_gard.cpp
     src/apps/hyphy_slac.cpp
     src/apps/hyphy_dfel.cpp
+    src/apps/hyphy_ohmic.cpp
 )
 target_compile_definitions(hyphy3 PRIVATE HYPHY3_COMBINED_DRIVER)
 target_link_libraries(hyphy3 PRIVATE hyphy3_core)
@@ -161,6 +166,9 @@ target_link_libraries(hyphy3-slac PRIVATE hyphy3_core)
 add_executable(hyphy3-dfel src/apps/hyphy_dfel.cpp)
 target_link_libraries(hyphy3-dfel PRIVATE hyphy3_core)
 
+add_executable(hyphy3-ohmic src/apps/hyphy_ohmic.cpp)
+target_link_libraries(hyphy3-ohmic PRIVATE hyphy3_core)
+
 # Backward-compatible aliases
 add_executable(hyphy-fel ALIAS hyphy3-fel)
 add_executable(hyphy-contrast-fel ALIAS hyphy3-contrast-fel)
@@ -173,6 +181,7 @@ add_executable(hyphy-prime ALIAS hyphy3-prime)
 add_executable(hyphy-gard ALIAS hyphy3-gard)
 add_executable(hyphy-slac ALIAS hyphy3-slac)
 add_executable(hyphy-dfel ALIAS hyphy3-dfel)
+add_executable(hyphy-ohmic ALIAS hyphy3-ohmic)
 
 # Python & nanobind bindings
 find_package(Python 3.8 COMPONENTS Interpreter Development.Module)

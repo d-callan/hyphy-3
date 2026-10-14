@@ -191,6 +191,7 @@ public:
                 node.branch_length *= conv;
             }
         }
+        codon_tree.scale_bridge_lengths(conv);
 
         if (settings.tree_scaling == "mg94") {
             if (progress_cb) progress_cb("Phase 1b: Refining Tree Scale under MG94", 0.15);
@@ -1234,12 +1235,8 @@ private:
                 }
                 node_log_scale[node_id] = 0.0;
             } else {
-                node_L[node_id].setOnes();
                 double child_scale_sum = 0.0;
-                for (int32_t child_id : node.children) {
-                    node_L[node_id].array() *= (P_branches[child_id] * node_L[child_id]).array();
-                    child_scale_sum += node_log_scale[child_id];
-                }
+                tree.eval_internal_node(node_id, P_branches, node_L, node_log_scale, node_L[node_id], child_scale_sum);
 
                 double max_val = node_L[node_id].maxCoeff();
                 int boost_count = 0;

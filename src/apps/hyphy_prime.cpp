@@ -2,6 +2,7 @@
 #include "hyphy/core/genetic_code.hpp"
 #include "hyphy/core/alignment.hpp"
 #include "hyphy/core/tree.hpp"
+#include "hyphy/core/ohmic_network.hpp"
 #include "hyphy/core/rate_matrix.hpp"
 #include "hyphy/core/likelihood.hpp"
 #include "hyphy/core/console.hpp"
@@ -39,7 +40,10 @@ static void print_prime_usage(const char* prog) {
               << Console::bold("Required arguments:") << "\n"
               << "  " << Console::brand("--alignment") << " <file>       Path to codon alignment (FASTA or NEXUS)\n\n"
               << Console::bold("Optional arguments:") << "\n"
-              << "  " << Console::brand("--tree") << " <file>            Path to Newick tree file (optional if embedded in NEXUS)\n"
+              << "  " << Console::brand("--tree") << " <file>            Path to Newick tree file (optional; auto-inferred via Ohmic if omitted)\n"
+              << "  " << Console::brand("--ohmic, --omhic") << "         Infer Ohmic network & Wheatstone bridges via HyphAeon 384D transformer\n"
+              << "  " << Console::brand("--no-hyphaeon") << "            Use empirical codon conductances instead of HyphAeon 384D transformer\n"
+              << "  " << Console::brand("--embeddings") << " <file>      Path to precomputed [N x D] taxon embeddings TSV/CSV for Ohmic\n"
               << "  " << Console::brand("--code") << " <name>            Genetic code (default: Universal; e.g. Vertebrate-mtDNA)\n"
               << "  " << Console::brand("--property-set") << " <set>     Property set: 5PROP (default), Atchley, 3PROP, 4PROP, 2PROP\n"
               << "  " << Console::brand("--property-file") << " <file>   Custom amino acid properties JSON file\n"
@@ -69,6 +73,7 @@ int run_prime(int argc, char* argv[]) {
     std::string property_file = "";
     std::string branch_spec = "All";
     std::string output_format = "modern";
+    std::string embeddings_file;
     int num_threads = 0;
     Scalar pvalue_threshold = 0.10;
     Scalar stage2_pvalue = 0.10;
@@ -76,6 +81,8 @@ int run_prime(int argc, char* argv[]) {
     bool show_progress = ProgressBar::is_terminal();
     bool force_progress = false;
     bool all_sites = false;
+    bool use_ohmic = false;
+    bool use_hyphaeon = true;
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -83,6 +90,15 @@ int run_prime(int argc, char* argv[]) {
             alignment_file = argv[++i];
         } else if (arg == "--tree" && i + 1 < argc) {
             tree_file = argv[++i];
+        } else if (arg == "--ohmic" || arg == "--omhic") {
+            use_ohmic = true;
+        } else if (arg == "--hyphaeon") {
+            use_hyphaeon = true;
+        } else if (arg == "--no-hyphaeon") {
+            use_hyphaeon = false;
+        } else if (arg == "--embeddings" && i + 1 < argc) {
+            embeddings_file = argv[++i];
+            use_ohmic = true;
         } else if (arg == "--code" && i + 1 < argc) {
             code_name = argv[++i];
         } else if (arg == "--property-set" && i + 1 < argc) {
@@ -167,18 +183,12 @@ int run_prime(int argc, char* argv[]) {
     }
 
     Tree tree;
+    std::string tree_source;
     try {
-        if (!tree_file.empty()) {
-            tree = Tree::from_newick_file(tree_file);
-        } else if (!aln.embedded_tree_newick.empty()) {
-            tree = Tree::from_newick(aln.embedded_tree_newick);
-            std::cout << "  " << Console::muted("Using tree embedded in NEXUS file.\n");
-        } else {
-            std::cerr << Console::danger("Error: No tree file specified and no tree embedded in NEXUS.\n");
-            return 1;
-        }
+        tree = OhmicNetwork::resolve_tree(aln, tree_file, use_ohmic, use_hyphaeon, embeddings_file, &tree_source);
+        std::cout << "  " << Console::muted("Tree source    : ") << Console::bold(tree_source) << "\n";
     } catch (const std::exception& e) {
-        std::cerr << Console::danger("Error reading tree: ") << e.what() << "\n";
+        std::cerr << Console::danger("Error resolving phylogeny: ") << e.what() << "\n";
         return 1;
     }
 

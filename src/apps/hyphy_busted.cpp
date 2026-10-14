@@ -2,6 +2,7 @@
 #include "hyphy/core/genetic_code.hpp"
 #include "hyphy/core/alignment.hpp"
 #include "hyphy/core/tree.hpp"
+#include "hyphy/core/ohmic_network.hpp"
 #include "hyphy/core/rate_matrix.hpp"
 #include "hyphy/core/likelihood.hpp"
 #include "hyphy/core/console.hpp"
@@ -37,7 +38,11 @@ static void print_usage(const char* prog) {
               << Console::bold("Required arguments:") << "\n"
               << "  " << Console::brand("--alignment") << " <file>   Path to codon alignment (FASTA or NEXUS)\n\n"
               << Console::bold("Optional arguments:") << "\n"
-              << "  " << Console::brand("--tree") << " <file>        Path to Newick tree file (optional if embedded in NEXUS)\n"
+              << "  " << Console::brand("--tree") << " <file>        Path to Newick tree file (optional; auto-infers Ohmic Network if omitted)\n"
+              << "  " << Console::brand("--ohmic") << "              Build Ohmic Phylogenetic Network with Wheatstone bridges (+ 384D HyphAeon)\n"
+              << "  " << Console::brand("--hyphaeon") << "           Enable 384D HyphAeon (192D dS + 192D dN) transformer embeddings\n"
+              << "  " << Console::brand("--no-hyphaeon") << "        Disable live HyphAeon transformer (use empirical codon conductances)\n"
+              << "  " << Console::brand("--embeddings") << " <file>  Path to precomputed [N x 384] HyphAeon embeddings (.bin/.csv/.tsv)\n"
               << "  " << Console::brand("--code") << " <name>        Genetic code (default: Universal)\n"
               << "  " << Console::brand("--auto") << "                Full-Auto BUSTED: 4-gate surprisal & score selector for SRV, MH, Error Sink & K\n"
               << "  " << Console::brand("--rates") << " <N>          Number of omega rate categories (default: 3)\n"
@@ -56,6 +61,7 @@ static void print_usage(const char* prog) {
               << "  " << Console::brand("--help, -h") << "           Show this help message\n\n"
               << Console::bold("Examples:") << "\n"
               << "  " << prog << " --alignment data/cd2.fna --tree data/cd2.nwk --auto\n"
+              << "  " << prog << " --alignment data/cd2.fna --ohmic --auto\n"
               << "  " << prog << " --alignment tests/data/adh.nex --auto --threads 8\n\n";
 }
 
@@ -64,6 +70,9 @@ int run_busted(int argc, char* argv[]) {
     std::string tree_file;
     std::string output_file;
     std::string code_name = "Universal";
+    std::string embeddings_file = "";
+    bool force_ohmic = false;
+    bool use_hyphaeon = true;
     int num_threads = 0;
     JSONFormat json_format = JSONFormat::ModernV3;
     BUSTEDSettings settings;
@@ -76,6 +85,16 @@ int run_busted(int argc, char* argv[]) {
             alignment_file = argv[++i];
         } else if (arg == "--tree" && i + 1 < argc) {
             tree_file = argv[++i];
+        } else if (arg == "--ohmic" || arg == "--omhic") {
+            force_ohmic = true;
+        } else if (arg == "--hyphaeon") {
+            force_ohmic = true;
+            use_hyphaeon = true;
+        } else if (arg == "--no-hyphaeon") {
+            use_hyphaeon = false;
+        } else if (arg == "--embeddings" && i + 1 < argc) {
+            force_ohmic = true;
+            embeddings_file = argv[++i];
         } else if (arg == "--code" && i + 1 < argc) {
             code_name = argv[++i];
         } else if (arg == "--auto" || arg == "--full-auto") {
@@ -176,24 +195,14 @@ int run_busted(int argc, char* argv[]) {
         return 1;
     }
 
-    // 3. Load Tree
+    // 3. Resolve Tree or Ohmic Phylogenetic Network
     Tree tree;
-    if (!tree_file.empty()) {
-        try {
-            tree = Tree::from_newick_file(tree_file);
-        } catch (const std::exception& e) {
-            std::cerr << Console::danger("Error loading tree: ") << e.what() << "\n";
-            return 1;
-        }
-    } else if (!aln.embedded_tree_newick.empty()) {
-        try {
-            tree = Tree::from_newick(aln.embedded_tree_newick);
-        } catch (const std::exception& e) {
-            std::cerr << Console::danger("Error parsing embedded tree: ") << e.what() << "\n";
-            return 1;
-        }
-    } else {
-        std::cerr << Console::danger("Error: No tree specified and no embedded tree found in alignment.\n");
+    OhmicNetwork ohmic_net;
+    std::string tree_source;
+    try {
+        tree = OhmicNetwork::resolve_tree(aln, tree_file, force_ohmic, use_hyphaeon, embeddings_file, &ohmic_net, &tree_source);
+    } catch (const std::exception& e) {
+        std::cerr << Console::danger("Error resolving tree/network: ") << e.what() << "\n";
         return 1;
     }
 
@@ -202,7 +211,7 @@ int run_busted(int argc, char* argv[]) {
         {"Sequences / Taxa", std::to_string(aln.num_taxa)},
         {"Codon Sites", std::to_string(aln.num_codons) + " (" + std::to_string(aln.num_codons * 3) + " nt)"},
         {"Unique Patterns", std::to_string(aln.patterns.size())},
-        {"Tree", std::to_string(tree.num_nodes()) + " nodes (" + std::to_string(tree.num_leaves()) + " leaves)"},
+        {"Tree Source", tree_source + " (" + std::to_string(tree.num_nodes()) + " nodes, " + std::to_string(tree.num_leaves()) + " leaves)"},
         {"Model Selection Mode", settings.full_auto ? "Full-Auto (4-Gate Surprisal & Score Screen)" : "Manual / Fixed"},
         {"Rate Classes (K)", settings.full_auto ? "Auto (2..3)" : (std::to_string(settings.num_rate_classes) + (settings.auto_select_k ? " (Auto-K enabled)" : ""))},
         {"Synonymous Variation", settings.full_auto ? "Auto" : (settings.srv ? "Enabled (" + std::to_string(settings.num_syn_rate_classes) + " classes)" : "Disabled")},

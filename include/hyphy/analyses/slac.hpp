@@ -1340,6 +1340,7 @@ public:
             if (node_id == static_cast<size_t>(tree.root_id)) continue;
             const auto& node = tree.nodes[node_id];
             int32_t parent_id = node.parent_id;
+            if (parent_id < 0) continue;
             bool is_tested = is_test_branch[node_id];
             int t_idx = node_to_tested_idx[node_id];
             Scalar bl = node.branch_length;
@@ -1782,6 +1783,7 @@ public:
                         if (node_id == static_cast<size_t>(tree.root_id) || !is_test_branch[node_id]) continue;
                         const auto& node = tree.nodes[node_id];
                         int32_t parent_id = node.parent_id;
+                        if (parent_id < 0) continue;
                         Scalar bl = node.branch_length;
                         Scalar rel_bl = bl / total_tested_length;
 

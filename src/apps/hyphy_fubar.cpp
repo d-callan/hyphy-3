@@ -2,6 +2,7 @@
 #include "hyphy/core/genetic_code.hpp"
 #include "hyphy/core/alignment.hpp"
 #include "hyphy/core/tree.hpp"
+#include "hyphy/core/ohmic_network.hpp"
 #include "hyphy/core/rate_matrix.hpp"
 #include "hyphy/core/likelihood.hpp"
 #include "hyphy/core/console.hpp"
@@ -38,7 +39,10 @@ static void print_usage(const char* prog) {
               << Console::bold("Required arguments:") << "\n"
               << "  " << Console::brand("--alignment, -a") << " <file>   Path to codon alignment (FASTA or NEXUS)\n\n"
               << Console::bold("Optional arguments:") << "\n"
-              << "  " << Console::brand("--tree, -t") << " <file>        Path to Newick tree file (optional if embedded in NEXUS)\n"
+              << "  " << Console::brand("--tree, -t") << " <file>        Path to Newick tree file (optional; auto-inferred via Ohmic if omitted)\n"
+              << "  " << Console::brand("--ohmic, --omhic") << "         Infer Ohmic network & Wheatstone bridges via HyphAeon 384D transformer\n"
+              << "  " << Console::brand("--no-hyphaeon") << "            Use empirical codon conductances instead of HyphAeon 384D transformer\n"
+              << "  " << Console::brand("--embeddings") << " <file>      Path to precomputed [N x D] taxon embeddings TSV/CSV for Ohmic\n"
               << "  " << Console::brand("--code") << " <name>            Genetic code (default: Universal; e.g. Vertebrate-mtDNA)\n"
               << "  " << Console::brand("--grid, -g") << " <N>           Number of grid points per dimension (default: 20; total D^2 = 400)\n"
               << "  " << Console::brand("--method, -m") << " <name>      Inference method: 'Variational-Bayes' (default), 'Collapsed-Gibbs', or 'Metropolis-Hastings'\n"
@@ -67,12 +71,15 @@ int run_fubar(int argc, char* argv[]) {
     std::string tree_file;
     std::string output_file;
     std::string code_name = "Universal";
+    std::string embeddings_file;
     int num_threads = 0;
     
     FUBARSettings settings;
     std::string json_format = "modern";
     bool show_progress = ProgressBar::is_terminal();
     bool all_sites = false;
+    bool use_ohmic = false;
+    bool use_hyphaeon = true;
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -80,6 +87,15 @@ int run_fubar(int argc, char* argv[]) {
             alignment_file = argv[++i];
         } else if ((arg == "--tree" || arg == "-t") && i + 1 < argc) {
             tree_file = argv[++i];
+        } else if (arg == "--ohmic" || arg == "--omhic") {
+            use_ohmic = true;
+        } else if (arg == "--hyphaeon") {
+            use_hyphaeon = true;
+        } else if (arg == "--no-hyphaeon") {
+            use_hyphaeon = false;
+        } else if (arg == "--embeddings" && i + 1 < argc) {
+            embeddings_file = argv[++i];
+            use_ohmic = true;
         } else if (arg == "--code" && i + 1 < argc) {
             code_name = argv[++i];
         } else if ((arg == "--grid" || arg == "-g") && i + 1 < argc) {
@@ -159,25 +175,10 @@ int run_fubar(int argc, char* argv[]) {
 
     Tree tree;
     std::string tree_source;
-    if (!tree_file.empty()) {
-        try {
-            tree = Tree::from_newick_file(tree_file);
-            tree_source = tree_file;
-        } catch (const std::exception& e) {
-            std::cerr << Console::danger("Error loading tree: ") << e.what() << "\n";
-            return 1;
-        }
-    } else if (!aln.embedded_tree_newick.empty()) {
-        try {
-            tree = Tree::from_newick(aln.embedded_tree_newick);
-            tree_source = "embedded in NEXUS";
-        } catch (const std::exception& e) {
-            std::cerr << Console::danger("Error parsing embedded tree: ") << e.what() << "\n";
-            return 1;
-        }
-    } else {
-        std::cerr << Console::danger("Error: No tree provided via --tree and no embedded tree found in alignment.\n\n");
-        print_usage(argv[0]);
+    try {
+        tree = OhmicNetwork::resolve_tree(aln, tree_file, use_ohmic, use_hyphaeon, embeddings_file, &tree_source);
+    } catch (const std::exception& e) {
+        std::cerr << Console::danger("Error resolving phylogeny: ") << e.what() << "\n";
         return 1;
     }
 
