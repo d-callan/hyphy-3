@@ -159,9 +159,7 @@ struct ABSRELResult {
         // Tested map
         nlohmann::json tested_map = nlohmann::json::object();
         for (const auto& [name, bres] : branches) {
-            if (bres.is_tested) {
-                tested_map[name] = "test";
-            }
+            tested_map[name] = bres.is_tested ? "test" : "background";
         }
         j["tested"] = {{"0", tested_map}};
 
@@ -435,11 +433,16 @@ public:
     // Scale factors for Q matrices
     Scalar syn_scale_factor = 1.0;
 
+    std::vector<bool> is_test_branch;
+
     ABSRELAnalyzer(Tree t, Alignment a, ABSRELSettings s = ABSRELSettings{})
         : tree(std::move(t)), aln(std::move(a)), settings(s) {
         gcode = aln.code ? aln.code.get() : GeneticCode::universal().get();
         pos_nuc_freqs = aln.pos_nuc_frequencies;
         codon_freqs = aln.codon_frequencies_f3x4;
+
+        auto sel = tree.select_branches(settings.test_branches, "", {}, false);
+        is_test_branch = std::move(sel.is_selected);
 
         size_t num_nodes = tree.num_nodes();
         leaf_to_taxon.assign(num_nodes, static_cast<size_t>(-1));
@@ -1300,9 +1303,7 @@ public:
         std::vector<std::string> to_test;
         for (const auto& node : tree.nodes) {
             if (node.id == tree.root_id) continue;
-            bool test_this = true;
-            if (settings.test_branches == "Internal" && node.is_leaf) test_this = false;
-            if (settings.test_branches == "Leaves" && !node.is_leaf) test_this = false;
+            bool test_this = (static_cast<size_t>(node.id) < is_test_branch.size()) ? is_test_branch[node.id] : true;
             if (test_this) {
                 to_test.push_back(node.name);
             } else {

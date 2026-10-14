@@ -96,9 +96,13 @@ print(f"Detected {sum(1 for r in results if r.p_value <= 0.1)} sites under selec
 Inspect selection profiles, branch rate partitions, and site evidence plots in an interactive, publication-ready dashboard:
 
 ```bash
-# Generate standalone self-contained HTML report from any HyPhy 3 JSON
-python3 viz/fel-viewer/build_standalone_html.py results.dFEL.json report.html
-open report.html
+# Write a self-contained HTML report alongside the JSON (FEL and MEME)
+hyphy3 fel --alignment data.nex --output results.FEL.json --html results.FEL.html
+
+# ...or create one later from an existing result file (hyphy3 or legacy HyPhy 2.5 / Datamonkey JSON)
+hyphy3 report results.MEME.json --html results.MEME.html
+
+open results.FEL.html    # or double-click it; works offline, straight from disk
 ```
 
 ---
@@ -779,14 +783,22 @@ HyPhy 3 features a modern, interactive visualization engine designed according t
     - Branch attribution with Empirical Bayes Factor (EBF) rankings (MEME).
     - Bivariate posterior mass distribution across the 20 × 20 rate grid (FUBAR).
 
-### 2. Standalone Single-File HTML Reports (`build_standalone_html.py`)
+### 2. Standalone Single-File HTML Reports (`hyphy3 --html`, `hyphy3 report`)
 
-HyPhy 3 includes a standalone bundler that produces **100% self-contained, single-file HTML reports**:
+The viewer is compiled into the `hyphy3` binary, so reports need nothing beyond `hyphy3` itself: no Node, Python, or files shipped alongside the binary. Each report is **one self-contained HTML file**:
 
 ```bash
-# Generate a self-contained interactive report from any HyPhy 3 JSON output
-python3 viz/fel-viewer/build_standalone_html.py results.FEL.json results.html
+# As part of an analysis run
+hyphy3 meme --alignment data.nex --output results.MEME.json --html results.MEME.html
+
+# From an existing result file (hyphy3 v3 or legacy HyPhy 2.5 / Datamonkey JSON)
+hyphy3 report results.FEL.json --html results.FEL.html
 ```
+
+Reports are currently available for **FEL** and **MEME**; other analyses are refused with a clear message until their viewers are added.
+
+- **How the viewer gets embedded**: at build time, `cmake/EmbedViewer.cmake` bundles the ES modules under `viz/fel-viewer/src` (following their imports from `index.js`) together with the stylesheet into a generated header. Editing the viewer and re-running the build is all that's needed.
+- **Developing the viewer**: the sources are plain browser ES modules with no build step. Serve `viz/fel-viewer/` with any static file server and open `index.html`.
 
 - **Zero Network Dependencies**: Inlines the complete JavaScript runtime, CSS styling, and JSON dataset directly into the HTML document.
 - **Universal Portability**: Double-click to open in Safari, Chrome, Firefox, or Edge. Works directly via `file://` URLs, in air-gapped laboratory environments, HPC clusters, and email attachments.
@@ -819,8 +831,9 @@ hyphy-3/
 │   └── python/                 # Nanobind C++ Python bridge (bindings.cpp)
 ├── python/
 │   └── hyphy3/                 # Pure Python high-level API & wrappers
-├── viz/                        # Interactive browser visualizers & standalone HTML generator
-│   └── fel-viewer/             # Braun-inspired synchronized Tree/Alignment/Overview viewer
+├── viz/                        # Interactive browser visualizers (embedded into hyphy3 for HTML reports)
+│   └── fel-viewer/             # Braun-inspired FEL / MEME results viewer (plain ES modules)
+├── cmake/                      # Build helpers (EmbedViewer.cmake bundles the viewer into the binary)
 ├── mac/                        # Native macOS applications
 │   └── HyPhyStudio/            # Swift 6 / SwiftUI macOS desktop studio
 ├── examples/

@@ -36,6 +36,7 @@ struct OhmicBridgeSummary {
     std::string hub_name;
     std::string bridge_name;
     std::array<std::string, 3> child_names;
+    std::array<std::vector<std::string>, 4> quartet_clades; // [A, B, C, D] leaf taxon names
     std::array<Scalar, 3> initial_weights{1.0, 0.0, 0.0};
     std::array<Scalar, 3> fitted_weights{1.0, 0.0, 0.0};
     std::array<Scalar, 3> fitted_branch_lengths{0.01, 0.01, 0.01};
@@ -46,6 +47,7 @@ struct OhmicBridgeSummary {
 struct OhmicResult {
     OhmicAnalysisSettings settings;
     OhmicNetwork network;
+    std::vector<std::string> taxon_names;
     size_t num_taxa = 0;
     size_t num_sites = 0;
     size_t num_patterns = 0;
@@ -64,6 +66,9 @@ struct OhmicResult {
     GTRParameters gtr_params;
     MG94Parameters mg94_params;
     std::vector<OhmicBridgeSummary> bridge_summaries;
+    std::vector<Scalar> site_single_tree_log_l;
+    std::vector<Scalar> site_ohmic_log_l;
+    std::vector<Scalar> site_delta_log_l;
     double runtime_seconds = 0.0;
 
     nlohmann::json to_modern_json(const std::string& filepath = "") const {
@@ -80,21 +85,44 @@ struct OhmicResult {
         };
         j["dataset"] = {
             {"file", filepath.empty() ? settings.input_file : filepath},
+            {"datatype", settings.use_codon_model ? "codon" : "nucleotide"},
             {"taxa_count", static_cast<int>(num_taxa)},
             {"sites_count", static_cast<int>(num_sites)},
             {"patterns_count", static_cast<int>(num_patterns)},
-            {"super_nodes_count", static_cast<int>(num_super_nodes)}
+            {"super_nodes_count", static_cast<int>(num_super_nodes)},
+            {"taxa", taxon_names}
         };
         std::string mode_str = (network.active_mode == OhmicScaleMode::ExactDense)
             ? "ExactDense" : "ScalableWoodbury";
         j["electrical_network"] = {
             {"scale_mode", mode_str},
+            {"used_hyphaeon_embeddings", network.used_hyphaeon_embeddings},
+            {"embedding_dim", network.used_hyphaeon_embeddings ? static_cast<int>(network.hyphaeon_embeddings.cols()) : 0},
             {"foster_sum", foster_sum},
             {"num_bridges", static_cast<int>(num_bridges)},
             {"num_collapsed_polytomies", static_cast<int>(num_collapsed_polytomies)},
             {"backbone_tree", network.backbone_tree.to_newick(true)},
             {"collapsed_tree", network.collapsed_tree.to_newick(true)}
         };
+
+        // Export pairwise matrices in ExactDense mode for interactive visualization (when N <= 128)
+        if (network.P_edge.rows() > 0 && network.P_edge.rows() <= 128) {
+            auto mat_to_json = [](const Matrix& m) {
+                nlohmann::json rows = nlohmann::json::array();
+                for (Eigen::Index r = 0; r < m.rows(); ++r) {
+                    nlohmann::json row = nlohmann::json::array();
+                    for (Eigen::Index c = 0; c < m.cols(); ++c) {
+                        row.push_back(m(r, c));
+                    }
+                    rows.push_back(std::move(row));
+                }
+                return rows;
+            };
+            j["electrical_network"]["pairwise_foster_probabilities"] = mat_to_json(network.P_edge);
+            j["electrical_network"]["pairwise_effective_resistances"] = mat_to_json(network.Omega);
+            j["electrical_network"]["pairwise_tn93_distances"] = mat_to_json(network.D_tn93);
+        }
+
         j["fits"] = {
             {"single_tree", {
                 {"log_likelihood", single_tree_log_l},
@@ -107,6 +135,9 @@ struct OhmicResult {
                 {"delta_aicc", delta_aicc}
             }}
         };
+        if (settings.use_codon_model) {
+            j["fits"]["omega"] = mg94_params.beta;
+        }
         nlohmann::json bridges_arr = nlohmann::json::array();
         for (const auto& b : bridge_summaries) {
             bridges_arr.push_back({
@@ -114,6 +145,7 @@ struct OhmicResult {
                 {"hub_node", b.hub_name},
                 {"bridge_node", b.bridge_name},
                 {"children", {b.child_names[0], b.child_names[1], b.child_names[2]}},
+                {"quartet_clades", {b.quartet_clades[0], b.quartet_clades[1], b.quartet_clades[2], b.quartet_clades[3]}},
                 {"ohmic_support", b.ohmic_support},
                 {"shunt_stress", b.shunt_stress},
                 {"initial_weights", {b.initial_weights[0], b.initial_weights[1], b.initial_weights[2]}},
@@ -122,6 +154,13 @@ struct OhmicResult {
             });
         }
         j["wheatstone_bridges"] = bridges_arr;
+        if (!site_delta_log_l.empty()) {
+            j["site_results"] = {
+                {"delta_log_l", site_delta_log_l},
+                {"single_tree_log_l", site_single_tree_log_l},
+                {"ohmic_log_l", site_ohmic_log_l}
+            };
+        }
         j["timers"] = {
             {"total_seconds", runtime_seconds}
         };
@@ -152,6 +191,7 @@ public:
 
         OhmicResult result;
         result.settings = settings;
+        result.taxon_names = aln.taxon_names;
         result.num_taxa = aln.num_taxa;
         result.num_sites = settings.use_codon_model ? aln.num_codons : aln.num_nucleotides;
         if (result.num_sites == 0) {
@@ -166,6 +206,24 @@ public:
         result.num_collapsed_polytomies = result.network.num_collapsed_polytomies;
         result.foster_sum = result.network.foster_sum;
 
+        // Helper to collect leaf taxon names descending from a subtree root in collapsed_tree
+        auto collect_clade_leaves = [&](int32_t root_nid) -> std::vector<std::string> {
+            std::vector<std::string> leaves;
+            if (root_nid < 0 || static_cast<size_t>(root_nid) >= result.network.collapsed_tree.nodes.size()) return leaves;
+            std::vector<int32_t> stack = {root_nid};
+            while (!stack.empty()) {
+                int32_t curr = stack.back();
+                stack.pop_back();
+                const auto& node = result.network.collapsed_tree.nodes[curr];
+                if (node.is_leaf) {
+                    leaves.push_back(node.name);
+                } else {
+                    for (int32_t c : node.children) stack.push_back(c);
+                }
+            }
+            return leaves;
+        };
+
         // Record initial bridge weights before ML refinement
         result.bridge_summaries.resize(result.num_bridges);
         for (size_t k = 0; k < result.num_bridges; ++k) {
@@ -174,9 +232,17 @@ public:
             bs.bridge_index = k;
             bs.hub_name = (wb.hub_node_id >= 0) ? result.network.collapsed_tree.nodes[wb.hub_node_id].name : "";
             bs.bridge_name = (wb.bridge_node_id >= 0) ? result.network.backbone_tree.nodes[wb.bridge_node_id].name : "";
+            std::unordered_set<std::string> in_abc;
             for (int r = 0; r < 3; ++r) {
                 int32_t cid = wb.children[r];
                 bs.child_names[r] = (cid >= 0) ? result.network.collapsed_tree.nodes[cid].name : "";
+                bs.quartet_clades[r] = collect_clade_leaves(cid);
+                for (const auto& nm : bs.quartet_clades[r]) in_abc.insert(nm);
+            }
+            for (const auto& nm : aln.taxon_names) {
+                if (in_abc.find(nm) == in_abc.end()) {
+                    bs.quartet_clades[3].push_back(nm);
+                }
             }
             bs.initial_weights = wb.weights;
             bs.fitted_weights = wb.weights;
@@ -195,6 +261,8 @@ public:
             result.bridge_summaries[k].fitted_weights = result.network.bridges[k].weights;
             result.bridge_summaries[k].fitted_branch_lengths = result.network.bridges[k].branch_lengths;
         }
+        result.network.collapsed_tree.bridges = result.network.bridges;
+        result.network.collapsed_tree.node_to_bridge_idx = result.network.node_to_bridge_idx;
 
         auto t_end = std::chrono::steady_clock::now();
         result.runtime_seconds = std::chrono::duration<double>(t_end - t_start).count();
@@ -343,6 +411,24 @@ private:
         result.ohmic_aicc = compute_aicc(result.ohmic_log_l, k_ohmic, n_obs);
         result.delta_log_l = result.ohmic_log_l - result.single_tree_log_l;
         result.delta_aicc = result.single_tree_aicc - result.ohmic_aicc;
+
+        // Compute per-site log-likelihood profile (Ohmic vs Single-Tree)
+        std::vector<Scalar> pat_ohm, pat_single;
+        WheatstoneLikelihood::compute_gtr_log_likelihood(result.network, nuc_aln, gtr, 1.0, &leaf_map, &pat_ohm);
+        OhmicNetwork single_net = result.network;
+        for (auto& wb : single_net.bridges) wb.weights = {1.0, 0.0, 0.0};
+        WheatstoneLikelihood::compute_gtr_log_likelihood(single_net, nuc_aln, gtr, 1.0, &leaf_map, &pat_single);
+
+        size_t S_sites = nuc_aln.site_to_pattern.size();
+        result.site_single_tree_log_l.resize(S_sites, 0.0);
+        result.site_ohmic_log_l.resize(S_sites, 0.0);
+        result.site_delta_log_l.resize(S_sites, 0.0);
+        for (size_t s = 0; s < S_sites; ++s) {
+            size_t p = nuc_aln.site_to_pattern[s];
+            result.site_single_tree_log_l[s] = pat_single[p];
+            result.site_ohmic_log_l[s] = pat_ohm[p];
+            result.site_delta_log_l[s] = pat_ohm[p] - pat_single[p];
+        }
     }
 
     void fit_codon_network(OhmicResult& result) {
@@ -454,6 +540,27 @@ private:
         result.ohmic_aicc = compute_aicc(result.ohmic_log_l, k_ohmic, n_obs);
         result.delta_log_l = result.ohmic_log_l - result.single_tree_log_l;
         result.delta_aicc = result.single_tree_aicc - result.ohmic_aicc;
+
+        // Compute per-site log-likelihood profile (Ohmic vs Single-Tree)
+        const GeneticCode& gcode = *(aln.code ? aln.code : GeneticCode::universal());
+        MG94Matrix mg94;
+        mg94.update(result.mg94_params, aln.pos_nuc_frequencies, aln.codon_frequencies_f3x4, gcode);
+        std::vector<Scalar> pat_ohm, pat_single;
+        WheatstoneLikelihood::compute_mg94_log_likelihood(result.network, aln, mg94, 1.0, &leaf_map, &pat_ohm);
+        OhmicNetwork single_net = result.network;
+        for (auto& wb : single_net.bridges) wb.weights = {1.0, 0.0, 0.0};
+        WheatstoneLikelihood::compute_mg94_log_likelihood(single_net, aln, mg94, 1.0, &leaf_map, &pat_single);
+
+        size_t S_sites = aln.site_to_pattern.size();
+        result.site_single_tree_log_l.resize(S_sites, 0.0);
+        result.site_ohmic_log_l.resize(S_sites, 0.0);
+        result.site_delta_log_l.resize(S_sites, 0.0);
+        for (size_t s = 0; s < S_sites; ++s) {
+            size_t p = aln.site_to_pattern[s];
+            result.site_single_tree_log_l[s] = pat_single[p];
+            result.site_ohmic_log_l[s] = pat_ohm[p];
+            result.site_delta_log_l[s] = pat_ohm[p] - pat_single[p];
+        }
     }
 };
 

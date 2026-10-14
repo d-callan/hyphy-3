@@ -39,7 +39,8 @@ static void print_relax_usage(const char* prog) {
               << "  " << Console::brand("--no-hyphaeon") << "        Use empirical codon conductances instead of HyphAeon 384D transformer\n"
               << "  " << Console::brand("--embeddings") << " <file>  Path to precomputed [N x D] taxon embeddings TSV/CSV for Ohmic\n"
               << "  " << Console::brand("--code") << " <name>        Genetic code (default: Universal)\n"
-              << "  " << Console::brand("--test") << " <regex|names> Branch names or regex to mark as Test set (default: use {T} tags)\n"
+              << "  " << Console::brand("--test, --branches") << " <spec> Branch tag, names, or regex to mark as Test set (default: {TEST}/{T}/{FG})\n"
+              << "  " << Console::brand("--reference") << " <spec>   Branch tag, names, or regex to mark as Reference set (default: {REFERENCE}/{R}/{BG} or complement)\n"
               << "  " << Console::brand("--pvalue") << " <threshold> Significance threshold for LRT (default: 0.05)\n"
               << "  " << Console::brand("--threads") << " <N>        Number of OpenMP worker threads\n"
               << "  " << Console::brand("--output") << " <file>      Path to output JSON file (default: <alignment>.RELAX.json)\n"
@@ -83,8 +84,10 @@ int run_relax(int argc, char* argv[]) {
             use_ohmic = true;
         } else if (arg == "--code" && i + 1 < argc) {
             code_name = argv[++i];
-        } else if (arg == "--test" && i + 1 < argc) {
+        } else if ((arg == "--test" || arg == "--branches") && i + 1 < argc) {
             settings.test_branch_regex = argv[++i];
+        } else if (arg == "--reference" && i + 1 < argc) {
+            settings.reference_branch_regex = argv[++i];
         } else if (arg == "--pvalue" && i + 1 < argc) {
             settings.p_value_threshold = std::stod(argv[++i]);
         } else if (arg == "--threads" && i + 1 < argc) {
@@ -178,20 +181,24 @@ int run_relax(int argc, char* argv[]) {
     auto relax = RELAXAnalyzer::create(tree, aln, settings);
 
     if (relax.test_branch_names.empty()) {
-        std::cerr << Console::danger("Error: No Test branches found! Annotate branches with {T} in Newick or pass --test <regex>.\n");
+        std::cerr << Console::danger("Error: No Test branches found! Annotate branches with {TEST}/{T}/{FG} in Newick or pass --test <spec>.\n");
         return 1;
     }
 
-    Panel::print_card("Dataset & Phylogeny", {
+    std::vector<std::pair<std::string, std::string>> card_items = {
         {"Alignment File", alignment_file},
         {"Sequences / Taxa", std::to_string(aln.num_taxa)},
         {"Codon Sites", std::to_string(aln.num_codons) + " (" + std::to_string(aln.num_codons * 3) + " nt)"},
         {"Unique Patterns", std::to_string(aln.patterns.size())},
         {"Tree", tree_source + " (" + std::to_string(tree.num_nodes()) + " nodes, " + std::to_string(tree.num_leaves()) + " leaves)"},
         {"Test Branches", std::to_string(relax.test_branch_names.size()) + " branches"},
-        {"Reference Branches", std::to_string(relax.ref_branch_names.size()) + " branches"},
-        {"Genetic Code", code->name}
-    });
+        {"Reference Branches", std::to_string(relax.ref_branch_names.size()) + " branches"}
+    };
+    if (!relax.unclassified_branch_names.empty()) {
+        card_items.push_back({"Unclassified Branches", std::to_string(relax.unclassified_branch_names.size()) + " branches"});
+    }
+    card_items.push_back({"Genetic Code", code->name});
+    Panel::print_card("Dataset & Phylogeny", card_items);
 
     Panel::print_step(1, 3, "Fitting Baseline & Separate-Rates Codon Models", "GTR & MG94xREV");
 

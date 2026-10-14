@@ -5,12 +5,16 @@
 #include <string>
 #include <vector>
 #include <unordered_map>
+#include <unordered_set>
 #include <stack>
 #include <sstream>
 #include <fstream>
 #include <stdexcept>
 #include <iostream>
 #include <iomanip>
+#include <regex>
+#include <algorithm>
+#include <cctype>
 
 namespace hyphy::core {
 
@@ -373,6 +377,191 @@ public:
             traverse_post_order(child_id);
         }
         post_order.push_back(node_id);
+    }
+
+    struct BranchSelection {
+        std::vector<bool> is_selected;
+        std::vector<std::string> selected_names;
+        std::vector<std::string> unselected_names;
+        size_t num_selected = 0;
+        size_t num_unselected = 0;
+    };
+
+    BranchSelection select_branches(
+        const std::string& spec = "All",
+        const std::string& regex_str = "",
+        const std::vector<std::string>& explicit_names = {},
+        bool auto_detect_test_tags_when_all = false
+    ) const {
+        BranchSelection sel;
+        size_t n = nodes.size();
+        sel.is_selected.assign(n, false);
+
+        auto to_lower = [](std::string s) {
+            std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            return s;
+        };
+        auto trim = [](std::string s) {
+            size_t start = s.find_first_not_of(" \t\r\n");
+            if (start == std::string::npos) return std::string{};
+            size_t end = s.find_last_not_of(" \t\r\n");
+            return s.substr(start, end - start + 1);
+        };
+        auto strip_braces = [&](std::string s) {
+            s = trim(std::move(s));
+            if (s.size() >= 2 && s.front() == '{' && s.back() == '}') {
+                return trim(s.substr(1, s.size() - 2));
+            }
+            return s;
+        };
+        auto is_fg_synonym = [](const std::string& s_low) {
+            return s_low == "t" || s_low == "test" || s_low == "foreground" || s_low == "fg";
+        };
+        auto is_bg_synonym = [](const std::string& s_low) {
+            return s_low == "r" || s_low == "ref" || s_low == "reference" || s_low == "background" || s_low == "bg";
+        };
+
+        bool has_tagged_test = false;
+        if (auto_detect_test_tags_when_all) {
+            for (const auto& node : nodes) {
+                if (node.id != root_id && is_fg_synonym(to_lower(node.model_tag))) {
+                    has_tagged_test = true;
+                    break;
+                }
+            }
+        }
+
+        if (!regex_str.empty()) {
+            std::regex re(regex_str, std::regex::icase);
+            for (const auto& node : nodes) {
+                if (node.id == root_id) continue;
+                if (std::regex_search(node.name, re) || (!node.model_tag.empty() && std::regex_search(node.model_tag, re))) {
+                    sel.is_selected[node.id] = true;
+                }
+            }
+        } else if (!explicit_names.empty()) {
+            std::unordered_set<std::string> lower_targets;
+            for (const auto& item : explicit_names) {
+                std::string cleaned = to_lower(strip_braces(item));
+                if (!cleaned.empty()) lower_targets.insert(cleaned);
+            }
+            for (const auto& node : nodes) {
+                if (node.id == root_id) continue;
+                std::string name_low = to_lower(node.name);
+                std::string tag_low = to_lower(node.model_tag);
+                if (lower_targets.count(name_low) > 0 || (!tag_low.empty() && lower_targets.count(tag_low) > 0)) {
+                    sel.is_selected[node.id] = true;
+                }
+            }
+        } else {
+            std::string mode = strip_braces(spec);
+            std::string mode_low = to_lower(mode);
+
+            if (mode.empty() || mode_low == "all") {
+                for (const auto& node : nodes) {
+                    if (node.id == root_id) continue;
+                    if (auto_detect_test_tags_when_all && has_tagged_test) {
+                        sel.is_selected[node.id] = is_fg_synonym(to_lower(node.model_tag));
+                    } else {
+                        sel.is_selected[node.id] = true;
+                    }
+                }
+            } else if (mode_low == "all-branches" || mode_low == "all_branches") {
+                for (const auto& node : nodes) {
+                    if (node.id == root_id) continue;
+                    sel.is_selected[node.id] = true;
+                }
+            } else if (mode_low == "internal") {
+                for (const auto& node : nodes) {
+                    if (node.id == root_id) continue;
+                    sel.is_selected[node.id] = !node.is_leaf;
+                }
+            } else if (mode_low == "leaves" || mode_low == "terminal" || mode_low == "tips") {
+                for (const auto& node : nodes) {
+                    if (node.id == root_id) continue;
+                    sel.is_selected[node.id] = node.is_leaf;
+                }
+            } else if (mode_low == "unlabeled" || mode_low == "untagged") {
+                for (const auto& node : nodes) {
+                    if (node.id == root_id) continue;
+                    sel.is_selected[node.id] = node.model_tag.empty();
+                }
+            } else if (mode.find(',') != std::string::npos) {
+                std::unordered_set<std::string> tokens;
+                std::stringstream ss(mode);
+                std::string item;
+                while (std::getline(ss, item, ',')) {
+                    std::string cleaned = to_lower(strip_braces(item));
+                    if (!cleaned.empty()) tokens.insert(cleaned);
+                }
+                for (const auto& node : nodes) {
+                    if (node.id == root_id) continue;
+                    std::string name_low = to_lower(node.name);
+                    std::string tag_low = to_lower(node.model_tag);
+                    bool match = (tokens.count(name_low) > 0) || (!tag_low.empty() && tokens.count(tag_low) > 0);
+                    if (!match && tokens.count("internal") > 0 && !node.is_leaf) match = true;
+                    if (!match && (tokens.count("leaves") > 0 || tokens.count("terminal") > 0) && node.is_leaf) match = true;
+                    if (!match && (tokens.count("unlabeled") > 0 || tokens.count("untagged") > 0) && node.model_tag.empty()) match = true;
+                    if (!match && is_fg_synonym(tag_low)) {
+                        for (const auto& tok : tokens) {
+                            if (is_fg_synonym(tok)) { match = true; break; }
+                        }
+                    }
+                    if (!match && is_bg_synonym(tag_low)) {
+                        for (const auto& tok : tokens) {
+                            if (is_bg_synonym(tok)) { match = true; break; }
+                        }
+                    }
+                    sel.is_selected[node.id] = match;
+                }
+            } else {
+                // Single token: check tag (including FG/BG synonyms) or branch name first
+                bool any_exact = false;
+                for (const auto& node : nodes) {
+                    if (node.id == root_id) continue;
+                    std::string name_low = to_lower(node.name);
+                    std::string tag_low = to_lower(node.model_tag);
+                    bool match = (!tag_low.empty() && tag_low == mode_low) || (name_low == mode_low);
+                    if (!match && is_fg_synonym(mode_low) && is_fg_synonym(tag_low)) match = true;
+                    if (!match && is_bg_synonym(mode_low) && is_bg_synonym(tag_low)) match = true;
+                    if (match) {
+                        sel.is_selected[node.id] = true;
+                        any_exact = true;
+                    }
+                }
+                // Fallback to regex only if mode contains regex metacharacters
+                if (!any_exact && spec.find_first_of(".*+?^$[]()|\\") != std::string::npos) {
+                    try {
+                        std::regex re(spec, std::regex::icase);
+                        for (const auto& node : nodes) {
+                            if (node.id == root_id) continue;
+                            if (std::regex_search(node.name, re) || (!node.model_tag.empty() && std::regex_search(node.model_tag, re))) {
+                                sel.is_selected[node.id] = true;
+                            }
+                        }
+                    } catch (...) {
+                    }
+                }
+            }
+        }
+
+        for (const auto& node : nodes) {
+            if (node.id == root_id) continue;
+            if (sel.is_selected[node.id]) {
+                sel.selected_names.push_back(node.name);
+                sel.num_selected++;
+            } else {
+                sel.unselected_names.push_back(node.name);
+                sel.num_unselected++;
+            }
+        }
+
+        if (sel.num_selected == 0 && n > 1) {
+            std::string requested = !regex_str.empty() ? regex_str : spec;
+            throw std::runtime_error("No branches matched '--branches " + requested + "'.");
+        }
+
+        return sel;
     }
 };
 

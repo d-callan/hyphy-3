@@ -48,6 +48,8 @@ static void print_usage(const char* prog) {
               << "  " << Console::brand("--shrinkage") << " <val>    Empirical Bayes Ridge shrinkage lambda (default: 1.0; 0 to disable)\n"
               << "  " << Console::brand("--threads") << " <N>        Number of OpenMP worker threads\n"
               << "  " << Console::brand("--output") << " <file>      Path to output JSON file (default: <alignment>.CONTRAST-FEL.json)\n"
+              << "  " << Console::brand("--json-format") << " <fmt>  JSON schema format: modern (default) or legacy (HyPhy 2.5)\n"
+              << "  " << Console::brand("--legacy-json") << "        Output legacy HyPhy 2.5 JSON schema\n"
               << "  " << Console::brand("--pvalue") << " <float>     Nominal p-value threshold for site display (default: 0.05)\n"
               << "  " << Console::brand("--qvalue") << " <float>     FDR q-value threshold for reporting (default: 0.20)\n"
               << "  " << Console::brand("--all-sites") << "          Display all codon sites in console table (default: significant only)\n"
@@ -71,6 +73,7 @@ int run_contrast_fel(int argc, char* argv[]) {
     Scalar pvalue_threshold = 0.05;
     Scalar qvalue_threshold = 0.20;
     Scalar shrinkage_lambda = 1.0;
+    JSONFormat json_format = JSONFormat::ModernV3;
     bool show_progress = ProgressBar::is_terminal();
     bool force_progress = false;
     bool all_sites = false;
@@ -102,6 +105,17 @@ int run_contrast_fel(int argc, char* argv[]) {
             shrinkage_lambda = 0.0;
         } else if (arg == "--threads" && i + 1 < argc) {
             num_threads = std::stoi(argv[++i]);
+        } else if (arg == "--json-format" && i + 1 < argc) {
+            std::string fmt = argv[++i];
+            if (fmt == "legacy" || fmt == "datamonkey") {
+                json_format = JSONFormat::Legacy;
+            } else {
+                json_format = JSONFormat::ModernV3;
+            }
+        } else if (arg == "--legacy-json" || arg == "--legacy") {
+            json_format = JSONFormat::Legacy;
+        } else if (arg == "--modern-json" || arg == "--modern") {
+            json_format = JSONFormat::ModernV3;
         } else if (arg == "--output" && i + 1 < argc) {
             output_file = argv[++i];
         } else if (arg == "--pvalue" && i + 1 < argc) {
@@ -423,6 +437,31 @@ int run_contrast_fel(int argc, char* argv[]) {
                                            std::to_string(qvalue_threshold) + ".\n\n");
     }
 
+    if (K > 2 && !site_results.empty() && !site_results[0].pairwise.empty()) {
+        std::cout << Console::bold("  Pairwise Group Contrasts Summary (p <= " + std::to_string(pvalue_threshold) + "):\n\n");
+        Table pw_table;
+        pw_table.add_column("Group Pair", Table::Align::Left, 24);
+        pw_table.add_column("Uncorrected p <= " + std::to_string(pvalue_threshold), Table::Align::Right, 22);
+        pw_table.add_column("Holm-Bonferroni p <= " + std::to_string(pvalue_threshold), Table::Align::Right, 26);
+        for (size_t pw_idx = 0; pw_idx < site_results[0].pairwise.size(); ++pw_idx) {
+            const auto& pw0 = site_results[0].pairwise[pw_idx];
+            size_t cnt_unadj = 0, cnt_adj = 0;
+            for (const auto& r : site_results) {
+                if (pw_idx < r.pairwise.size()) {
+                    if (r.pairwise[pw_idx].p_value <= pvalue_threshold) cnt_unadj++;
+                    if (r.pairwise[pw_idx].p_value_adjusted <= pvalue_threshold) cnt_adj++;
+                }
+            }
+            pw_table.add_row({
+                pw0.name_a + " vs " + pw0.name_b,
+                std::to_string(cnt_unadj),
+                std::to_string(cnt_adj)
+            });
+        }
+        pw_table.print();
+        std::cout << "\n";
+    }
+
     auto end_time = std::chrono::high_resolution_clock::now();
     double total_sec = std::chrono::duration<double>(end_time - start_time).count();
 
@@ -442,11 +481,12 @@ int run_contrast_fel(int argc, char* argv[]) {
     prov.execution.compiler = Provenance::detect_compiler();
 
     try {
-        contrast_fel.save_json(output_file, alignment_file, tree.to_newick(), prov);
+        contrast_fel.save_json(output_file, alignment_file, tree.to_newick(), prov, json_format);
         std::cout << Console::bold("Output:\n")
                   << "  " << Console::muted("Analysis results saved to: ") << Console::brand(output_file) << "\n\n";
     } catch (const std::exception& e) {
         std::cerr << Console::danger("Error writing JSON output: ") << e.what() << "\n";
+        return 1;
     }
 
     return 0;
@@ -454,6 +494,11 @@ int run_contrast_fel(int argc, char* argv[]) {
 
 #ifndef HYPHY3_COMBINED_DRIVER
 int main(int argc, char* argv[]) {
-    return run_contrast_fel(argc, argv);
+    try {
+        return run_contrast_fel(argc, argv);
+    } catch (const std::exception& e) {
+        std::cerr << Console::danger("Error: ") << e.what() << "\n";
+        return 1;
+    }
 }
 #endif

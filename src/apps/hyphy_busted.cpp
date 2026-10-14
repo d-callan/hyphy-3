@@ -44,6 +44,7 @@ static void print_usage(const char* prog) {
               << "  " << Console::brand("--no-hyphaeon") << "        Disable live HyphAeon transformer (use empirical codon conductances)\n"
               << "  " << Console::brand("--embeddings") << " <file>  Path to precomputed [N x 384] HyphAeon embeddings (.bin/.csv/.tsv)\n"
               << "  " << Console::brand("--code") << " <name>        Genetic code (default: Universal)\n"
+              << "  " << Console::brand("--branches") << " <spec>    Branches to test: All (default), Internal, Leaves, Unlabeled, {TAG}, or names\n"
               << "  " << Console::brand("--auto") << "                Full-Auto BUSTED: 4-gate surprisal & score selector for SRV, MH, Error Sink & K\n"
               << "  " << Console::brand("--rates") << " <N>          Number of omega rate categories (default: 3)\n"
               << "  " << Console::brand("--srv") << "                Enable synonymous rate variation across sites (BUSTED-S)\n"
@@ -97,6 +98,8 @@ int run_busted(int argc, char* argv[]) {
             embeddings_file = argv[++i];
         } else if (arg == "--code" && i + 1 < argc) {
             code_name = argv[++i];
+        } else if ((arg == "--branches" || arg == "--test") && i + 1 < argc) {
+            settings.test_branches = argv[++i];
         } else if (arg == "--auto" || arg == "--full-auto") {
             settings.full_auto = true;
         } else if (arg == "--rates" && i + 1 < argc) {
@@ -206,12 +209,22 @@ int run_busted(int argc, char* argv[]) {
         return 1;
     }
 
+    // Validate branch selection upfront before fitting GTR/MG94
+    Tree::BranchSelection branch_sel;
+    try {
+        branch_sel = tree.select_branches(settings.test_branches, "", {}, false);
+    } catch (const std::exception& e) {
+        std::cerr << Console::danger("Error: ") << e.what() << "\n";
+        return 1;
+    }
+
     Panel::print_card("Dataset & Model Settings", {
         {"Alignment File", alignment_file},
         {"Sequences / Taxa", std::to_string(aln.num_taxa)},
         {"Codon Sites", std::to_string(aln.num_codons) + " (" + std::to_string(aln.num_codons * 3) + " nt)"},
         {"Unique Patterns", std::to_string(aln.patterns.size())},
         {"Tree Source", tree_source + " (" + std::to_string(tree.num_nodes()) + " nodes, " + std::to_string(tree.num_leaves()) + " leaves)"},
+        {"Tested Branches", settings.test_branches + " (" + std::to_string(branch_sel.num_selected) + " test, " + std::to_string(branch_sel.num_unselected) + " background)"},
         {"Model Selection Mode", settings.full_auto ? "Full-Auto (4-Gate Surprisal & Score Screen)" : "Manual / Fixed"},
         {"Rate Classes (K)", settings.full_auto ? "Auto (2..3)" : (std::to_string(settings.num_rate_classes) + (settings.auto_select_k ? " (Auto-K enabled)" : ""))},
         {"Synonymous Variation", settings.full_auto ? "Auto" : (settings.srv ? "Enabled (" + std::to_string(settings.num_syn_rate_classes) + " classes)" : "Disabled")},
@@ -223,6 +236,7 @@ int run_busted(int argc, char* argv[]) {
     // 4. Initialize and run BUSTED
     Panel::print_step(1, 2, "Fitting Baseline GTR & Global MG94 Models", "Exchangeability rates & branch lengths");
     BUSTEDAnalyzer analyzer = BUSTEDAnalyzer::create_and_fit(tree, aln);
+    analyzer.select_test_branches(settings.test_branches);
 
     std::cout << "  " << Console::muted("Nucleotide GTR Log-L : ") << Console::bold(std::to_string(analyzer.gtr_log_l)) << "\n"
               << "  " << Console::muted("Global MG94 Log-L    : ") << Console::bold(std::to_string(analyzer.mg94_log_l))

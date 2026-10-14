@@ -111,6 +111,7 @@ struct GARDResult {
 
     std::map<std::string, Scalar> site_breakpoint_support;
     std::vector<std::pair<size_t, Scalar>> improvements; // (num_bps, deltaAICc)
+    std::vector<std::vector<size_t>> improvement_breakpoints; // per-step breakpoints
     size_t total_models_evaluated = 0;
     double time_elapsed = 0.0;
     std::string input_file;
@@ -160,9 +161,12 @@ struct GARDResult {
         };
 
         nlohmann::json improv_arr = nlohmann::json::array();
-        for (const auto& [bps, delta] : improvements) {
+        for (size_t i = 0; i < improvements.size(); ++i) {
+            const auto& [bps, delta] = improvements[i];
+            const auto& step_bps = (i < improvement_breakpoints.size()) ? improvement_breakpoints[i] : best_model.breakpoints;
             improv_arr.push_back({
                 {"breakpoints_count", bps},
+                {"breakpoints", step_bps},
                 {"delta_aicc", delta}
             });
         }
@@ -246,8 +250,9 @@ struct GARDResult {
             };
         } else {
             for (size_t i = 0; i < improvements.size(); ++i) {
+                const auto& step_bps = (i < improvement_breakpoints.size()) ? improvement_breakpoints[i] : best_model.breakpoints;
                 improv_obj[std::to_string(i)] = {
-                    {"breakpoints", best_model.breakpoints},
+                    {"breakpoints", step_bps},
                     {"deltaAICc", improvements[i].second}
                 };
             }
@@ -417,13 +422,13 @@ public:
         std::mutex master_mutex;
         master_list[best_overall_model.to_key()] = result.baseline_aicc;
 
-        auto evaluate_candidate_model = [&](const std::vector<size_t>& bps) -> GARDModel {
+        auto evaluate_candidate_model = [&](const std::vector<size_t>& bps, bool build_partitions = false) -> GARDModel {
             GARDModel model;
             model.breakpoints = bps;
             std::sort(model.breakpoints.begin(), model.breakpoints.end());
 
             std::string key = model.to_key();
-            {
+            if (!build_partitions) {
                 std::lock_guard<std::mutex> lock(master_mutex);
                 auto it = master_list.find(key);
                 if (it != master_list.end()) {
@@ -529,8 +534,12 @@ public:
 
         bool single_bp_improves = (best_single_bp_model.aicc < result.baseline_aicc);
         if (single_bp_improves) {
+            if (best_single_bp_model.partitions.empty()) {
+                best_single_bp_model = evaluate_candidate_model(best_single_bp_model.breakpoints, true);
+            }
             Scalar delta = result.baseline_aicc - best_single_bp_model.aicc;
             result.improvements.push_back({1, delta});
+            result.improvement_breakpoints.push_back(best_single_bp_model.breakpoints);
             best_overall_model = best_single_bp_model;
             result.best_model = best_overall_model;
         }
@@ -665,7 +674,7 @@ public:
 
                 Scalar current_best_caic = evaluated_pool[0].second;
                 if (current_best_caic < current_best_model_for_B.aicc) {
-                    current_best_model_for_B = evaluate_candidate_model(evaluated_pool[0].first);
+                    current_best_model_for_B = evaluate_candidate_model(evaluated_pool[0].first, true);
                 }
 
                 // Check convergence & diversity
@@ -771,8 +780,12 @@ public:
             visualizer.finish_ga(current_B, current_best_model_for_B.breakpoints, current_best_model_for_B.aicc, best_overall_model.aicc, improved);
 
             if (improved) {
+                if (current_best_model_for_B.partitions.empty()) {
+                    current_best_model_for_B = evaluate_candidate_model(current_best_model_for_B.breakpoints, true);
+                }
                 Scalar delta = best_overall_model.aicc - current_best_model_for_B.aicc;
                 result.improvements.push_back({current_B, delta});
+                result.improvement_breakpoints.push_back(current_best_model_for_B.breakpoints);
                 best_overall_model = current_best_model_for_B;
                 result.best_model = best_overall_model;
             } else {

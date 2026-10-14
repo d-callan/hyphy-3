@@ -104,6 +104,7 @@ struct BUSTEDSettings {
     bool error_sink = false;           // Enable Option A saturation/replacement error sink
     Scalar error_sink_max_weight = 0.01; // Upper bound on contamination proportion epsilon
     Scalar error_sink_bf_threshold = 100.0; // Bayes factor cutoff to flag branch-site errors
+    std::string test_branches = "All"; // "All", "Internal", "Leaves", "Unlabeled", or tag/comma-separated names
 };
 
 struct BUSTEDResult {
@@ -130,9 +131,9 @@ public:
 
     // Relative branch lengths tau_b (normalized from MG94 baseline)
     std::vector<Scalar> branch_tau;
-    std::vector<bool> is_test_branch;
+    mutable std::vector<bool> is_test_branch;
     std::vector<size_t> leaf_to_taxon;
-    size_t num_test_branches = 0;
+    mutable size_t num_test_branches = 0;
 
     // Precomputed off-diagonal saturation replacement kernel P_sink(i, j) = pi_j / (1 - pi_i) for i != j, 0 for i == j
     Matrix P_sink;
@@ -159,10 +160,19 @@ public:
         size_t num_nodes = tree.num_nodes();
         branch_tau.assign(num_nodes, 0.0);
         is_test_branch.assign(num_nodes, true); // Default: all branches are Test
-        num_test_branches = num_nodes - 1; // Non-root branches
+        if (tree.root_id >= 0 && static_cast<size_t>(tree.root_id) < num_nodes) {
+            is_test_branch[tree.root_id] = false;
+        }
+        num_test_branches = (num_nodes > 0) ? (num_nodes - 1) : 0; // Non-root branches
         leaf_to_taxon = LikelihoodEngine::build_leaf_to_taxon_map(tree, aln);
         build_sink_kernel();
         prepare_baseline_lengths();
+    }
+
+    void select_test_branches(const std::string& spec) const {
+        auto sel = tree.select_branches(spec, "", {}, false);
+        is_test_branch = std::move(sel.is_selected);
+        num_test_branches = sel.num_selected;
     }
 
     void build_sink_kernel() {
@@ -273,6 +283,16 @@ public:
             p.psi = psi;
             mg[k].update(p, aln.pos_nuc_frequencies, aln.codon_frequencies_f3x4, *code);
         }
+        bool has_bg = (num_test_branches + 1 < num_nodes);
+        MG94Matrix mg_bg;
+        if (has_bg) {
+            MG94Parameters p_bg = base_params;
+            p_bg.alpha = 1.0;
+            p_bg.beta = mg94_omega;
+            p_bg.delta = delta;
+            p_bg.psi = psi;
+            mg_bg.update(p_bg, aln.pos_nuc_frequencies, aln.codon_frequencies_f3x4, *code);
+        }
 
         // Precompute branch transition matrices P_mix[m][node_id]
         std::vector<std::vector<Matrix>> P_mix(M, std::vector<Matrix>(num_nodes));
@@ -281,13 +301,17 @@ public:
             for (const auto& node : tree.nodes) {
                 if (node.id != tree.root_id) {
                     Scalar bl = custom_branch_lengths ? (*custom_branch_lengths)[node.id] : (s * branch_tau[node.id]);
-                    P_mix[m][node.id] = Matrix::Zero(S, S);
-                    Scalar use_bio = (eps_sink > 0.0 && is_test_branch[node.id]) ? bio_scale : 1.0;
-                    for (size_t k = 0; k < K; ++k) {
-                        P_mix[m][node.id] += (use_bio * weights[k]) * mg[k].transition_matrix(alpha_m * bl);
-                    }
-                    if (eps_sink > 0.0 && is_test_branch[node.id]) {
-                        P_mix[m][node.id].noalias() += eps_sink * P_sink;
+                    if (is_test_branch[node.id]) {
+                        P_mix[m][node.id] = Matrix::Zero(S, S);
+                        Scalar use_bio = (eps_sink > 0.0) ? bio_scale : 1.0;
+                        for (size_t k = 0; k < K; ++k) {
+                            P_mix[m][node.id] += (use_bio * weights[k]) * mg[k].transition_matrix(alpha_m * bl);
+                        }
+                        if (eps_sink > 0.0) {
+                            P_mix[m][node.id].noalias() += eps_sink * P_sink;
+                        }
+                    } else {
+                        P_mix[m][node.id] = mg_bg.transition_matrix(alpha_m * bl);
                     }
                 }
             }
@@ -636,6 +660,16 @@ public:
             p.psi = psi;
             mg[k].update(p, aln.pos_nuc_frequencies, aln.codon_frequencies_f3x4, *code);
         }
+        bool has_bg = (num_test_branches + 1 < num_nodes);
+        MG94Matrix mg_bg;
+        if (has_bg) {
+            MG94Parameters p_bg = base_params;
+            p_bg.alpha = 1.0;
+            p_bg.beta = mg94_omega;
+            p_bg.delta = delta;
+            p_bg.psi = psi;
+            mg_bg.update(p_bg, aln.pos_nuc_frequencies, aln.codon_frequencies_f3x4, *code);
+        }
 
         // 2. Precompute P_mix[m] and dP_mix[m] for each synonymous rate category and branch
         // Note: d/dt_b (eps_sink * P_sink) == 0 because the saturation replacement kernel is branch-length invariant!
@@ -647,16 +681,22 @@ public:
                 if (node.id != tree.root_id) {
                     int nid = node.id;
                     Scalar bl = branch_lengths[nid];
-                    P_mix[m][nid] = Matrix::Zero(S, S);
-                    dP_mix[m][nid] = Matrix::Zero(S, S);
-                    Scalar use_bio = (eps_sink > 0.0 && is_test_branch[nid]) ? bio_scale : 1.0;
-                    for (size_t k = 0; k < K; ++k) {
-                        Matrix P_k = mg[k].transition_matrix(alpha_m * bl);
-                        P_mix[m][nid] += (use_bio * weights[k]) * P_k;
-                        dP_mix[m][nid] += (use_bio * weights[k]) * alpha_m * (mg[k].Q * P_k);
-                    }
-                    if (eps_sink > 0.0 && is_test_branch[nid]) {
-                        P_mix[m][nid].noalias() += eps_sink * P_sink;
+                    if (is_test_branch[nid]) {
+                        P_mix[m][nid] = Matrix::Zero(S, S);
+                        dP_mix[m][nid] = Matrix::Zero(S, S);
+                        Scalar use_bio = (eps_sink > 0.0) ? bio_scale : 1.0;
+                        for (size_t k = 0; k < K; ++k) {
+                            Matrix P_k = mg[k].transition_matrix(alpha_m * bl);
+                            P_mix[m][nid] += (use_bio * weights[k]) * P_k;
+                            dP_mix[m][nid] += (use_bio * weights[k]) * alpha_m * (mg[k].Q * P_k);
+                        }
+                        if (eps_sink > 0.0) {
+                            P_mix[m][nid].noalias() += eps_sink * P_sink;
+                        }
+                    } else {
+                        Matrix P_b = mg_bg.transition_matrix(alpha_m * bl);
+                        P_mix[m][nid] = P_b;
+                        dP_mix[m][nid] = alpha_m * (mg_bg.Q * P_b);
                     }
                 }
             }
@@ -1723,6 +1763,7 @@ public:
         bool force_progress = false
     ) const {
         auto t0 = std::chrono::high_resolution_clock::now();
+        select_test_branches(settings.test_branches);
         BUSTEDResult res;
         if (settings.full_auto) {
             res.auto_diagnostics = diagnose_and_select_model(settings);
@@ -1994,6 +2035,7 @@ public:
 
         // Branch attributes
         nlohmann::json branch_attr;
+        nlohmann::json tested_map = nlohmann::json::object();
         for (const auto& node : tree.nodes) {
             if (node.id != tree.root_id) {
                 nlohmann::json b_entry;
@@ -2004,9 +2046,12 @@ public:
                     b_entry["constrained"] = res.constrained.branch_lengths[node.id];
                 }
                 branch_attr[node.name] = b_entry;
+                bool is_test = (static_cast<size_t>(node.id) < is_test_branch.size()) ? is_test_branch[node.id] : true;
+                tested_map[node.name] = is_test ? "test" : "background";
             }
         }
         j["branch attributes"] = {{"0", branch_attr}};
+        j["tested"] = {{"0", tested_map}};
 
         j["Evidence Ratios"] = {
             {"constrained", {res.evidence_ratios}},
@@ -2065,6 +2110,7 @@ public:
         j["analysis"]["settings"]["refine_branch_lengths"] = res.settings.refine_branch_lengths;
         j["analysis"]["settings"]["pvalue_threshold"] = res.settings.p_value_threshold;
         j["analysis"]["settings"]["optimal_k"] = res.optimal_k;
+        j["analysis"]["settings"]["test_branches"] = res.settings.test_branches;
 
         // Software block
         j["software"]["name"] = "hyphy";
@@ -2126,6 +2172,10 @@ public:
         for (const auto& node : tree.nodes) {
             nlohmann::json node_entry;
             node_entry["type"] = node.children.empty() ? "leaf" : "internal";
+            if (node.id != tree.root_id) {
+                bool is_test = (static_cast<size_t>(node.id) < is_test_branch.size()) ? is_test_branch[node.id] : true;
+                node_entry["tested"] = is_test;
+            }
 
             if (!res.unconstrained.branch_lengths.empty() && node.id >= 0 && static_cast<size_t>(node.id) < res.unconstrained.branch_lengths.size()) {
                 node_entry["branch_lengths"]["unconstrained"] = res.unconstrained.branch_lengths[node.id];

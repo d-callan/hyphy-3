@@ -182,6 +182,13 @@ int run_slac(int argc, char* argv[]) {
         return 1;
     }
 
+    try {
+        (void)tree.select_branches(test_branches, test_branch_regex);
+    } catch (const std::exception& e) {
+        std::cerr << Console::danger("Error in branch selection: ") << e.what() << "\n";
+        return 1;
+    }
+
     std::cout << Console::muted("  • Sequences : ") << Console::accent(std::to_string(aln.num_taxa)) << "\n"
               << Console::muted("  • Codon Sites: ") << Console::accent(std::to_string(aln.num_codons)) << "\n"
               << Console::muted("  • Tree Leaves: ") << Console::accent(std::to_string(tree.num_leaves())) << "\n"

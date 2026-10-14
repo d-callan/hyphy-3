@@ -3,6 +3,7 @@
 #include "hyphy/core/tree.hpp"
 #include "hyphy/core/console.hpp"
 #include "hyphy/analyses/ohmic.hpp"
+#include "hyphy/report/html_report.hpp"
 
 #include <iostream>
 #include <string>
@@ -43,6 +44,7 @@ static void print_ohmic_usage(const char* prog) {
               << "  " << Console::brand("--woodbury-rank") << " <p>            Rank p for ScalableWoodbury landmarks (default: 256)\n"
               << "  " << Console::brand("--threads, -t") << " <N>              Number of OpenMP worker threads\n"
               << "  " << Console::brand("--output, -o") << " <file>            Path to output JSON file (default: <alignment>.OHMIC.json)\n"
+              << "  " << Console::brand("--html") << " <file>                  Also write a self-contained interactive HTML report\n"
               << "  " << Console::brand("--format") << " <fmt>                 Output format: 'modern' (default) or 'legacy'\n"
               << "  " << Console::brand("--quiet, -q") << "                    Suppress progress output\n"
               << "  " << Console::brand("--help, -h") << "                     Show this help message\n\n"
@@ -54,6 +56,7 @@ static void print_ohmic_usage(const char* prog) {
 int run_ohmic(int argc, char* argv[]) {
     std::string alignment_file;
     std::string output_file;
+    std::string html_file;
     std::string datatype = "nucleotide";
     std::string scale_mode_str = "auto";
     std::string output_format = "modern";
@@ -71,6 +74,8 @@ int run_ohmic(int argc, char* argv[]) {
             alignment_file = argv[++i];
         } else if ((arg == "--output" || arg == "-o") && i + 1 < argc) {
             output_file = argv[++i];
+        } else if (arg == "--html" && i + 1 < argc) {
+            html_file = argv[++i];
         } else if ((arg == "--datatype" || arg == "-d") && i + 1 < argc) {
             datatype = argv[++i];
         } else if (arg == "--hyphaeon") {
@@ -89,10 +94,12 @@ int run_ohmic(int argc, char* argv[]) {
             woodbury_rank = std::stoull(argv[++i]);
         } else if ((arg == "--threads" || arg == "-t") && i + 1 < argc) {
             num_threads = std::stoi(argv[++i]);
-        } else if (arg == "--format" && i + 1 < argc) {
+        } else if ((arg == "--format" || arg == "--json-format") && i + 1 < argc) {
             output_format = argv[++i];
         } else if (arg == "--legacy-json") {
             output_format = "legacy";
+        } else if (arg == "--modern-json") {
+            output_format = "modern";
         } else if (arg == "--quiet" || arg == "-q") {
             quiet = true;
         } else if (arg == "--help" || arg == "-h") {
@@ -170,6 +177,10 @@ int run_ohmic(int argc, char* argv[]) {
         out << json_out.dump(2) << "\n";
         out.close();
 
+        if (!html_file.empty()) {
+            hyphy::report::write_html_report(output_file, html_file);
+        }
+
         if (!quiet) {
             std::ostringstream lnl_s, lnl_o, dlnl, aicc_s, aicc_o, daicc, foster_ss, time_ss;
             lnl_s << std::fixed << std::setprecision(4) << result.single_tree_log_l;
@@ -220,6 +231,11 @@ int run_ohmic(int argc, char* argv[]) {
 
 #ifndef HYPHY3_COMBINED_DRIVER
 int main(int argc, char* argv[]) {
-    return run_ohmic(argc, argv);
+    try {
+        return run_ohmic(argc, argv);
+    } catch (const std::exception& e) {
+        std::cerr << Console::danger("Error: ") << e.what() << "\n";
+        return 1;
+    }
 }
 #endif

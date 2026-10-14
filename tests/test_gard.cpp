@@ -145,6 +145,17 @@ TEST_CASE("GARD: Positive Control on adh.nex (Breakpoint at Site 460)") {
     CHECK(result.best_model.partitions[0].start_site == 1);
     CHECK(result.best_model.partitions[0].end_site == primary_bp + 1);
     CHECK(result.best_model.partitions[1].start_site == primary_bp + 2);
+
+    // Issue #5: Verify legacy JSON has all partitions, trees, and improvements breakpoints
+    auto legacy_json = result.to_legacy_json();
+    CHECK(legacy_json["breakpointData"].size() == result.best_model.partitions.size());
+    CHECK(legacy_json["trees"].size() == result.best_model.partitions.size());
+    CHECK(legacy_json["improvements"].size() == result.improvements.size());
+    for (auto& [k, imp] : legacy_json["improvements"].items()) {
+        CHECK(imp.contains("breakpoints"));
+        CHECK(imp["breakpoints"].is_array());
+        CHECK(!imp["breakpoints"].empty());
+    }
 }
 
 TEST_CASE("GARD: Dynamic Breakpoint Chart and Visualizer") {

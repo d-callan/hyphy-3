@@ -200,103 +200,17 @@ public:
     }
 
     void partition_branches() {
-        size_t n = tree.num_nodes();
-        is_test_branch.assign(n, false);
-        test_branch_names.clear();
-        bg_branch_names.clear();
-        num_tested = 0;
-        num_background = 0;
-
-        bool has_tagged_test = false;
-        for (const auto& node : tree.nodes) {
-            if (node.id != tree.root_id) {
-                if (node.model_tag == "T" || node.model_tag == "Test" || node.model_tag == "test" ||
-                    node.model_tag == "Foreground" || node.model_tag == "fg") {
-                    has_tagged_test = true;
-                    break;
-                }
-            }
-        }
-
-        std::regex test_regex;
-        bool use_test_regex = false;
-        if (!settings.test_branch_regex.empty()) {
-            try {
-                test_regex = std::regex(settings.test_branch_regex, std::regex::icase);
-                use_test_regex = true;
-            } catch (const std::exception& e) {
-                std::cerr << "Warning: Invalid test branch regex: " << e.what() << "\n";
-            }
-        }
-
-        std::unordered_set<std::string> explicit_test_set(
-            settings.test_branch_names.begin(), settings.test_branch_names.end()
+        auto sel = tree.select_branches(
+            settings.test_branches,
+            settings.test_branch_regex,
+            settings.test_branch_names,
+            true
         );
-
-        if (settings.test_branches.find(',') != std::string::npos) {
-            std::stringstream ss(settings.test_branches);
-            std::string item;
-            while (std::getline(ss, item, ',')) {
-                size_t start = item.find_first_not_of(" \t\r\n");
-                size_t end = item.find_last_not_of(" \t\r\n");
-                if (start != std::string::npos && end != std::string::npos) {
-                    explicit_test_set.insert(item.substr(start, end - start + 1));
-                }
-            }
-        }
-
-        std::string mode = settings.test_branches;
-        std::string mode_lower = mode;
-        std::transform(mode_lower.begin(), mode_lower.end(), mode_lower.begin(), ::tolower);
-
-        for (const auto& node : tree.nodes) {
-            if (node.id == tree.root_id) continue;
-
-            bool is_test = false;
-            if (use_test_regex) {
-                is_test = std::regex_search(node.name, test_regex);
-            } else if (!explicit_test_set.empty()) {
-                is_test = explicit_test_set.count(node.name) > 0;
-            } else if (mode_lower == "all" || mode.empty()) {
-                if (has_tagged_test) {
-                    is_test = (node.model_tag == "T" || node.model_tag == "Test" || node.model_tag == "test" ||
-                               node.model_tag == "Foreground" || node.model_tag == "fg");
-                } else {
-                    is_test = true;
-                }
-            } else if (mode_lower == "all-branches" || mode_lower == "all_branches") {
-                is_test = true;
-            } else if (mode_lower == "internal") {
-                is_test = !node.is_leaf;
-            } else if (mode_lower == "leaves" || mode_lower == "terminal") {
-                is_test = node.is_leaf;
-            } else if (mode_lower == "unlabeled") {
-                is_test = node.model_tag.empty();
-            } else if (mode_lower == "t" || mode_lower == "test" || mode_lower == "foreground" || mode_lower == "fg") {
-                is_test = (node.model_tag == "T" || node.model_tag == "Test" || node.model_tag == "test" ||
-                           node.model_tag == "Foreground" || node.model_tag == "fg");
-            } else {
-                std::string tag_lower = node.model_tag;
-                std::transform(tag_lower.begin(), tag_lower.end(), tag_lower.begin(), ::tolower);
-                std::string name_lower = node.name;
-                std::transform(name_lower.begin(), name_lower.end(), name_lower.begin(), ::tolower);
-
-                if (!tag_lower.empty() && tag_lower == mode_lower) {
-                    is_test = true;
-                } else if (name_lower == mode_lower) {
-                    is_test = true;
-                }
-            }
-
-            is_test_branch[node.id] = is_test;
-            if (is_test) {
-                test_branch_names.push_back(node.name);
-                num_tested++;
-            } else {
-                bg_branch_names.push_back(node.name);
-                num_background++;
-            }
-        }
+        is_test_branch = std::move(sel.is_selected);
+        test_branch_names = std::move(sel.selected_names);
+        bg_branch_names = std::move(sel.unselected_names);
+        num_tested = sel.num_selected;
+        num_background = sel.num_unselected;
     }
 
     void prepare_branch_lengths() {
@@ -1064,7 +978,7 @@ public:
 
         // Fits
         if (has_gtr_fit) {
-            j["fits"]["Nucleotide GTR"]["Log-likelihood"] = gtr_log_l;
+            j["fits"]["Nucleotide GTR"]["Log Likelihood"] = gtr_log_l;
             j["fits"]["Nucleotide GTR"]["AIC-c"] = gtr_aicc;
             j["fits"]["Nucleotide GTR"]["display order"] = 0;
             nlohmann::json gtr_ef = nlohmann::json::array();
@@ -1082,7 +996,7 @@ public:
             };
         }
 
-        j["fits"]["Global MG94xREV"]["Log-likelihood"] = global_log_l;
+        j["fits"]["Global MG94xREV"]["Log Likelihood"] = global_log_l;
         j["fits"]["Global MG94xREV"]["AIC-c"] = global_aicc;
         j["fits"]["Global MG94xREV"]["display order"] = 1;
         nlohmann::json mg_ef = nlohmann::json::array();

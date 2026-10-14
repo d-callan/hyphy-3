@@ -56,6 +56,8 @@ static void print_usage(const char* prog) {
               << "  " << Console::brand("--samples") << " <N>            MCMC samples to draw (default: 100)\n"
               << "  " << Console::brand("--threads, -T") << " <N>        Number of OpenMP worker threads\n"
               << "  " << Console::brand("--output, -o") << " <file>      Path to output JSON file (default: <alignment>.FUBAR.json)\n"
+              << "  " << Console::brand("--json-format") << " <fmt>      JSON schema format: modern (default) or legacy (HyPhy 2.5)\n"
+              << "  " << Console::brand("--legacy-json") << "            Output legacy HyPhy 2.5 JSON schema\n"
               << "  " << Console::brand("--all-sites") << "              Display all codon sites in console table (default: significant only)\n"
               << "  " << Console::brand("--progress") << "               Force interactive progress bar\n"
               << "  " << Console::brand("--no-progress") << "            Disable progress bar\n"
@@ -124,9 +126,12 @@ int run_fubar(int argc, char* argv[]) {
             output_file = argv[++i];
         } else if (arg == "--all-sites") {
             all_sites = true;
-        } else if (arg == "--legacy") {
+        } else if (arg == "--json-format" && i + 1 < argc) {
+            std::string fmt = argv[++i];
+            json_format = (fmt == "legacy" || fmt == "datamonkey") ? "legacy" : "modern";
+        } else if (arg == "--legacy" || arg == "--legacy-json") {
             json_format = "legacy";
-        } else if (arg == "--modern") {
+        } else if (arg == "--modern" || arg == "--modern-json") {
             json_format = "modern";
         } else if (arg == "--progress") {
             show_progress = true;
@@ -135,6 +140,10 @@ int run_fubar(int argc, char* argv[]) {
         } else if (arg == "--help" || arg == "-h") {
             print_usage(argv[0]);
             return 0;
+        } else {
+            std::cerr << Console::danger("Unknown argument: ") << arg << "\n";
+            print_usage(argv[0]);
+            return 1;
         }
     }
 

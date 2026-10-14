@@ -40,6 +40,39 @@ if(OpenMP_CXX_FOUND)
     target_link_libraries(hyphy3_core INTERFACE OpenMP::OpenMP_CXX)
 endif()
 
+# HTML results viewer (viz/fel-viewer), embedded into the binaries at build time so hyphy3 can
+# write self-contained reports with no Node, Python or companion files (cmake/EmbedViewer.cmake)
+set(HYPHY3_VIEWER_DIR ${CMAKE_CURRENT_SOURCE_DIR}/viz/fel-viewer)
+set(HYPHY3_OHMIC_VIEWER_DIR ${CMAKE_CURRENT_SOURCE_DIR}/viz/ohmic-viewer)
+set(HYPHY3_GENERATED_DIR ${CMAKE_CURRENT_BINARY_DIR}/generated)
+set(HYPHY3_VIEWER_HEADER ${HYPHY3_GENERATED_DIR}/hyphy/report/viewer_assets.hpp)
+set(HYPHY3_VIEWER_STAMP ${HYPHY3_GENERATED_DIR}/viewer_assets.stamp)
+file(GLOB_RECURSE HYPHY3_VIEWER_SOURCES CONFIGURE_DEPENDS
+    ${HYPHY3_VIEWER_DIR}/src/*.js
+    ${HYPHY3_VIEWER_DIR}/src/*.css
+    ${HYPHY3_OHMIC_VIEWER_DIR}/src/*.js
+    ${HYPHY3_OHMIC_VIEWER_DIR}/src/*.css
+)
+add_custom_command(
+    OUTPUT ${HYPHY3_VIEWER_STAMP}
+    BYPRODUCTS ${HYPHY3_VIEWER_HEADER}
+    COMMAND ${CMAKE_COMMAND}
+        -DVIEWER_DIR=${HYPHY3_VIEWER_DIR}
+        -DOHMIC_VIEWER_DIR=${HYPHY3_OHMIC_VIEWER_DIR}
+        -DOUTPUT=${HYPHY3_VIEWER_HEADER}
+        -DSTAMP=${HYPHY3_VIEWER_STAMP}
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/EmbedViewer.cmake
+    DEPENDS ${HYPHY3_VIEWER_SOURCES} ${CMAKE_CURRENT_SOURCE_DIR}/cmake/EmbedViewer.cmake
+    COMMENT "Embedding HTML results viewer"
+    VERBATIM
+)
+add_custom_target(hyphy3_viewer_assets DEPENDS ${HYPHY3_VIEWER_STAMP})
+
+add_library(hyphy3_report INTERFACE)
+target_include_directories(hyphy3_report INTERFACE ${HYPHY3_GENERATED_DIR})
+target_link_libraries(hyphy3_report INTERFACE hyphy3_core)
+add_dependencies(hyphy3_report hyphy3_viewer_assets)
+
 # Test targets
 enable_testing()
 # Lets tests locate benchmarks/ and tests/data/ regardless of working directory
@@ -112,6 +145,18 @@ add_executable(hyphy_ohmic_test tests/test_ohmic.cpp)
 target_link_libraries(hyphy_ohmic_test PRIVATE hyphy3_core)
 add_test(NAME OhmicTest COMMAND hyphy_ohmic_test)
 
+add_executable(hyphy_report_test tests/test_report.cpp)
+target_link_libraries(hyphy_report_test PRIVATE hyphy3_report)
+add_test(NAME ReportTest COMMAND hyphy_report_test)
+
+add_test(NAME HTMLReportEndToEndTest
+    COMMAND ${CMAKE_COMMAND}
+        -DHYPHY3=$<TARGET_FILE:hyphy3>
+        -DDATA_DIR=${CMAKE_CURRENT_SOURCE_DIR}/benchmarks/data
+        -DWORK_DIR=${CMAKE_CURRENT_BINARY_DIR}/html_report_test
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/check_html_report.cmake
+)
+
 
 # Unified HyPhy 3 CLI Driver (hyphy3 fel ..., hyphy3 meme ..., hyphy3 busted ..., hyphy3 absrel ..., hyphy3 relax ..., hyphy3 fubar ..., hyphy3 prime ..., hyphy3 gard ..., hyphy3 slac ..., hyphy3 dfel ..., hyphy3 ohmic ...)
 add_executable(hyphy3
@@ -128,19 +173,20 @@ add_executable(hyphy3
     src/apps/hyphy_slac.cpp
     src/apps/hyphy_dfel.cpp
     src/apps/hyphy_ohmic.cpp
+    src/apps/hyphy_report.cpp
 )
 target_compile_definitions(hyphy3 PRIVATE HYPHY3_COMBINED_DRIVER)
-target_link_libraries(hyphy3 PRIVATE hyphy3_core)
+target_link_libraries(hyphy3 PRIVATE hyphy3_report)
 
 # Standalone CLI Applications
 add_executable(hyphy3-fel src/apps/hyphy_fel.cpp)
-target_link_libraries(hyphy3-fel PRIVATE hyphy3_core)
+target_link_libraries(hyphy3-fel PRIVATE hyphy3_report)
 
 add_executable(hyphy3-contrast-fel src/apps/hyphy_contrast_fel.cpp)
 target_link_libraries(hyphy3-contrast-fel PRIVATE hyphy3_core)
 
 add_executable(hyphy3-meme src/apps/hyphy_meme.cpp)
-target_link_libraries(hyphy3-meme PRIVATE hyphy3_core)
+target_link_libraries(hyphy3-meme PRIVATE hyphy3_report)
 
 add_executable(hyphy3-busted src/apps/hyphy_busted.cpp)
 target_link_libraries(hyphy3-busted PRIVATE hyphy3_core)
@@ -164,10 +210,10 @@ add_executable(hyphy3-slac src/apps/hyphy_slac.cpp)
 target_link_libraries(hyphy3-slac PRIVATE hyphy3_core)
 
 add_executable(hyphy3-dfel src/apps/hyphy_dfel.cpp)
-target_link_libraries(hyphy3-dfel PRIVATE hyphy3_core)
+target_link_libraries(hyphy3-dfel PRIVATE hyphy3_report)
 
 add_executable(hyphy3-ohmic src/apps/hyphy_ohmic.cpp)
-target_link_libraries(hyphy3-ohmic PRIVATE hyphy3_core)
+target_link_libraries(hyphy3-ohmic PRIVATE hyphy3_report)
 
 # Backward-compatible aliases
 add_executable(hyphy-fel ALIAS hyphy3-fel)

@@ -136,3 +136,20 @@ TEST_CASE("RELAX: User-specified test branch regex") {
         CHECK(name.find("PSEUDOGENE") != std::string::npos);
     }
 }
+
+TEST_CASE("Issue #4: RELAX case-insensitive {TEST}/{REFERENCE} tags and Unclassified partition") {
+    std::string aln_path = HYPHY3_SOURCE_DIR "/benchmarks/data/cd2_reduced.fna";
+    // Tag Human and Chimp as {TEST}, Baboon and RhMonkey as {REFERENCE}, leave others untagged (Unclassified)
+    std::string nwk = "((((Pig:0.147969,Cow:0.213430):0.085099,Horse:0.165787,Cat:0.264806):0.058611,((RhMonkey{REFERENCE}:0.002015,Baboon{REFERENCE}:0.003108):0.022733,(Human{TEST}:0.004349,Chimp{TEST}:0.000799):0.011873):0.101856):0.340802,Rat:0.050958,Mouse:0.097950);";
+
+    auto aln = Alignment::from_fasta(aln_path);
+    auto tree = Tree::from_newick(nwk);
+
+    RELAXSettings settings;
+    auto relax = RELAXAnalyzer::create(tree, aln, settings);
+
+    CHECK(relax.test_branch_names.size() == 2);
+    CHECK(relax.ref_branch_names.size() == 2);
+    CHECK(!relax.unclassified_branch_names.empty());
+}
+
