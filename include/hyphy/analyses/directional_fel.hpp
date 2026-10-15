@@ -7,6 +7,7 @@
 #include "hyphy/core/likelihood.hpp"
 #include "hyphy/core/progress_bar.hpp"
 #include "hyphy/core/provenance.hpp"
+#include "hyphy/core/json_output.hpp"
 #include "hyphy/analyses/site_visualizer.hpp"
 #include "hyphy/opt/nelder_mead.hpp"
 #include "hyphy/opt/optimizer.hpp"
@@ -1555,47 +1556,70 @@ public:
     // ========================================================================
 
     nlohmann::json to_modern_json(const std::string& input_filepath = "", const std::string& tree_string = "") const {
+        AnalysisMetadata meta{
+            "dfel",
+            "Directional Fixed Effects Likelihood",
+            "3.0.0",
+            "selection",
+            "Directional FEL detects site-level selection while accounting for lineage-specific compositional heterogeneity and auto-rooting via non-reversible dynamics",
+            {},
+            {
+                {"p_value_threshold", p_value_threshold},
+                {"heterogeneity_threshold", settings.heterogeneity_threshold},
+                {"root_strategy", settings.root_strategy},
+                {"num_regimes", regimes.size()}
+            }
+        };
+
         nlohmann::json j;
         j["$schema"] = "https://raw.githubusercontent.com/veg/hyphy-3/main/schemas/v3/dfel.v3.schema.json";
-        j["schema_version"] = "3.0.0";
-
-        // Analysis
-        j["analysis"]["id"] = "dfel";
-        j["analysis"]["name"] = "Directional Fixed Effects Likelihood";
-        j["analysis"]["version"] = "3.0.0";
-        j["analysis"]["category"] = "selection";
-        j["analysis"]["description"] = "Directional FEL detects site-level selection while accounting for lineage-specific compositional heterogeneity and auto-rooting via non-reversible dynamics";
-        j["analysis"]["settings"]["p_value_threshold"] = p_value_threshold;
-        j["analysis"]["settings"]["heterogeneity_threshold"] = settings.heterogeneity_threshold;
-        j["analysis"]["settings"]["root_strategy"] = settings.root_strategy;
-        j["analysis"]["settings"]["num_regimes"] = regimes.size();
-
-        // Software
-        j["software"]["name"] = "hyphy";
-        j["software"]["version"] = "3.0.0";
+        j["schema_version"] = meta.version;
+        j["analysis"] = meta.to_json();
+        j["software"] = software_block();
         j["software"]["citation"] = "Directional Evolution & Fixed Effects Likelihood under Non-Stationary Composition Dynamics (2026)";
 
-        // Provenance
+        // Provenance — dFEL's signature carries no cli_cmd, so build the
+        // block inline with a fixed invocation label.
+        {
+            Provenance prov;
+            prov.invocation.cli_command = "hyphy3 dfel";
+            prov.invocation.working_directory = Provenance::get_cwd();
+            if (!input_filepath.empty()) {
+                size_t sz = 0;
+                std::string hash = crypto::SHA256::hash_file(input_filepath, &sz);
+                if (!hash.empty()) {
+                    prov.inputs["alignment"] = {input_filepath, "FASTA/NEXUS", hash, sz};
+                }
+            }
+            prov.execution.start_time = Provenance::current_iso8601();
+            prov.execution.end_time = prov.execution.start_time;
+            prov.execution.hostname = Provenance::get_hostname();
+            prov.execution.os = Provenance::detect_os();
+            prov.execution.compiler = Provenance::detect_compiler();
+            j["provenance"] = prov.to_json();
+        }
         j["provenance"]["created_at"] = Provenance::current_iso8601();
 
-        // Dataset
+        // Dataset — dfel.v3.schema.json pins genetic_code as a plain string
+        // and patterns_count (not the shared unique_patterns key), so this
+        // block stays custom.
         j["dataset"]["file"] = input_filepath;
         j["dataset"]["taxa_count"] = aln.num_taxa;
         j["dataset"]["codon_sites"] = aln.num_codons;
         j["dataset"]["patterns_count"] = aln.patterns.size();
         j["dataset"]["genetic_code"] = aln.code ? aln.code->name : "Universal";
 
-        // Phylogeny
+        // Phylogeny — schema-pinned custom shape (rooted auto-root details).
         j["phylogeny"]["rooted"] = true;
         j["phylogeny"]["root_branch"] = root_result.chosen_branch_name;
-        j["phylogeny"]["root_log_likelihood"] = root_result.chosen_log_l;
-        j["phylogeny"]["root_weight"] = root_result.chosen_weight;
-        j["phylogeny"]["tree_length"] = baseline_tree_length;
+        j["phylogeny"]["root_log_likelihood"] = finite_or_null(root_result.chosen_log_l);
+        j["phylogeny"]["root_weight"] = finite_or_null(root_result.chosen_weight);
+        j["phylogeny"]["tree_length"] = finite_or_null(baseline_tree_length);
         if (!tree_string.empty()) {
             j["phylogeny"]["newick"] = tree_string;
         }
 
-        // Compositional Heterogeneity Test
+        // Compositional heterogeneity test
         nlohmann::json comp_j;
         comp_j["is_heterogeneous"] = comp_test.is_heterogeneous;
         comp_j["overall"] = { {"chi2", comp_test.chi2_overall}, {"df", comp_test.df_overall}, {"p_value", comp_test.p_value_overall} };
@@ -1614,7 +1638,7 @@ public:
         comp_j["taxa"] = taxa_arr;
         j["compositional_heterogeneity"] = comp_j;
 
-        // Auto-Rooting Candidates
+        // Auto-rooting candidates
         nlohmann::json root_cands = nlohmann::json::array();
         for (const auto& c : root_result.candidates) {
             root_cands.push_back({
@@ -1653,20 +1677,20 @@ public:
         }
         j["directional_model"]["branch_regimes"] = branch_regimes_j;
 
-        // Model Fits
-        j["model_fits"]["gtr"]["log_likelihood"] = gtr_log_l;
-        j["model_fits"]["gtr"]["aicc"] = gtr_aicc;
-        j["model_fits"]["directional_mg94"]["log_likelihood"] = global_log_l;
-        j["model_fits"]["directional_mg94"]["aicc"] = global_aicc;
+        // Model fits — schema pins these two fit names
+        j["model_fits"]["gtr"]["log_likelihood"] = finite_or_null(gtr_log_l);
+        j["model_fits"]["gtr"]["aicc"] = finite_or_null(gtr_aicc);
+        j["model_fits"]["directional_mg94"]["log_likelihood"] = finite_or_null(global_log_l);
+        j["model_fits"]["directional_mg94"]["aicc"] = finite_or_null(global_aicc);
 
-        // Site Results
-        nlohmann::json site_data;
-        std::vector<size_t> sites_vec;
-        std::vector<Scalar> alpha_vec, beta_vec, alpha_null_vec, lrt_vec, pval_vec;
+        // Site results (columnar; ColumnarResults enforces equal-length)
+        ColumnarResults table;
+        std::vector<int> sites_vec;
+        std::vector<double> alpha_vec, beta_vec, alpha_null_vec, lrt_vec, pval_vec;
         std::vector<std::string> class_vec, subs_vec;
 
         for (const auto& r : site_results) {
-            sites_vec.push_back(r.site_index + 1);
+            sites_vec.push_back(static_cast<int>(r.site_index + 1));
             alpha_vec.push_back(r.alpha);
             beta_vec.push_back(r.beta);
             alpha_null_vec.push_back(r.alpha_null);
@@ -1682,15 +1706,15 @@ public:
             subs_vec.push_back(r.subs.summary_string);
         }
 
-        site_data["site"] = sites_vec;
-        site_data["alpha"] = alpha_vec;
-        site_data["beta"] = beta_vec;
-        site_data["alpha_null"] = alpha_null_vec;
-        site_data["lrt"] = lrt_vec;
-        site_data["p_value"] = pval_vec;
-        site_data["classification"] = class_vec;
-        site_data["substitutions"] = subs_vec;
-        j["site_results"]["data"] = site_data;
+        table.add_column("site", {"integer", "1-based codon site index"}, sites_vec);
+        table.add_column("alpha", {"number", "Synonymous rate under the directional model"}, alpha_vec);
+        table.add_column("beta", {"number", "Non-synonymous rate under the directional model"}, beta_vec);
+        table.add_column("alpha_null", {"number", "Synonymous rate under the null model"}, alpha_null_vec);
+        table.add_column("lrt", {"number", "Likelihood ratio test statistic"}, lrt_vec);
+        table.add_column("p_value", {"number", "Site-level p-value"}, pval_vec);
+        table.add_column("classification", {"string", "diversifying, purifying, or neutral"}, class_vec);
+        table.add_column("substitutions", {"string", "Summary of inferred substitutions at the site"}, subs_vec);
+        j["site_results"] = table.to_json();
 
         return j;
     }

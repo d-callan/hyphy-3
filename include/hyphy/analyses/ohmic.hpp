@@ -7,6 +7,8 @@
 #include "hyphy/core/likelihood.hpp"
 #include "hyphy/core/ohmic_network.hpp"
 #include "hyphy/core/wheatstone_likelihood.hpp"
+#include "hyphy/core/provenance.hpp"
+#include "hyphy/core/json_output.hpp"
 #include "hyphy/opt/optimizer.hpp"
 #include "LBFGSB.h"
 #include <nlohmann/json.hpp>
@@ -78,6 +80,32 @@ struct OhmicResult {
             {"authors", "Sergei L Kosakovsky Pond"},
             {"contact", "spond@temple.edu"}
         };
+        j["software"] = software_block();
+
+        // Provenance — to_modern_json carries no cli_cmd, so build the
+        // block inline with a fixed invocation label.
+        {
+            const std::string in_path = filepath.empty() ? settings.input_file : filepath;
+            Provenance prov;
+            prov.invocation.cli_command = "hyphy3 ohmic";
+            prov.invocation.working_directory = Provenance::get_cwd();
+            if (!in_path.empty()) {
+                size_t sz = 0;
+                std::string hash = crypto::SHA256::hash_file(in_path, &sz);
+                if (!hash.empty()) {
+                    prov.inputs["alignment"] = {in_path, "FASTA/NEXUS", hash, sz};
+                }
+            }
+            prov.execution.start_time = Provenance::current_iso8601();
+            prov.execution.end_time = prov.execution.start_time;
+            prov.execution.wall_time_seconds = runtime_seconds;
+            prov.execution.cpu_threads = 1;
+            prov.execution.hostname = Provenance::get_hostname();
+            prov.execution.os = Provenance::detect_os();
+            prov.execution.compiler = Provenance::detect_compiler();
+            j["provenance"] = prov.to_json();
+        }
+
         j["dataset"] = {
             {"file", filepath.empty() ? settings.input_file : filepath},
             {"taxa_count", static_cast<int>(num_taxa)},
@@ -97,14 +125,14 @@ struct OhmicResult {
         };
         j["fits"] = {
             {"single_tree", {
-                {"log_likelihood", single_tree_log_l},
-                {"aicc", single_tree_aicc}
+                {"log_likelihood", finite_or_null(single_tree_log_l)},
+                {"aicc", finite_or_null(single_tree_aicc)}
             }},
             {"ohmic_network", {
-                {"log_likelihood", ohmic_log_l},
-                {"aicc", ohmic_aicc},
-                {"delta_log_likelihood", delta_log_l},
-                {"delta_aicc", delta_aicc}
+                {"log_likelihood", finite_or_null(ohmic_log_l)},
+                {"aicc", finite_or_null(ohmic_aicc)},
+                {"delta_log_likelihood", finite_or_null(delta_log_l)},
+                {"delta_aicc", finite_or_null(delta_aicc)}
             }}
         };
         nlohmann::json bridges_arr = nlohmann::json::array();

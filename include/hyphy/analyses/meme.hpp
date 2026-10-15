@@ -7,6 +7,7 @@
 #include "hyphy/core/likelihood.hpp"
 #include "hyphy/opt/nelder_mead.hpp"
 #include "hyphy/opt/optimizer.hpp"
+#include "hyphy/core/json_output.hpp"
 #include "hyphy/analyses/fel.hpp"
 #include "hyphy/analyses/site_visualizer.hpp"
 #include "hyphy/core/progress_bar.hpp"
@@ -547,162 +548,46 @@ public:
     }
 
     nlohmann::json to_modern_json(const Provenance& prov = {}) const {
-        nlohmann::json j;
-
-        j["$schema"] = "https://raw.githubusercontent.com/veg/hyphy-3/main/schemas/v3/meme.v3.schema.json";
-        j["schema_version"] = "3.0.0";
-
-        // Analysis block
-        j["analysis"]["id"] = "meme";
-        j["analysis"]["name"] = "Mixed Effects Model of Evolution";
-        j["analysis"]["version"] = "3.0.0";
-        j["analysis"]["category"] = "episodic_site_selection";
-        j["analysis"]["description"] = "MEME (Mixed Effects Model of Evolution) estimates site-wise synonymous (alpha) and two-category non-synonymous rates (beta1 with p1, and beta+ with p+), using a likelihood ratio test for episodic diversifying selection.";
-        j["analysis"]["citations"] = nlohmann::json::array({
+        AnalysisMetadata meta{
+            "meme",
+            "Mixed Effects Model of Evolution",
+            "3.0.0",
+            "episodic_site_selection",
+            "MEME (Mixed Effects Model of Evolution) estimates site-wise synonymous (alpha) and two-category non-synonymous rates (beta1 with p1, and beta+ with p+), using a likelihood ratio test for episodic diversifying selection.",
+            {citation("Murrell B, Wertheim JO, Moola S, Weighill T, Scheffler K, Kosakovsky Pond SL (2012). Detecting Individual Sites Subject to Episodic Diversifying Selection. PLoS Genet 8(7): e1002764.",
+                      "10.1371/journal.pgen.1002764", "22844254")},
             {
-                {"citation", "Murrell B, Wertheim JO, Moola S, Weighill T, Scheffler K, Kosakovsky Pond SL (2012). Detecting Individual Sites Subject to Episodic Diversifying Selection. PLoS Genet 8(7): e1002764."},
-                {"doi", "10.1371/journal.pgen.1002764"},
-                {"pmid", "22844254"}
+                {"pvalue_threshold", p_value_threshold},
+                {"code", aln.code ? aln.code->name : "Universal"}
             }
-        });
-        j["analysis"]["settings"]["pvalue_threshold"] = p_value_threshold;
-        j["analysis"]["settings"]["code"] = aln.code ? aln.code->name : "Universal";
+        };
 
-        // Software block
-        j["software"]["name"] = "hyphy";
-        j["software"]["version"] = "3.0.0";
-        j["software"]["git_commit"] = "6e22db3";
-        j["software"]["build_type"] = "Release";
-        j["software"]["compiler"] = Provenance::detect_compiler();
+        nlohmann::json j = new_analysis_json(meta, prov, input_filepath);
+        j["dataset"] = dataset_block(aln);
+        j["phylogeny"] = phylogeny_block(
+            tree, tree_string,
+            mg94_branch_lengths_fn(conversion_factor, has_gtr_fit, gtr_branch_lengths));
 
-        // Provenance block
-        if (!prov.invocation.cli_command.empty() || !prov.inputs.empty()) {
-            j["provenance"] = prov.to_json();
-        } else {
-            Provenance auto_prov;
-            auto_prov.invocation.cli_command = "hyphy3 meme";
-            auto_prov.invocation.working_directory = Provenance::get_cwd();
-            if (!input_filepath.empty()) {
-                size_t sz = 0;
-                std::string hash = crypto::SHA256::hash_file(input_filepath, &sz);
-                auto_prov.inputs["alignment"] = {input_filepath, "FASTA/NEXUS", hash, sz};
-            }
-            auto_prov.execution.start_time = Provenance::current_iso8601();
-            auto_prov.execution.end_time = Provenance::current_iso8601();
-            auto_prov.execution.wall_time_seconds = 0.0;
-            auto_prov.execution.cpu_threads = 1;
-            auto_prov.execution.hostname = Provenance::get_hostname();
-            auto_prov.execution.os = Provenance::detect_os();
-            auto_prov.execution.compiler = Provenance::detect_compiler();
-            j["provenance"] = auto_prov.to_json();
-        }
-
-        // Dataset block
-        j["dataset"]["taxa_count"] = aln.num_taxa;
-        j["dataset"]["codon_sites"] = aln.num_codons;
-        j["dataset"]["nucleotide_sites"] = aln.num_codons * 3;
-        j["dataset"]["unique_patterns"] = aln.patterns.size();
-        j["dataset"]["taxa"] = aln.taxon_names;
-
-        nlohmann::json seqs_json = nlohmann::json::object();
-        for (const auto& s : aln.sequences) {
-            seqs_json[s.name] = s.raw_seq;
-        }
-        j["dataset"]["sequences"] = seqs_json;
-
-        nlohmann::json gcode;
-        gcode["id"] = aln.code ? aln.code->name : "Universal";
-        gcode["name"] = aln.code ? aln.code->name : "Universal";
-        gcode["sense_codons"] = aln.code ? static_cast<int>(aln.code->sense_codons.size()) : 61;
-        if (aln.code) {
-            gcode["stop_codons"] = aln.code->stop_codons;
-        } else {
-            gcode["stop_codons"] = {"TAA", "TAG", "TGA"};
-        }
-        j["dataset"]["genetic_code"] = gcode;
-
-        j["dataset"]["partitions"] = nlohmann::json::array({
-            {
-                {"id", "default"},
-                {"name", "Full Alignment"},
-                {"span", nlohmann::json::array({nlohmann::json::array({1, aln.num_codons})})},
-                {"sites_count", aln.num_codons},
-                {"patterns_count", aln.patterns.size()}
-            }
-        });
-
-        // Phylogeny block
-        std::string nwk = tree_string.empty() ? tree.to_newick() : tree_string;
-        j["phylogeny"]["newick"] = nwk;
-
-        nlohmann::json nodes_json;
-        double sum_bl_mg94 = 0.0;
-        double sum_bl_gtr = 0.0;
-
-        for (const auto& node : tree.nodes) {
-            nlohmann::json node_entry;
-            node_entry["type"] = node.children.empty() ? "leaf" : "internal";
-
-            Scalar mg_bl = (conversion_factor > 0.0) ? (node.branch_length / conversion_factor) : node.branch_length;
-            node_entry["branch_lengths"]["codon_mg94"] = mg_bl;
-            if (node.id != tree.root_id) sum_bl_mg94 += mg_bl;
-
-            if (has_gtr_fit) {
-                auto it = gtr_branch_lengths.find(node.name);
-                Scalar gtr_bl = (it != gtr_branch_lengths.end()) ? it->second : mg_bl;
-                node_entry["branch_lengths"]["nucleotide_gtr"] = gtr_bl;
-                if (node.id != tree.root_id) sum_bl_gtr += gtr_bl;
-            }
-
-            if (!node.model_tag.empty()) {
-                node_entry["model_tags"] = nlohmann::json::array({node.model_tag});
-            }
-
-            nodes_json[node.name] = node_entry;
-        }
-        j["phylogeny"]["nodes"] = nodes_json;
-        j["phylogeny"]["tree_lengths"]["codon_mg94"] = sum_bl_mg94;
+        // Model fits
         if (has_gtr_fit) {
-            j["phylogeny"]["tree_lengths"]["nucleotide_gtr"] = sum_bl_gtr;
+            j["model_fits"]["nucleotide_gtr"] = nucleotide_gtr_fit(
+                aln, gtr_rates, gtr_log_l, gtr_aicc,
+                5 + static_cast<int>(tree.nodes.size()) - 1);
         }
-
-        // Model fits block
-        if (has_gtr_fit) {
-            j["model_fits"]["nucleotide_gtr"]["description"] = "General Time Reversible nucleotide model with empirical frequencies";
-            j["model_fits"]["nucleotide_gtr"]["log_likelihood"] = gtr_log_l;
-            j["model_fits"]["nucleotide_gtr"]["aicc"] = gtr_aicc;
-            j["model_fits"]["nucleotide_gtr"]["parameters_count"] = 5 + static_cast<int>(tree.nodes.size()) - 1;
-            j["model_fits"]["nucleotide_gtr"]["equilibrium_frequencies"] = {
-                {"A", aln.nuc_frequencies(0)},
-                {"C", aln.nuc_frequencies(1)},
-                {"G", aln.nuc_frequencies(2)},
-                {"T", aln.nuc_frequencies(3)}
-            };
-            j["model_fits"]["nucleotide_gtr"]["substitution_rates"] = {
-                {"AC", gtr_rates.theta_AC},
-                {"AG", 1.0},
-                {"AT", gtr_rates.theta_AT},
-                {"CG", gtr_rates.theta_CG},
-                {"CT", gtr_rates.theta_CT},
-                {"GT", gtr_rates.theta_GT}
-            };
-        }
-
-        j["model_fits"]["codon_mg94"]["description"] = "Muse-Gaut 1994 x GTR codon model with shared global omega";
-        j["model_fits"]["codon_mg94"]["log_likelihood"] = global_log_l;
-        j["model_fits"]["codon_mg94"]["aicc"] = global_aicc;
-        j["model_fits"]["codon_mg94"]["parameters_count"] = 6 + static_cast<int>(tree.nodes.size()) - 1;
+        j["model_fits"]["codon_mg94"] = fit_entry(
+            "Muse-Gaut 1994 x GTR codon model with shared global omega",
+            global_log_l, global_aicc,
+            6 + static_cast<int>(tree.nodes.size()) - 1);
         j["model_fits"]["codon_mg94"]["global_parameters"] = {
             {"omega", (base_params.alpha > 0.0) ? (base_params.beta / base_params.alpha) : 1.0},
             {"tree_scale", 1.0}
         };
 
-        // Statistical tests block
+        // Statistical tests
         int diversifying_sites = 0;
         for (const auto& r : site_results) {
             if (r.p_value <= p_value_threshold) diversifying_sites++;
         }
-
         j["statistical_tests"]["site_level_summary"] = {
             {"method", "Mixed Effects Model of Evolution (MEME)"},
             {"test_statistic", "Likelihood Ratio Test (LRT)"},
@@ -715,57 +600,25 @@ public:
             {"diversifying_count", diversifying_sites}
         };
 
-        // Site Results (Columnar format)
-        j["site_results"]["columns"] = {
-            {"site", {{"type", "integer"}, {"unit", "1-based codon position"}, {"description", "Alignment codon site index (1-based)"}}},
-            {"alpha", {{"type", "float"}, {"unit", "substitutions/site"}, {"description", "Synonymous substitution rate estimate (alpha)"}}},
-            {"beta1", {{"type", "float"}, {"unit", "substitutions/site"}, {"description", "Non-synonymous rate for negative/neutral component"}}},
-            {"p1", {{"type", "float"}, {"description", "Weight allocated to negative/neutral component"}}},
-            {"beta_plus", {{"type", "float"}, {"unit", "substitutions/site"}, {"description", "Non-synonymous rate for positive selection component"}}},
-            {"p_plus", {{"type", "float"}, {"description", "Weight allocated to positive selection component"}}},
-            {"lrt", {{"type", "float"}, {"description", "Likelihood ratio test statistic for episodic diversification"}}},
-            {"p_value", {{"type", "float"}, {"description", "Asymptotic p-value from mixture chi^2 distribution"}}},
-            {"branches_under_selection", {{"type", "integer"}, {"description", "Number of branches with empirical Bayes factor >= 100"}}},
-            {"total_branch_length", {{"type", "float"}, {"unit", "substitutions/site"}, {"description", "Total length of branches contributing to inference at this site"}}},
-            {"log_l_meme", {{"type", "float"}, {"description", "Site log-likelihood under MEME model"}}},
-            {"log_l_fel", {{"type", "float"}, {"description", "Site log-likelihood under FEL model"}}},
-            {"classification", {{"type", "string"}, {"description", "Selection classification at threshold (diversifying, neutral)"}}},
-            {"substitution_history", {{"type", "string"}, {"description", "Formatted string of observed substitution events at this site"}}},
-            {"mean_substitution_surprise", {{"type", "float"}, {"unit", "bits"}, {"description", "Mean Shannon perplexity surprise across substitution events at this site"}}},
-            {"site_perplexity", {{"type", "float"}, {"description", "Empirical site perplexity metric"}}},
-            {"synonymous_substitutions", {{"type", "integer"}, {"description", "Count of synonymous substitutions at this site"}}},
-            {"nonsynonymous_substitutions", {{"type", "integer"}, {"description", "Count of non-synonymous substitutions at this site"}}},
-            {"branch_ebf", {{"type", "object"}, {"description", "Map of branch names to Empirical Bayes Factors (EBF >= 1.0) under positive selection"}}}
-        };
-
-        std::vector<int> col_site, col_branches;
-        std::vector<double> col_alpha, col_beta1, col_p1, col_beta_plus, col_p_plus;
-        std::vector<double> col_lrt, col_pval, col_tbl, col_ll_meme, col_ll_fel;
+        // Site results (columnar; ColumnarResults enforces equal-length)
+        ColumnarResults table;
+        const size_t n = site_results.size();
+        std::vector<int> col_site, col_branches, col_syn, col_nonsyn;
+        std::vector<double> col_alpha, col_beta1, col_p1, col_beta_plus, col_p_plus,
+                            col_lrt, col_pval, col_tbl, col_ll_meme, col_ll_fel,
+                            col_surprise, col_perplexity;
         std::vector<std::string> col_class, col_history;
-        std::vector<double> col_surprise, col_perplexity;
-        std::vector<int> col_syn, col_nonsyn;
         nlohmann::json col_branch_ebf = nlohmann::json::array();
 
-        col_site.reserve(site_results.size());
-        col_alpha.reserve(site_results.size());
-        col_beta1.reserve(site_results.size());
-        col_p1.reserve(site_results.size());
-        col_beta_plus.reserve(site_results.size());
-        col_p_plus.reserve(site_results.size());
-        col_lrt.reserve(site_results.size());
-        col_pval.reserve(site_results.size());
-        col_branches.reserve(site_results.size());
-        col_tbl.reserve(site_results.size());
-        col_ll_meme.reserve(site_results.size());
-        col_ll_fel.reserve(site_results.size());
-        col_class.reserve(site_results.size());
-        col_history.reserve(site_results.size());
-        col_surprise.reserve(site_results.size());
-        col_perplexity.reserve(site_results.size());
-        col_syn.reserve(site_results.size());
-        col_nonsyn.reserve(site_results.size());
+        col_site.reserve(n); col_alpha.reserve(n); col_beta1.reserve(n);
+        col_p1.reserve(n); col_beta_plus.reserve(n); col_p_plus.reserve(n);
+        col_lrt.reserve(n); col_pval.reserve(n); col_branches.reserve(n);
+        col_tbl.reserve(n); col_ll_meme.reserve(n); col_ll_fel.reserve(n);
+        col_class.reserve(n); col_history.reserve(n);
+        col_surprise.reserve(n); col_perplexity.reserve(n);
+        col_syn.reserve(n); col_nonsyn.reserve(n);
 
-        for (size_t i = 0; i < site_results.size(); ++i) {
+        for (size_t i = 0; i < n; ++i) {
             const auto& r = site_results[i];
             col_site.push_back(static_cast<int>(i + 1));
             col_alpha.push_back(r.alpha);
@@ -789,35 +642,37 @@ public:
 
             nlohmann::json site_ebf = nlohmann::json::object();
             for (const auto& node : tree.nodes) {
-                if (node.id != tree.root_id && node.id >= 0 && static_cast<size_t>(node.id) < r.branch_ebf.size()) {
+                if (node.id != tree.root_id && node.id >= 0 &&
+                    static_cast<size_t>(node.id) < r.branch_ebf.size()) {
                     Scalar ebf = r.branch_ebf[node.id];
                     if (ebf >= 1.0) {
-                        site_ebf[node.name] = ebf;
+                        site_ebf[node.name] = finite_or_null(ebf);
                     }
                 }
             }
             col_branch_ebf.push_back(site_ebf);
         }
 
-        j["site_results"]["data"]["site"] = col_site;
-        j["site_results"]["data"]["alpha"] = col_alpha;
-        j["site_results"]["data"]["beta1"] = col_beta1;
-        j["site_results"]["data"]["p1"] = col_p1;
-        j["site_results"]["data"]["beta_plus"] = col_beta_plus;
-        j["site_results"]["data"]["p_plus"] = col_p_plus;
-        j["site_results"]["data"]["lrt"] = col_lrt;
-        j["site_results"]["data"]["p_value"] = col_pval;
-        j["site_results"]["data"]["branches_under_selection"] = col_branches;
-        j["site_results"]["data"]["total_branch_length"] = col_tbl;
-        j["site_results"]["data"]["log_l_meme"] = col_ll_meme;
-        j["site_results"]["data"]["log_l_fel"] = col_ll_fel;
-        j["site_results"]["data"]["classification"] = col_class;
-        j["site_results"]["data"]["substitution_history"] = col_history;
-        j["site_results"]["data"]["mean_substitution_surprise"] = col_surprise;
-        j["site_results"]["data"]["site_perplexity"] = col_perplexity;
-        j["site_results"]["data"]["synonymous_substitutions"] = col_syn;
-        j["site_results"]["data"]["nonsynonymous_substitutions"] = col_nonsyn;
-        j["site_results"]["data"]["branch_ebf"] = col_branch_ebf;
+        table.add_column("site", {"integer", "Alignment codon site index (1-based)", "1-based codon position"}, col_site);
+        table.add_column("alpha", {"number", "Synonymous substitution rate estimate (alpha)", "substitutions/site"}, col_alpha);
+        table.add_column("beta1", {"number", "Non-synonymous rate for negative/neutral component", "substitutions/site"}, col_beta1);
+        table.add_column("p1", {"number", "Weight allocated to negative/neutral component"}, col_p1);
+        table.add_column("beta_plus", {"number", "Non-synonymous rate for positive selection component", "substitutions/site"}, col_beta_plus);
+        table.add_column("p_plus", {"number", "Weight allocated to positive selection component"}, col_p_plus);
+        table.add_column("lrt", {"number", "Likelihood ratio test statistic for episodic diversification"}, col_lrt);
+        table.add_column("p_value", {"number", "Asymptotic p-value from mixture chi^2 distribution"}, col_pval);
+        table.add_column("branches_under_selection", {"integer", "Number of branches with empirical Bayes factor >= 100"}, col_branches);
+        table.add_column("total_branch_length", {"number", "Total length of branches contributing to inference at this site", "substitutions/site"}, col_tbl);
+        table.add_column("log_l_meme", {"number", "Site log-likelihood under MEME model"}, col_ll_meme);
+        table.add_column("log_l_fel", {"number", "Site log-likelihood under FEL model"}, col_ll_fel);
+        table.add_column("classification", {"string", "Selection classification at threshold (diversifying, neutral)"}, col_class);
+        table.add_column("substitution_history", {"string", "Formatted string of observed substitution events at this site"}, col_history);
+        table.add_column("mean_substitution_surprise", {"number", "Mean Shannon perplexity surprise across substitution events at this site", "bits"}, col_surprise);
+        table.add_column("site_perplexity", {"number", "Empirical site perplexity metric"}, col_perplexity);
+        table.add_column("synonymous_substitutions", {"integer", "Count of synonymous substitutions at this site"}, col_syn);
+        table.add_column("nonsynonymous_substitutions", {"integer", "Count of non-synonymous substitutions at this site"}, col_nonsyn);
+        table.add_column("branch_ebf", {"object", "Map of branch names to Empirical Bayes Factors (EBF >= 1.0) under positive selection"}, col_branch_ebf);
+        j["site_results"] = table.to_json();
 
         // Substitution events block (Root level)
         nlohmann::json sub_events_arr = nlohmann::json::array();
@@ -853,7 +708,6 @@ public:
 
         return j;
     }
-
     nlohmann::json to_json(JSONFormat format = JSONFormat::ModernV3, const Provenance& prov = {}) const {
         if (format == JSONFormat::Legacy) {
             return to_legacy_json();

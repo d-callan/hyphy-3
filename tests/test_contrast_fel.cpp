@@ -74,10 +74,19 @@ TEST_CASE("Contrast-FEL: Multi-group differential selection on cd2.fna with tree
     CHECK(summary.total_sites == aln.num_codons);
 
     auto json = analyzer.to_modern_json(aln_path, tree_path);
+    CHECK(json["$schema"] == "https://raw.githubusercontent.com/veg/hyphy-3/main/schemas/v3/contrast_fel.v3.schema.json");
     CHECK(json["schema_version"] == "3.0.0");
     CHECK(json["analysis"]["id"] == "contrast-fel");
     CHECK(json["analysis"]["shrinkage_lambda"] == 1.0);
+    CHECK(json["software"]["name"] == "hyphy");
+    CHECK(json.contains("provenance"));
+    CHECK(json["site_results"].contains("columns"));
+    CHECK(json["site_results"]["row_count"] == aln.num_codons);
     CHECK(json["site_results"]["data"]["site"].size() == aln.num_codons);
+    // Dynamic per-group beta columns must exist for every testable group
+    for (const auto& grp : analyzer.testable_groups) {
+        CHECK(json["site_results"]["data"].contains("beta_" + grp.name));
+    }
 }
 
 TEST_CASE("Contrast-FEL: Internal vs Leaves 2-group contrast") {

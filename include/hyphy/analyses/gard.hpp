@@ -7,6 +7,8 @@
 #include "hyphy/core/likelihood.hpp"
 #include "hyphy/core/neighbor_joining.hpp"
 #include "hyphy/core/progress_bar.hpp"
+#include "hyphy/core/provenance.hpp"
+#include "hyphy/core/json_output.hpp"
 #include "hyphy/core/console.hpp"
 #include "hyphy/opt/optimizer.hpp"
 #include "hyphy/analyses/gard_visualizer.hpp"
@@ -127,11 +129,33 @@ struct GARDResult {
             {"authors", "Sergei L Kosakovsky Pond"},
             {"contact", "spond@temple.edu"}
         };
-        j["software"] = {
-            {"name", "hyphy"},
-            {"version", "3.0.0"},
-            {"homepage", "https://hyphy.org"}
-        };
+        j["software"] = software_block();
+
+        // Provenance — to_json() carries no cli_cmd, so build the block
+        // inline with a fixed invocation label.
+        {
+            Provenance prov;
+            prov.invocation.cli_command = "hyphy3 gard";
+            prov.invocation.working_directory = Provenance::get_cwd();
+            if (!input_file.empty()) {
+                size_t sz = 0;
+                std::string hash = crypto::SHA256::hash_file(input_file, &sz);
+                if (!hash.empty()) {
+                    prov.inputs["alignment"] = {input_file, "FASTA/NEXUS", hash, sz};
+                }
+            }
+            prov.execution.start_time = Provenance::current_iso8601();
+            prov.execution.end_time = prov.execution.start_time;
+            prov.execution.wall_time_seconds = time_elapsed;
+            prov.execution.cpu_threads = 1;
+            prov.execution.hostname = Provenance::get_hostname();
+            prov.execution.os = Provenance::detect_os();
+            prov.execution.compiler = Provenance::detect_compiler();
+            j["provenance"] = prov.to_json();
+        }
+
+        // GARD's schema pins this dataset shape (sites_count rather than the
+        // shared codon_sites/unique_patterns contract), so it stays custom.
         j["dataset"] = {
             {"file", input_file},
             {"taxa_count", static_cast<int>(num_taxa)},
@@ -141,21 +165,21 @@ struct GARDResult {
             {"minimum_partition_size", static_cast<int>(min_partition_size)}
         };
         j["baseline"] = {
-            {"log_likelihood", baseline_log_l},
-            {"aicc", baseline_aicc},
+            {"log_likelihood", finite_or_null(baseline_log_l)},
+            {"aicc", finite_or_null(baseline_aicc)},
             {"tree", baseline_tree.to_newick(true)},
             {"rates", {
-                {"AC", baseline_rates.theta_AC},
-                {"AT", baseline_rates.theta_AT},
-                {"CG", baseline_rates.theta_CG},
-                {"CT", baseline_rates.theta_CT},
-                {"GT", baseline_rates.theta_GT}
+                {"AC", finite_or_null(baseline_rates.theta_AC)},
+                {"AT", finite_or_null(baseline_rates.theta_AT)},
+                {"CG", finite_or_null(baseline_rates.theta_CG)},
+                {"CT", finite_or_null(baseline_rates.theta_CT)},
+                {"GT", finite_or_null(baseline_rates.theta_GT)}
             }},
             {"frequencies", {
-                {"A", baseline_frequencies(0)},
-                {"C", baseline_frequencies(1)},
-                {"G", baseline_frequencies(2)},
-                {"T", baseline_frequencies(3)}
+                {"A", finite_or_null(baseline_frequencies(0))},
+                {"C", finite_or_null(baseline_frequencies(1))},
+                {"G", finite_or_null(baseline_frequencies(2))},
+                {"T", finite_or_null(baseline_frequencies(3))}
             }}
         };
 
@@ -169,8 +193,8 @@ struct GARDResult {
 
         j["model_selection"] = {
             {"best_model_breakpoints", best_model.breakpoints},
-            {"best_model_aicc", best_model.aicc},
-            {"best_model_log_likelihood", best_model.log_likelihood},
+            {"best_model_aicc", finite_or_null(best_model.aicc)},
+            {"best_model_log_likelihood", finite_or_null(best_model.log_likelihood)},
             {"improvements", improv_arr}
         };
 
@@ -181,16 +205,16 @@ struct GARDResult {
                 {"partition_index", p},
                 {"start_site", part.start_site},
                 {"end_site", part.end_site},
-                {"log_likelihood", part.log_likelihood},
+                {"log_likelihood", finite_or_null(part.log_likelihood)},
                 {"tree", part.tree.to_newick(true)}
             });
         }
         j["partitions"] = part_arr;
 
         j["topology_test"] = {
-            {"single_tree_aicc", single_tree_aicc},
+            {"single_tree_aicc", finite_or_null(single_tree_aicc)},
             {"topological_incongruence_supported", topological_incongruence},
-            {"delta_aicc_topology", single_tree_aicc - best_model.aicc}
+            {"delta_aicc_topology", finite_or_null(single_tree_aicc - best_model.aicc)}
         };
 
         j["site_breakpoint_support"] = site_breakpoint_support;

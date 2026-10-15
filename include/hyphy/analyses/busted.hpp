@@ -7,6 +7,7 @@
 #include "hyphy/core/rate_matrix.hpp"
 #include "hyphy/core/likelihood.hpp"
 #include "hyphy/opt/optimizer.hpp"
+#include "hyphy/core/json_output.hpp"
 #include "hyphy/analyses/fel.hpp"
 #include "hyphy/core/progress_bar.hpp"
 #include "hyphy/opt/nelder_mead.hpp"
@@ -45,7 +46,7 @@ struct BUSTEDRateDistribution {
     std::vector<Scalar> syn_rates;
     std::vector<Scalar> syn_weights;
     Scalar error_sink_weight = 0.0; // Contamination weight epsilon in [0, error_sink_max]
-    std::vector<std::string> annotations; // e.g. "Collapsed rate class"
+    std::vector<std::string> annotations; // per-class, parallel to omegas/weights; "" = unannotated
 };
 
 struct BUSTEDFit {
@@ -1290,15 +1291,18 @@ public:
             fit.test_distribution.syn_weights = syn_weights;
         }
 
-        // Detect collapsed rate classes
+        // Detect collapsed rate classes. annotations[k] annotates class k
+        // directly (empty string = unannotated); a pairwise collapse note is
+        // attached to the first class of the pair.
+        fit.test_distribution.annotations.assign(K, "");
         for (size_t i = 0; i < K; ++i) {
             if (weights[i] < 0.005) {
-                fit.test_distribution.annotations.push_back("Rate class " + std::to_string(i) + " collapsed (weight < 0.5%)");
+                fit.test_distribution.annotations[i] = "Rate class " + std::to_string(i) + " collapsed (weight < 0.5%)";
             }
         }
         for (size_t i = 0; i + 1 < K; ++i) {
-            if (std::abs(omegas[i+1] - omegas[i]) < 0.015) {
-                fit.test_distribution.annotations.push_back("Rate classes " + std::to_string(i) + " and " + std::to_string(i+1) + " collapsed into identical omega");
+            if (std::abs(omegas[i+1] - omegas[i]) < 0.015 && fit.test_distribution.annotations[i].empty()) {
+                fit.test_distribution.annotations[i] = "Rate classes " + std::to_string(i) + " and " + std::to_string(i+1) + " collapsed into identical omega";
             }
         }
 
@@ -1927,7 +1931,7 @@ public:
                     {"omega", d.omegas[k]},
                     {"proportion", bio_scale * d.weights[k]}
                 };
-                if (!d.annotations.empty() && k < d.annotations.size()) {
+                if (k < d.annotations.size() && !d.annotations[k].empty()) {
                     entry["annotation"] = d.annotations[k];
                 }
                 distro[std::to_string(k)] = entry;
@@ -2033,132 +2037,87 @@ public:
     }
 
     nlohmann::json to_modern_json(const BUSTEDResult& res, const Provenance& prov = {}) const {
-        nlohmann::json j;
-
-        j["$schema"] = "https://raw.githubusercontent.com/veg/hyphy-3/main/schemas/v3/busted.v3.schema.json";
-        j["schema_version"] = "3.0.0";
-
-        // Analysis block
-        j["analysis"]["id"] = "busted";
-        j["analysis"]["name"] = "Branch-Site Unrestricted Statistical Test for Episodic Diversification";
-        j["analysis"]["version"] = "3.0.0";
-        j["analysis"]["category"] = "gene_selection";
-        j["analysis"]["description"] = "BUSTED uses a random effects likelihood approach to test whether a gene has experienced positive selection at any site on specified (or all) branches of a phylogeny.";
-        j["analysis"]["citations"] = nlohmann::json::array({
-            {
-                {"citation", "Murrell B, Weaver S, Smith MD, Wertheim JO, Murrell S, Aylward A, Eren K, Pollner T, Martin DP, Frost SDW, Kosakovsky Pond SL (2015). Gene-Wide Identification of Episodic Selection. Mol Biol Evol 32(5): 1365-1371."},
-                {"doi", "10.1093/molbev/msv035"},
-                {"pmid", "25701167"}
-            }
-        });
-
-        j["analysis"]["settings"]["rates"] = res.settings.num_rate_classes;
-        j["analysis"]["settings"]["srv"] = res.settings.srv;
-        j["analysis"]["settings"]["syn_rates"] = res.settings.num_syn_rate_classes;
-        j["analysis"]["settings"]["auto_k"] = res.settings.auto_select_k;
-        j["analysis"]["settings"]["multiple_hits"] = res.settings.multiple_hits;
-        j["analysis"]["settings"]["error_sink"] = res.settings.error_sink;
+        auto json_settings = nlohmann::json{
+            {"rates", res.settings.num_rate_classes},
+            {"srv", res.settings.srv},
+            {"syn_rates", res.settings.num_syn_rate_classes},
+            {"auto_k", res.settings.auto_select_k},
+            {"multiple_hits", res.settings.multiple_hits},
+            {"error_sink", res.settings.error_sink},
+            {"refine_branch_lengths", res.settings.refine_branch_lengths},
+            {"pvalue_threshold", res.settings.p_value_threshold},
+            {"optimal_k", res.optimal_k}
+        };
         if (res.settings.error_sink) {
-            j["analysis"]["settings"]["error_sink_max_weight"] = res.settings.error_sink_max_weight;
-            j["analysis"]["settings"]["error_sink_bf_threshold"] = res.settings.error_sink_bf_threshold;
-        }
-        j["analysis"]["settings"]["refine_branch_lengths"] = res.settings.refine_branch_lengths;
-        j["analysis"]["settings"]["pvalue_threshold"] = res.settings.p_value_threshold;
-        j["analysis"]["settings"]["optimal_k"] = res.optimal_k;
-
-        // Software block
-        j["software"]["name"] = "hyphy";
-        j["software"]["version"] = "3.0.0";
-        j["software"]["git_commit"] = "6e22db3";
-        j["software"]["build_type"] = "Release";
-        j["software"]["compiler"] = Provenance::detect_compiler();
-
-        // Provenance block
-        if (!prov.invocation.cli_command.empty() || !prov.inputs.empty()) {
-            j["provenance"] = prov.to_json();
-        } else {
-            Provenance auto_prov;
-            auto_prov.invocation.cli_command = "hyphy3 busted";
-            auto_prov.invocation.working_directory = Provenance::get_cwd();
-            auto_prov.execution.start_time = Provenance::current_iso8601();
-            auto_prov.execution.end_time = Provenance::current_iso8601();
-            auto_prov.execution.wall_time_seconds = res.runtime_seconds;
-            auto_prov.execution.cpu_threads = 1;
-            auto_prov.execution.hostname = Provenance::get_hostname();
-            auto_prov.execution.os = Provenance::detect_os();
-            auto_prov.execution.compiler = Provenance::detect_compiler();
-            j["provenance"] = auto_prov.to_json();
+            json_settings["error_sink_max_weight"] = res.settings.error_sink_max_weight;
+            json_settings["error_sink_bf_threshold"] = res.settings.error_sink_bf_threshold;
         }
 
-        // Dataset block
-        j["dataset"]["taxa_count"] = aln.num_taxa;
-        j["dataset"]["codon_sites"] = aln.num_codons;
-        j["dataset"]["nucleotide_sites"] = aln.num_codons * 3;
-        j["dataset"]["unique_patterns"] = aln.patterns.size();
-        j["dataset"]["taxa"] = aln.taxon_names;
+        AnalysisMetadata meta{
+            "busted",
+            "Branch-Site Unrestricted Statistical Test for Episodic Diversification",
+            "3.0.0",
+            "gene_selection",
+            "BUSTED uses a random effects likelihood approach to test whether a gene has experienced positive selection at any site on specified (or all) branches of a phylogeny.",
+            {citation("Murrell B, Weaver S, Smith MD, Wertheim JO, Murrell S, Aylward A, Eren K, Pollner T, Martin DP, Frost SDW, Kosakovsky Pond SL (2015). Gene-Wide Identification of Episodic Selection. Mol Biol Evol 32(5): 1365-1371.",
+                      "10.1093/molbev/msv035", "25701167")},
+            std::move(json_settings)
+        };
 
-        nlohmann::json gcode;
-        gcode["id"] = code ? code->name : "Universal";
-        gcode["name"] = code ? code->name : "Universal";
-        gcode["sense_codons"] = code ? static_cast<int>(code->sense_codons.size()) : 61;
-        if (code) {
-            gcode["stop_codons"] = code->stop_codons;
-        } else {
-            gcode["stop_codons"] = {"TAA", "TAG", "TGA"};
+        nlohmann::json j = new_analysis_json(meta, prov);
+        // Preserve measured runtime when the caller supplied no real provenance:
+        // the auto block reports the actual wall clock of the analysis.
+        if (prov.invocation.cli_command.empty() && prov.inputs.empty() &&
+            j["provenance"].contains("execution")) {
+            j["provenance"]["execution"]["wall_time_seconds"] = res.runtime_seconds;
         }
-        j["dataset"]["genetic_code"] = gcode;
+        j["dataset"] = dataset_block(aln);
+        j["phylogeny"] = phylogeny_block(
+            tree, "",
+            [&res](const TreeNode& node) {
+                std::map<std::string, Scalar> lengths;
+                if (node.id >= 0 &&
+                    static_cast<size_t>(node.id) < res.unconstrained.branch_lengths.size()) {
+                    lengths["unconstrained"] = res.unconstrained.branch_lengths[node.id];
+                }
+                if (node.id >= 0 &&
+                    static_cast<size_t>(node.id) < res.constrained.branch_lengths.size()) {
+                    lengths["constrained"] = res.constrained.branch_lengths[node.id];
+                }
+                return lengths;
+            });
 
-        j["dataset"]["partitions"] = nlohmann::json::array({
-            {
-                {"id", "default"},
-                {"name", "Full Alignment"},
-                {"span", nlohmann::json::array({nlohmann::json::array({1, aln.num_codons})})},
-                {"sites_count", aln.num_codons},
-                {"patterns_count", aln.patterns.size()}
-            }
-        });
-
-        // Phylogeny block
-        j["phylogeny"]["newick"] = tree.to_newick();
-        nlohmann::json nodes_json;
-        double sum_bl_unc = 0.0;
-        double sum_bl_con = 0.0;
-        for (const auto& node : tree.nodes) {
-            nlohmann::json node_entry;
-            node_entry["type"] = node.children.empty() ? "leaf" : "internal";
-
-            if (!res.unconstrained.branch_lengths.empty() && node.id >= 0 && static_cast<size_t>(node.id) < res.unconstrained.branch_lengths.size()) {
-                node_entry["branch_lengths"]["unconstrained"] = res.unconstrained.branch_lengths[node.id];
-                if (node.id != tree.root_id) sum_bl_unc += res.unconstrained.branch_lengths[node.id];
-            }
-            if (!res.constrained.branch_lengths.empty() && node.id >= 0 && static_cast<size_t>(node.id) < res.constrained.branch_lengths.size()) {
-                node_entry["branch_lengths"]["constrained"] = res.constrained.branch_lengths[node.id];
-                if (node.id != tree.root_id) sum_bl_con += res.constrained.branch_lengths[node.id];
-            }
-
-            nodes_json[node.name] = node_entry;
-        }
-        j["phylogeny"]["nodes"] = nodes_json;
-        j["phylogeny"]["tree_lengths"]["unconstrained"] = sum_bl_unc;
-        j["phylogeny"]["tree_lengths"]["constrained"] = sum_bl_con;
-
-        // Model fits block
+        // Model fits
         auto format_fit_modern = [&](const BUSTEDFit& fit, const std::string& desc) {
             nlohmann::json f;
             f["description"] = desc;
-            f["log_likelihood"] = fit.log_likelihood;
-            f["aicc"] = fit.aicc;
-            f["tree_scale"] = fit.tree_scale;
-            f["rate_classes"] = fit.num_rate_classes;
+            f["log_likelihood"] = finite_or_null(fit.log_likelihood);
+            f["aicc"] = finite_or_null(fit.aicc);
+            f["tree_scale"] = finite_or_null(fit.tree_scale);
+            f["rate_classes"] = static_cast<int>(fit.num_rate_classes);
 
-            Scalar bio_scale = res.settings.error_sink ? (1.0 - fit.error_sink_weight) : 1.0;
+            const Scalar bio_scale =
+                res.settings.error_sink ? (1.0 - fit.error_sink_weight) : 1.0;
+            const auto& d = fit.test_distribution;
+            if (d.omegas.size() != d.weights.size() ||
+                (!d.annotations.empty() && d.annotations.size() != d.omegas.size())) {
+                throw std::runtime_error(
+                    "busted: rate distribution length mismatch (omegas=" +
+                    std::to_string(d.omegas.size()) + ", weights=" +
+                    std::to_string(d.weights.size()) + ", annotations=" +
+                    std::to_string(d.annotations.size()) + ")");
+            }
             nlohmann::json test_dist = nlohmann::json::array();
-            for (size_t k = 0; k < fit.test_distribution.omegas.size(); ++k) {
-                test_dist.push_back({
+            for (size_t k = 0; k < d.omegas.size(); ++k) {
+                nlohmann::json cls = {
                     {"class", static_cast<int>(k + 1)},
-                    {"omega", fit.test_distribution.omegas[k]},
-                    {"proportion", bio_scale * fit.test_distribution.weights[k]}
-                });
+                    {"omega", finite_or_null(d.omegas[k])},
+                    {"proportion", finite_or_null(bio_scale * d.weights[k])}
+                };
+                if (k < d.annotations.size() && !d.annotations[k].empty()) {
+                    cls["annotation"] = d.annotations[k];
+                }
+                test_dist.push_back(cls);
             }
             f["rate_distributions"]["test"] = test_dist;
 
@@ -2166,29 +2125,29 @@ public:
                 f["error_sink"] = {
                     {"type", "saturation_replacement"},
                     {"kernel", "P_sink(i,j) = pi_j / (1 - pi_i) for i != j, 0 for i == j"},
-                    {"proportion", fit.error_sink_weight},
+                    {"proportion", finite_or_null(fit.error_sink_weight)},
                     {"max_weight_bound", res.settings.error_sink_max_weight}
                 };
             }
 
-            if (!fit.test_distribution.syn_rates.empty() && fit.test_distribution.syn_rates.size() > 1) {
+            if (d.syn_rates.size() > 1 && d.syn_rates.size() == d.syn_weights.size()) {
                 nlohmann::json syn_dist = nlohmann::json::array();
-                for (size_t m = 0; m < fit.test_distribution.syn_rates.size(); ++m) {
+                for (size_t m = 0; m < d.syn_rates.size(); ++m) {
                     syn_dist.push_back({
                         {"class", static_cast<int>(m + 1)},
-                        {"rate", fit.test_distribution.syn_rates[m]},
-                        {"proportion", fit.test_distribution.syn_weights[m]}
+                        {"rate", finite_or_null(d.syn_rates[m])},
+                        {"proportion", finite_or_null(d.syn_weights[m])}
                     });
                 }
                 f["rate_distributions"]["synonymous"] = syn_dist;
             }
 
             if (res.settings.multiple_hits != "None") {
-                f["multiple_hits"]["double_hit_rate"] = fit.delta;
-                f["multiple_hits"]["double_hit_fraction"] = fit.frac_delta;
+                f["multiple_hits"]["double_hit_rate"] = finite_or_null(fit.delta);
+                f["multiple_hits"]["double_hit_fraction"] = finite_or_null(fit.frac_delta);
                 if (res.settings.multiple_hits == "Double+Triple") {
-                    f["multiple_hits"]["triple_hit_rate"] = fit.psi;
-                    f["multiple_hits"]["triple_hit_fraction"] = fit.frac_psi;
+                    f["multiple_hits"]["triple_hit_rate"] = finite_or_null(fit.psi);
+                    f["multiple_hits"]["triple_hit_fraction"] = finite_or_null(fit.frac_psi);
                 }
             }
             return f;
@@ -2198,41 +2157,27 @@ public:
         j["model_fits"]["constrained"] = format_fit_modern(res.constrained, "Constrained null BUSTED model fixing omega_k <= 1");
 
         if (has_gtr_fit) {
-            j["model_fits"]["nucleotide_gtr"]["description"] = "General Time Reversible nucleotide model with empirical frequencies";
-            j["model_fits"]["nucleotide_gtr"]["log_likelihood"] = gtr_log_l;
-            j["model_fits"]["nucleotide_gtr"]["aicc"] = gtr_aicc;
-            j["model_fits"]["nucleotide_gtr"]["equilibrium_frequencies"] = {
-                {"A", aln.nuc_frequencies(0)},
-                {"C", aln.nuc_frequencies(1)},
-                {"G", aln.nuc_frequencies(2)},
-                {"T", aln.nuc_frequencies(3)}
-            };
-            j["model_fits"]["nucleotide_gtr"]["substitution_rates"] = {
-                {"AC", gtr_rates.theta_AC},
-                {"AG", 1.0},
-                {"AT", gtr_rates.theta_AT},
-                {"CG", gtr_rates.theta_CG},
-                {"CT", gtr_rates.theta_CT},
-                {"GT", gtr_rates.theta_GT}
-            };
+            j["model_fits"]["nucleotide_gtr"] = nucleotide_gtr_fit(
+                aln, gtr_rates, gtr_log_l, gtr_aicc,
+                5 + static_cast<int>(tree.nodes.size()) - 1);
         }
 
         j["model_fits"]["codon_mg94"]["description"] = "Muse-Gaut 1994 x GTR codon model with shared global omega";
-        j["model_fits"]["codon_mg94"]["log_likelihood"] = mg94_log_l;
+        j["model_fits"]["codon_mg94"]["log_likelihood"] = finite_or_null(mg94_log_l);
         j["model_fits"]["codon_mg94"]["global_parameters"] = {
-            {"omega", mg94_omega}
+            {"omega", finite_or_null(mg94_omega)}
         };
 
-        // Statistical tests block
+        // Statistical tests
         j["statistical_tests"]["gene_level"] = {
             {"method", "Likelihood Ratio Test (LRT)"},
             {"test_statistic", "LRT"},
-            {"statistic_value", res.lrt},
+            {"statistic_value", finite_or_null(res.lrt)},
             {"distribution", "0.5 * chi^2_0 + 0.5 * chi^2_2"},
             {"degrees_of_freedom", 2},
             {"null_hypothesis", "omega_k <= 1 for all k on test branches (Constrained model)"},
             {"alternative_hypothesis", "omega_k > 1 for at least one k on test branches (Unconstrained model)"},
-            {"p_value", res.p_value},
+            {"p_value", finite_or_null(res.p_value)},
             {"decision", (res.p_value <= res.settings.p_value_threshold) ? "Episodic diversifying selection detected" : "No evidence of episodic diversifying selection"},
             {"optimal_k", static_cast<int>(res.optimal_k)}
         };
@@ -2273,33 +2218,21 @@ public:
                 flagged.push_back({
                     {"site", static_cast<int>(ev.site)},
                     {"branch", ev.branch_name},
-                    {"posterior", ev.posterior},
-                    {"bayes_factor", ev.bayes_factor}
+                    {"posterior", finite_or_null(ev.posterior)},
+                    {"bayes_factor", finite_or_null(ev.bayes_factor)}
                 });
             }
             j["error_sink_diagnostics"] = {
-                {"unconstrained_epsilon", res.unconstrained.error_sink_weight},
-                {"constrained_epsilon", res.constrained.error_sink_weight},
+                {"unconstrained_epsilon", finite_or_null(res.unconstrained.error_sink_weight)},
+                {"constrained_epsilon", finite_or_null(res.constrained.error_sink_weight)},
                 {"bf_threshold", res.settings.error_sink_bf_threshold},
                 {"flagged_branch_sites_count", static_cast<int>(res.flagged_error_events.size())},
                 {"flagged_branch_sites", flagged}
             };
         }
 
-        // Site results (Columnar format)
-        j["site_results"]["columns"] = {
-            {"site", {{"type", "integer"}, {"unit", "1-based codon position"}, {"description", "Alignment codon site index (1-based)"}}},
-            {"evidence_ratio", {{"type", "float"}, {"description", "Per-site Evidence Ratio (Bayes Factor) favoring positive selection (omega > 1)"}}},
-            {"unconstrained_log_l", {{"type", "float"}, {"description", "Site log-likelihood under unconstrained model"}}},
-            {"constrained_log_l", {{"type", "float"}, {"description", "Site log-likelihood under constrained null model"}}}
-        };
-        if (res.settings.error_sink) {
-            j["site_results"]["columns"]["error_sink_max_bf"] = {
-                {"type", "float"},
-                {"description", "Maximum branch-site Empirical Bayes Factor for the saturation error sink across branches at this site"}
-            };
-        }
-
+        // Site results (columnar; ColumnarResults enforces equal-length)
+        ColumnarResults table;
         std::vector<int> col_site;
         std::vector<double> col_er, col_unc_ll, col_con_ll, col_err_bf;
         col_site.reserve(aln.num_codons);
@@ -2311,25 +2244,30 @@ public:
         for (size_t s = 0; s < aln.num_codons; ++s) {
             col_site.push_back(static_cast<int>(s + 1));
             col_er.push_back(res.evidence_ratios[s]);
-            size_t p = aln.site_to_pattern[s];
+            const size_t p = aln.site_to_pattern[s];
             col_unc_ll.push_back(res.unconstrained.site_log_likelihoods[p]);
             col_con_ll.push_back(res.constrained.site_log_likelihoods[p]);
-            if (res.settings.error_sink && s < res.site_error_bfs.size()) {
-                col_err_bf.push_back(res.site_error_bfs[s]);
+            if (res.settings.error_sink) {
+                // Out-of-range is impossible when error_sink ran (site_error_bfs
+                // is sized to num_sites), but emit null rather than crash if a
+                // caller hands in a shorter vector.
+                col_err_bf.push_back(s < res.site_error_bfs.size()
+                    ? res.site_error_bfs[s]
+                    : std::numeric_limits<double>::quiet_NaN());
             }
         }
 
-        j["site_results"]["data"]["site"] = col_site;
-        j["site_results"]["data"]["evidence_ratio"] = col_er;
-        j["site_results"]["data"]["unconstrained_log_l"] = col_unc_ll;
-        j["site_results"]["data"]["constrained_log_l"] = col_con_ll;
+        table.add_column("site", {"integer", "Alignment codon site index (1-based)", "1-based codon position"}, col_site);
+        table.add_column("evidence_ratio", {"number", "Per-site Evidence Ratio (Bayes Factor) favoring positive selection (omega > 1)"}, col_er);
+        table.add_column("unconstrained_log_l", {"number", "Site log-likelihood under unconstrained model"}, col_unc_ll);
+        table.add_column("constrained_log_l", {"number", "Site log-likelihood under constrained null model"}, col_con_ll);
         if (res.settings.error_sink) {
-            j["site_results"]["data"]["error_sink_max_bf"] = col_err_bf;
+            table.add_column("error_sink_max_bf", {"number", "Maximum branch-site Empirical Bayes Factor for the saturation error sink across branches at this site"}, col_err_bf);
         }
+        j["site_results"] = table.to_json();
 
         return j;
     }
-
     nlohmann::json to_json(
         const BUSTEDResult& res,
         JSONFormat format = JSONFormat::ModernV3,

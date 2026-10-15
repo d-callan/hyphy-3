@@ -7,6 +7,7 @@
 #include "hyphy/core/likelihood.hpp"
 #include "hyphy/core/progress_bar.hpp"
 #include "hyphy/core/provenance.hpp"
+#include "hyphy/core/json_output.hpp"
 #include "hyphy/analyses/site_visualizer.hpp"
 #include "LBFGSB.h"
 #include "hyphy/opt/nelder_mead.hpp"
@@ -1137,166 +1138,54 @@ public:
     nlohmann::json to_modern_json(const std::string& input_filepath = "",
                                   const std::string& tree_string = "",
                                   const Provenance& prov = {}) const {
-        nlohmann::json j;
-
-        j["$schema"] = "https://raw.githubusercontent.com/veg/hyphy-3/main/schemas/v3/fel.v3.schema.json";
-        j["schema_version"] = "3.0.0";
-
-        // Analysis block
-        j["analysis"]["id"] = "fel";
-        j["analysis"]["name"] = "Fixed Effects Likelihood";
-        j["analysis"]["version"] = "3.0.0";
-        j["analysis"]["category"] = "site_selection";
-        j["analysis"]["description"] = "FEL (Fixed Effects Likelihood) estimates site-wise synonymous (alpha) and non-synonymous (beta) rates, and uses a likelihood ratio test to determine if beta != alpha at a site.";
-        j["analysis"]["citations"] = nlohmann::json::array({
-            {
-                {"citation", "Kosakovsky Pond SL, Frost SDW (2005). Not So Different After All: A Comparison of Methods for Detecting Amino Acid Sites Under Selection. Mol Biol Evol 22(5): 1208-1222."},
-                {"doi", "10.1093/molbev/msi105"},
-                {"pmid", "15703277"}
-            }
-        });
-        j["analysis"]["settings"]["pvalue_threshold"] = p_value_threshold;
-        j["analysis"]["settings"]["srv"] = true;
-        j["analysis"]["settings"]["ci"] = false;
-        j["analysis"]["settings"]["full_model"] = full_model;
-        j["analysis"]["settings"]["test_branches"] = settings.test_branches;
+        auto json_settings = nlohmann::json{
+            {"pvalue_threshold", p_value_threshold},
+            {"srv", true},
+            {"ci", false},
+            {"full_model", full_model},
+            {"test_branches", settings.test_branches}
+        };
         if (!settings.test_branch_regex.empty()) {
-            j["analysis"]["settings"]["test_branch_regex"] = settings.test_branch_regex;
+            json_settings["test_branch_regex"] = settings.test_branch_regex;
         }
 
-        // Software block
-        j["software"]["name"] = "hyphy";
-        j["software"]["version"] = "3.0.0";
-        j["software"]["git_commit"] = "e1352b6";
-        j["software"]["build_type"] = "Release";
-        j["software"]["compiler"] = Provenance::detect_compiler();
+        AnalysisMetadata meta{
+            "fel",
+            "Fixed Effects Likelihood",
+            "3.0.0",
+            "site_selection",
+            "FEL (Fixed Effects Likelihood) estimates site-wise synonymous (alpha) and non-synonymous (beta) rates, and uses a likelihood ratio test to determine if beta != alpha at a site.",
+            {citation("Kosakovsky Pond SL, Frost SDW (2005). Not So Different After All: A Comparison of Methods for Detecting Amino Acid Sites Under Selection. Mol Biol Evol 22(5): 1208-1222.",
+                      "10.1093/molbev/msi105", "15703277")},
+            std::move(json_settings)
+        };
 
-        // Provenance block
-        if (!prov.invocation.cli_command.empty() || !prov.inputs.empty()) {
-            j["provenance"] = prov.to_json();
-        } else {
-            Provenance auto_prov;
-            auto_prov.invocation.cli_command = "hyphy3 fel";
-            auto_prov.invocation.working_directory = Provenance::get_cwd();
-            if (!input_filepath.empty()) {
-                size_t sz = 0;
-                std::string hash = crypto::SHA256::hash_file(input_filepath, &sz);
-                auto_prov.inputs["alignment"] = {input_filepath, "FASTA/NEXUS", hash, sz};
-            }
-            auto_prov.execution.start_time = Provenance::current_iso8601();
-            auto_prov.execution.end_time = Provenance::current_iso8601();
-            auto_prov.execution.wall_time_seconds = 0.0;
-            auto_prov.execution.cpu_threads = 1;
-            auto_prov.execution.hostname = Provenance::get_hostname();
-            auto_prov.execution.os = Provenance::detect_os();
-            auto_prov.execution.compiler = Provenance::detect_compiler();
-            j["provenance"] = auto_prov.to_json();
-        }
+        nlohmann::json j = new_analysis_json(meta, prov, input_filepath);
+        j["dataset"] = dataset_block(aln);
+        j["phylogeny"] = phylogeny_block(
+            tree, tree_string,
+            mg94_branch_lengths_fn(conversion_factor, has_gtr_fit, gtr_branch_lengths),
+            [&](const TreeNode& node) -> nlohmann::json {
+                if (node.id == tree.root_id) return nlohmann::json::object();
+                return {{"tested", is_test_branch[node.id]}};
+            });
 
-        // Dataset block
-        j["dataset"]["taxa_count"] = aln.num_taxa;
-        j["dataset"]["codon_sites"] = aln.num_codons;
-        j["dataset"]["nucleotide_sites"] = aln.num_codons * 3;
-        j["dataset"]["unique_patterns"] = aln.patterns.size();
-        j["dataset"]["taxa"] = aln.taxon_names;
-
-        nlohmann::json gcode;
-        gcode["id"] = aln.code ? aln.code->name : "Universal";
-        gcode["name"] = aln.code ? aln.code->name : "Universal";
-        gcode["sense_codons"] = aln.code ? static_cast<int>(aln.code->sense_codons.size()) : 61;
-        if (aln.code) {
-            gcode["stop_codons"] = aln.code->stop_codons;
-        } else {
-            gcode["stop_codons"] = {"TAA", "TAG", "TGA"};
-        }
-        j["dataset"]["genetic_code"] = gcode;
-
-        j["dataset"]["partitions"] = nlohmann::json::array({
-            {
-                {"id", "default"},
-                {"name", "Full Alignment"},
-                {"span", nlohmann::json::array({nlohmann::json::array({1, aln.num_codons})})},
-                {"sites_count", aln.num_codons},
-                {"patterns_count", aln.patterns.size()}
-            }
-        });
-
-        nlohmann::json seqs_json = nlohmann::json::object();
-        for (const auto& s : aln.sequences) {
-            seqs_json[s.name] = s.raw_seq;
-        }
-        j["dataset"]["sequences"] = seqs_json;
-
-        // Phylogeny block
-        std::string nwk = tree_string.empty() ? tree.to_newick() : tree_string;
-        j["phylogeny"]["newick"] = nwk;
-
-        nlohmann::json nodes_json;
-        double sum_bl_mg94 = 0.0;
-        double sum_bl_gtr = 0.0;
-
-        for (const auto& node : tree.nodes) {
-            nlohmann::json node_entry;
-            node_entry["type"] = node.children.empty() ? "leaf" : "internal";
-
-            Scalar mg_bl = (conversion_factor > 0.0) ? (node.branch_length / conversion_factor) : node.branch_length;
-            node_entry["branch_lengths"]["codon_mg94"] = mg_bl;
-            if (node.id != tree.root_id) sum_bl_mg94 += mg_bl;
-
-            if (has_gtr_fit) {
-                Scalar gtr_bl = gtr_branch_lengths.count(node.name) ? gtr_branch_lengths.at(node.name) : mg_bl;
-                node_entry["branch_lengths"]["nucleotide_gtr"] = gtr_bl;
-                if (node.id != tree.root_id) sum_bl_gtr += gtr_bl;
-            }
-
-            if (!node.model_tag.empty()) {
-                node_entry["model_tags"] = nlohmann::json::array({node.model_tag});
-            }
-
-            if (node.id != tree.root_id) {
-                node_entry["tested"] = is_test_branch[node.id];
-            }
-
-            nodes_json[node.name] = node_entry;
-        }
-        j["phylogeny"]["nodes"] = nodes_json;
-        j["phylogeny"]["tree_lengths"]["codon_mg94"] = sum_bl_mg94;
+        // Model fits
         if (has_gtr_fit) {
-            j["phylogeny"]["tree_lengths"]["nucleotide_gtr"] = sum_bl_gtr;
+            j["model_fits"]["nucleotide_gtr"] = nucleotide_gtr_fit(
+                aln, gtr_rates, gtr_log_l, gtr_aicc,
+                5 + static_cast<int>(tree.nodes.size()) - 1);
         }
-
-        // Model fits block
-        if (has_gtr_fit) {
-            j["model_fits"]["nucleotide_gtr"]["description"] = "General Time Reversible nucleotide model with empirical frequencies";
-            j["model_fits"]["nucleotide_gtr"]["log_likelihood"] = gtr_log_l;
-            j["model_fits"]["nucleotide_gtr"]["aicc"] = gtr_aicc;
-            j["model_fits"]["nucleotide_gtr"]["parameters_count"] = 5 + static_cast<int>(tree.nodes.size()) - 1;
-            j["model_fits"]["nucleotide_gtr"]["equilibrium_frequencies"] = {
-                {"A", aln.nuc_frequencies(0)},
-                {"C", aln.nuc_frequencies(1)},
-                {"G", aln.nuc_frequencies(2)},
-                {"T", aln.nuc_frequencies(3)}
-            };
-            j["model_fits"]["nucleotide_gtr"]["substitution_rates"] = {
-                {"AC", gtr_rates.theta_AC},
-                {"AG", 1.0},
-                {"AT", gtr_rates.theta_AT},
-                {"CG", gtr_rates.theta_CG},
-                {"CT", gtr_rates.theta_CT},
-                {"GT", gtr_rates.theta_GT}
-            };
-        }
-
-        j["model_fits"]["codon_mg94"]["description"] = "Muse-Gaut 1994 x GTR codon model with shared global omega";
-        j["model_fits"]["codon_mg94"]["log_likelihood"] = global_log_l;
-        j["model_fits"]["codon_mg94"]["aicc"] = global_aicc;
-        j["model_fits"]["codon_mg94"]["parameters_count"] = 6 + static_cast<int>(tree.nodes.size()) - 1;
+        j["model_fits"]["codon_mg94"] = fit_entry(
+            "Muse-Gaut 1994 x GTR codon model with shared global omega",
+            global_log_l, global_aicc,
+            6 + static_cast<int>(tree.nodes.size()) - 1);
         j["model_fits"]["codon_mg94"]["global_parameters"] = {
             {"omega", (base_params.alpha > 0.0) ? (base_params.beta / base_params.alpha) : 1.0},
             {"tree_scale", 1.0}
         };
 
-        // Statistical tests block
+        // Statistical tests
         auto summary = get_summary();
         j["statistical_tests"]["site_level_summary"] = {
             {"method", "Fixed Effects Likelihood (FEL)"},
@@ -1315,77 +1204,31 @@ public:
             {"total_tested_tree_length", (conversion_factor > 0.0) ? (baseline_tested_tree_length / conversion_factor) : baseline_tested_tree_length}
         };
 
-        // Site results (Columnar format)
-        j["site_results"]["columns"] = {
-            {"site", {{"type", "integer"}, {"unit", "1-based codon position"}, {"description", "Alignment codon site index (1-based)"}}},
-            {"alpha", {{"type", "float"}, {"unit", "substitutions/site"}, {"description", "Synonymous substitution rate estimate (alpha)"}}},
-            {"beta", {{"type", "float"}, {"unit", "substitutions/site"}, {"description", "Non-synonymous substitution rate estimate on tested branches (beta)"}}},
-            {"alpha_null", {{"type", "float"}, {"unit", "substitutions/site"}, {"description", "Constrained neutral rate (alpha = beta)"}}},
-            {"lrt", {{"type", "float"}, {"description", "Likelihood ratio test statistic for beta != alpha"}}},
-            {"p_value", {{"type", "float"}, {"description", "Asymptotic p-value from chi^2_1 distribution"}}},
-            {"total_branch_length", {{"type", "float"}, {"unit", "substitutions/site"}, {"description", "Total length of tested branches contributing to inference at this site"}}},
-            {"classification", {{"type", "string"}, {"description", "Selection classification at threshold (diversifying, purifying, neutral)"}}},
-            {"synonymous_substitutions", {{"type", "integer"}, {"description", "Count of synonymous substitutions on tested branches"}}},
-            {"nonsynonymous_substitutions", {{"type", "integer"}, {"description", "Count of non-synonymous substitutions on tested branches"}}},
-            {"substitutions_1nt", {{"type", "integer"}, {"description", "Count of single-nucleotide codon substitutions"}}},
-            {"substitutions_2nt", {{"type", "integer"}, {"description", "Count of double-nucleotide codon substitutions"}}},
-            {"substitutions_3nt", {{"type", "integer"}, {"description", "Count of triple-nucleotide codon substitutions"}}},
-            {"mean_substitution_surprise", {{"type", "float"}, {"unit", "bits"}, {"description", "Mean Shannon self-information (-log2 P) of substitutions at this site"}}},
-            {"mean_substitution_branch_length", {{"type", "float"}, {"unit", "substitutions/site"}, {"description", "Mean length of branches where substitutions occurred at this site"}}},
-            {"substitution_history", {{"type", "string"}, {"description", "Formatted substitution history summary (AA changes, hit counts, surprise)"}}}
-        };
-        if (num_background > 0) {
-            j["site_results"]["columns"]["beta_background"] = {
-                {"type", "float"},
-                {"unit", "substitutions/site"},
-                {"description", "Non-synonymous substitution rate estimate on background branches (beta_background)"}
-            };
-            j["site_results"]["columns"]["synonymous_substitutions_background"] = {
-                {"type", "integer"},
-                {"description", "Count of synonymous substitutions on background branches"}
-            };
-            j["site_results"]["columns"]["nonsynonymous_substitutions_background"] = {
-                {"type", "integer"},
-                {"description", "Count of non-synonymous substitutions on background branches"}
-            };
-        }
+        // Site results (columnar; ColumnarResults enforces equal-length)
+        ColumnarResults table;
+        const size_t n = site_results.size();
+        const bool has_bg = num_background > 0;
+        std::vector<int> col_site, col_syn, col_nonsyn, col_syn_bg, col_nonsyn_bg,
+                         col_1nt, col_2nt, col_3nt;
+        std::vector<double> col_alpha, col_beta, col_beta_bg, col_alpha_null,
+                            col_lrt, col_pval, col_tbl, col_surprise, col_mut_bl;
+        std::vector<std::string> col_class, col_history;
 
-        std::vector<int> col_site;
-        std::vector<double> col_alpha, col_beta, col_beta_bg, col_alpha_null, col_lrt, col_pval, col_tbl;
-        std::vector<std::string> col_class;
-        std::vector<int> col_syn, col_nonsyn, col_syn_bg, col_nonsyn_bg;
-        std::vector<int> col_1nt, col_2nt, col_3nt;
-        std::vector<double> col_surprise, col_mut_bl;
-        std::vector<std::string> col_history;
+        col_site.reserve(n); col_alpha.reserve(n); col_beta.reserve(n);
+        if (has_bg) col_beta_bg.reserve(n);
+        col_alpha_null.reserve(n); col_lrt.reserve(n); col_pval.reserve(n);
+        col_tbl.reserve(n); col_class.reserve(n);
+        col_syn.reserve(n); col_nonsyn.reserve(n);
+        if (has_bg) { col_syn_bg.reserve(n); col_nonsyn_bg.reserve(n); }
+        col_1nt.reserve(n); col_2nt.reserve(n); col_3nt.reserve(n);
+        col_surprise.reserve(n); col_mut_bl.reserve(n); col_history.reserve(n);
 
-        col_site.reserve(site_results.size());
-        col_alpha.reserve(site_results.size());
-        col_beta.reserve(site_results.size());
-        if (num_background > 0) col_beta_bg.reserve(site_results.size());
-        col_alpha_null.reserve(site_results.size());
-        col_lrt.reserve(site_results.size());
-        col_pval.reserve(site_results.size());
-        col_tbl.reserve(site_results.size());
-        col_class.reserve(site_results.size());
-        col_syn.reserve(site_results.size());
-        col_nonsyn.reserve(site_results.size());
-        if (num_background > 0) {
-            col_syn_bg.reserve(site_results.size());
-            col_nonsyn_bg.reserve(site_results.size());
-        }
-        col_1nt.reserve(site_results.size());
-        col_2nt.reserve(site_results.size());
-        col_3nt.reserve(site_results.size());
-        col_surprise.reserve(site_results.size());
-        col_mut_bl.reserve(site_results.size());
-        col_history.reserve(site_results.size());
-
-        for (size_t i = 0; i < site_results.size(); ++i) {
+        for (size_t i = 0; i < n; ++i) {
             const auto& r = site_results[i];
             col_site.push_back(static_cast<int>(i + 1));
             col_alpha.push_back(r.alpha);
             col_beta.push_back(r.beta);
-            if (num_background > 0) col_beta_bg.push_back(r.beta_nuisance);
+            if (has_bg) col_beta_bg.push_back(r.beta_nuisance);
             col_alpha_null.push_back(r.alpha_null);
             col_lrt.push_back(r.lrt);
             col_pval.push_back(r.p_value);
@@ -1405,7 +1248,7 @@ public:
 
             col_syn.push_back(static_cast<int>(r.subs.syn_test));
             col_nonsyn.push_back(static_cast<int>(r.subs.nonsyn_test));
-            if (num_background > 0) {
+            if (has_bg) {
                 col_syn_bg.push_back(static_cast<int>(r.subs.syn_bg));
                 col_nonsyn_bg.push_back(static_cast<int>(r.subs.nonsyn_bg));
             }
@@ -1414,33 +1257,33 @@ public:
             col_3nt.push_back(static_cast<int>(r.subs.subs_3nt));
             col_surprise.push_back(r.subs.mean_surprise_bits);
             col_mut_bl.push_back(r.subs.mean_branch_length);
-            col_history.push_back((num_background > 0) ? r.subs.summary_string_partitioned : r.subs.summary_string);
+            col_history.push_back(has_bg ? r.subs.summary_string_partitioned : r.subs.summary_string);
         }
 
-        j["site_results"]["data"]["site"] = col_site;
-        j["site_results"]["data"]["alpha"] = col_alpha;
-        j["site_results"]["data"]["beta"] = col_beta;
-        if (num_background > 0) {
-            j["site_results"]["data"]["beta_background"] = col_beta_bg;
+        table.add_column("site", {"integer", "Alignment codon site index (1-based)", "1-based codon position"}, col_site);
+        table.add_column("alpha", {"number", "Synonymous substitution rate estimate (alpha)", "substitutions/site"}, col_alpha);
+        table.add_column("beta", {"number", "Non-synonymous substitution rate estimate on tested branches (beta)", "substitutions/site"}, col_beta);
+        if (has_bg) {
+            table.add_column("beta_background", {"number", "Non-synonymous substitution rate estimate on background branches (beta_background)", "substitutions/site"}, col_beta_bg);
         }
-        j["site_results"]["data"]["alpha_null"] = col_alpha_null;
-        j["site_results"]["data"]["lrt"] = col_lrt;
-        j["site_results"]["data"]["p_value"] = col_pval;
-        j["site_results"]["data"]["total_branch_length"] = col_tbl;
-        j["site_results"]["data"]["classification"] = col_class;
-
-        j["site_results"]["data"]["synonymous_substitutions"] = col_syn;
-        j["site_results"]["data"]["nonsynonymous_substitutions"] = col_nonsyn;
-        if (num_background > 0) {
-            j["site_results"]["data"]["synonymous_substitutions_background"] = col_syn_bg;
-            j["site_results"]["data"]["nonsynonymous_substitutions_background"] = col_nonsyn_bg;
+        table.add_column("alpha_null", {"number", "Constrained neutral rate (alpha = beta)", "substitutions/site"}, col_alpha_null);
+        table.add_column("lrt", {"number", "Likelihood ratio test statistic for beta != alpha"}, col_lrt);
+        table.add_column("p_value", {"number", "Asymptotic p-value from chi^2_1 distribution"}, col_pval);
+        table.add_column("total_branch_length", {"number", "Total length of tested branches contributing to inference at this site", "substitutions/site"}, col_tbl);
+        table.add_column("classification", {"string", "Selection classification at threshold (diversifying, purifying, neutral)"}, col_class);
+        table.add_column("synonymous_substitutions", {"integer", "Count of synonymous substitutions on tested branches"}, col_syn);
+        table.add_column("nonsynonymous_substitutions", {"integer", "Count of non-synonymous substitutions on tested branches"}, col_nonsyn);
+        if (has_bg) {
+            table.add_column("synonymous_substitutions_background", {"integer", "Count of synonymous substitutions on background branches"}, col_syn_bg);
+            table.add_column("nonsynonymous_substitutions_background", {"integer", "Count of non-synonymous substitutions on background branches"}, col_nonsyn_bg);
         }
-        j["site_results"]["data"]["substitutions_1nt"] = col_1nt;
-        j["site_results"]["data"]["substitutions_2nt"] = col_2nt;
-        j["site_results"]["data"]["substitutions_3nt"] = col_3nt;
-        j["site_results"]["data"]["mean_substitution_surprise"] = col_surprise;
-        j["site_results"]["data"]["mean_substitution_branch_length"] = col_mut_bl;
-        j["site_results"]["data"]["substitution_history"] = col_history;
+        table.add_column("substitutions_1nt", {"integer", "Count of single-nucleotide codon substitutions"}, col_1nt);
+        table.add_column("substitutions_2nt", {"integer", "Count of double-nucleotide codon substitutions"}, col_2nt);
+        table.add_column("substitutions_3nt", {"integer", "Count of triple-nucleotide codon substitutions"}, col_3nt);
+        table.add_column("mean_substitution_surprise", {"number", "Mean Shannon self-information (-log2 P) of substitutions at this site", "bits"}, col_surprise);
+        table.add_column("mean_substitution_branch_length", {"number", "Mean length of branches where substitutions occurred at this site", "substitutions/site"}, col_mut_bl);
+        table.add_column("substitution_history", {"string", "Formatted substitution history summary (AA changes, hit counts, surprise)"}, col_history);
+        j["site_results"] = table.to_json();
 
         // Compressed substitutions mapping (HyPhy 2.5 datamonkey / hyphy-vision parity)
         nlohmann::json subs_comp = nlohmann::json::object();
@@ -1494,7 +1337,6 @@ public:
 
         return j;
     }
-
     nlohmann::json to_json(const std::string& input_filepath = "",
                            const std::string& tree_string = "",
                            JSONFormat format = JSONFormat::ModernV3,

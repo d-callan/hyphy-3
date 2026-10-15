@@ -7,6 +7,7 @@
 #include "hyphy/core/likelihood.hpp"
 #include "hyphy/core/progress_bar.hpp"
 #include "hyphy/core/provenance.hpp"
+#include "hyphy/core/json_output.hpp"
 #include "hyphy/core/console.hpp"
 #include "hyphy/opt/optimizer.hpp"
 #include "nlohmann/json.hpp"
@@ -822,25 +823,15 @@ public:
         const std::string& cli_cmd = "hyphy3 fubar",
         const std::string& input_filepath = ""
     ) const {
-        nlohmann::json j;
-        j["$schema"] = "https://raw.githubusercontent.com/veg/hyphy-3/main/schemas/v3/fubar.v3.schema.json";
-        j["schema_version"] = "3.0.0";
-
-        // Analysis
-        j["analysis"] = {
-            {"id", "fubar"},
-            {"name", "Fast, Unconstrained Bayesian AppRoximation"},
-            {"version", "3.0.0"},
-            {"category", "site-level selection"},
-            {"description", "Site-by-site detection of positive and purifying selection via Bayesian rate grid approximation"},
-            {"citations", nlohmann::json::array({
-                {
-                    {"citation", "Murrell B, et al. FUBAR: A Fast, Unconstrained Bayesian AppRoximation for Inferring Selection. Mol Biol Evol. 30(5):1196-1205 (2013)."},
-                    {"doi", "10.1093/molbev/mst030"},
-                    {"pmid", "23420840"}
-                }
-            })},
-            {"settings", {
+        AnalysisMetadata meta{
+            "fubar",
+            "Fast, Unconstrained Bayesian AppRoximation",
+            "3.0.0",
+            "site-level selection",
+            "Site-by-site detection of positive and purifying selection via Bayesian rate grid approximation",
+            {citation("Murrell B, et al. FUBAR: A Fast, Unconstrained Bayesian AppRoximation for Inferring Selection. Mol Biol Evol. 30(5):1196-1205 (2013).",
+                      "10.1093/molbev/mst030", "23420840")},
+            {
                 {"grid_points", settings.grid_points},
                 {"total_grid_points", settings.grid_points * settings.grid_points},
                 {"method", fubar_method_to_string(settings.method)},
@@ -848,31 +839,39 @@ public:
                 {"posterior_threshold", settings.posterior_threshold},
                 {"non_zero", settings.non_zero},
                 {"tree_scaling", settings.tree_scaling}
-            }}
+            }
         };
 
-        // Software
-        j["software"] = {
-            {"name", "hyphy"},
-            {"version", "3.0.0"},
-            {"git_commit", "c566a240"},
-            {"build_type", "Release"},
-            {"compiler", Provenance::detect_compiler()}
-        };
+        nlohmann::json j;
+        j["$schema"] = "https://raw.githubusercontent.com/veg/hyphy-3/main/schemas/v3/fubar.v3.schema.json";
+        j["schema_version"] = meta.version;
+        j["analysis"] = meta.to_json();
+        j["software"] = software_block();
+        // FUBAR's signature carries cli_cmd (not a Provenance), so build the
+        // auto block inline and attach the real runtime.
+        {
+            Provenance prov;
+            prov.invocation.cli_command = cli_cmd;
+            prov.invocation.working_directory = Provenance::get_cwd();
+            if (!input_filepath.empty()) {
+                size_t sz = 0;
+                std::string hash = crypto::SHA256::hash_file(input_filepath, &sz);
+                if (!hash.empty()) {
+                    prov.inputs["alignment"] = {input_filepath, "FASTA/NEXUS", hash, sz};
+                }
+            }
+            prov.execution.start_time = Provenance::current_iso8601();
+            prov.execution.end_time = prov.execution.start_time;
+            prov.execution.wall_time_seconds = res.time_total_sec;
+            prov.execution.cpu_threads = 1;
+            prov.execution.hostname = Provenance::get_hostname();
+            prov.execution.os = Provenance::detect_os();
+            prov.execution.compiler = Provenance::detect_compiler();
+            j["provenance"] = prov.to_json();
+        }
 
-        // Provenance
-        Provenance prov;
-        prov.invocation.cli_command = cli_cmd;
-        prov.invocation.working_directory = Provenance::get_cwd();
-        prov.execution.start_time = Provenance::current_iso8601();
-        prov.execution.end_time = Provenance::current_iso8601();
-        prov.execution.wall_time_seconds = res.time_total_sec;
-        prov.execution.hostname = Provenance::get_hostname();
-        prov.execution.os = Provenance::detect_os();
-        prov.execution.compiler = Provenance::detect_compiler();
-        j["provenance"] = prov.to_json();
-
-        // Dataset
+        // Dataset — shape pinned by fubar.v3.schema.json (file/taxa/partitions
+        // with coverage), distinct from the shared dataset_block contract.
         j["dataset"] = {
             {"file", input_filepath},
             {"taxa", aln.taxon_names},
@@ -890,31 +889,30 @@ public:
             j["dataset"]["partitions"][0]["coverage"].push_back(s);
         }
 
-        // Phylogeny
+        // Phylogeny — shape pinned by fubar.v3.schema.json
         j["phylogeny"] = {
             {"tree", tree.to_newick(true)},
             {"total_tree_length", res.baseline_tree_length},
             {"nodes_count", tree.num_nodes()}
         };
 
-        // Model Fits
-        j["model_fits"] = nlohmann::json::object();
+        // Model fits
         if (res.has_gtr_fit) {
             j["model_fits"]["nucleotide_gtr"] = {
-                {"log_likelihood", res.gtr_log_l},
-                {"aicc", res.gtr_aicc},
+                {"log_likelihood", finite_or_null(res.gtr_log_l)},
+                {"aicc", finite_or_null(res.gtr_aicc)},
                 {"rates", {
-                    {"theta_AC", res.gtr_rates.theta_AC},
-                    {"theta_AT", res.gtr_rates.theta_AT},
-                    {"theta_CG", res.gtr_rates.theta_CG},
-                    {"theta_CT", res.gtr_rates.theta_CT},
-                    {"theta_GT", res.gtr_rates.theta_GT}
+                    {"theta_AC", finite_or_null(res.gtr_rates.theta_AC)},
+                    {"theta_AT", finite_or_null(res.gtr_rates.theta_AT)},
+                    {"theta_CG", finite_or_null(res.gtr_rates.theta_CG)},
+                    {"theta_CT", finite_or_null(res.gtr_rates.theta_CT)},
+                    {"theta_GT", finite_or_null(res.gtr_rates.theta_GT)}
                 }},
                 {"branch_lengths", res.gtr_branch_lengths}
             };
         }
 
-        // Rate Grid
+        // Rate grid
         j["rate_grid"] = {
             {"dimensions", {settings.grid_points, settings.grid_points}},
             {"total_points", res.grid.size()},
@@ -944,45 +942,38 @@ public:
             {"purifying_sites", res.purifying_sites}
         };
 
-        // Site Results (Columnar v3 format)
-        j["site_results"] = {
-            {"columns", {
-                {"site", {{"type", "integer"}, {"description", "1-based codon site index"}}},
-                {"alpha", {{"type", "float"}, {"unit", "substitutions/site"}, {"description", "Mean posterior synonymous rate"}}},
-                {"beta", {{"type", "float"}, {"unit", "substitutions/site"}, {"description", "Mean posterior non-synonymous rate"}}},
-                {"beta_minus_alpha", {{"type", "float"}, {"unit", "substitutions/site"}, {"description", "Mean posterior beta - alpha"}}},
-                {"prob_neg", {{"type", "float"}, {"range", {0.0, 1.0}}, {"description", "Posterior probability of negative selection P(alpha > beta | Data)"}}},
-                {"prob_pos", {{"type", "float"}, {"range", {0.0, 1.0}}, {"description", "Posterior probability of positive selection P(beta > alpha | Data)"}}},
-                {"bayes_factor", {{"type", "float"}, {"description", "Empirical Bayes Factor for positive selection"}}},
-                {"classification", {{"type", "string"}, {"enum", {"diversifying", "purifying", "neutral"}}}}
-            }},
-            {"data", {
-                {"site", nlohmann::json::array()},
-                {"alpha", nlohmann::json::array()},
-                {"beta", nlohmann::json::array()},
-                {"beta_minus_alpha", nlohmann::json::array()},
-                {"prob_neg", nlohmann::json::array()},
-                {"prob_pos", nlohmann::json::array()},
-                {"bayes_factor", nlohmann::json::array()},
-                {"classification", nlohmann::json::array()}
-            }}
-        };
-
+        // Site results (columnar; ColumnarResults enforces equal-length)
+        ColumnarResults table;
+        std::vector<int> col_site;
+        std::vector<double> col_alpha, col_beta, col_bma, col_pneg, col_ppos, col_bf;
+        std::vector<std::string> col_class;
+        const size_t n = res.site_results.size();
+        col_site.reserve(n); col_alpha.reserve(n); col_beta.reserve(n);
+        col_bma.reserve(n); col_pneg.reserve(n); col_ppos.reserve(n);
+        col_bf.reserve(n); col_class.reserve(n);
         for (const auto& sr : res.site_results) {
-            j["site_results"]["data"]["site"].push_back(static_cast<int>(sr.site));
-            j["site_results"]["data"]["alpha"].push_back(sr.alpha);
-            j["site_results"]["data"]["beta"].push_back(sr.beta);
-            j["site_results"]["data"]["beta_minus_alpha"].push_back(sr.beta_minus_alpha);
-            j["site_results"]["data"]["prob_neg"].push_back(sr.prob_neg);
-            j["site_results"]["data"]["prob_pos"].push_back(sr.prob_pos);
-            j["site_results"]["data"]["bayes_factor"].push_back(sr.bayes_factor);
-            j["site_results"]["data"]["classification"].push_back(sr.classification);
+            col_site.push_back(static_cast<int>(sr.site));
+            col_alpha.push_back(sr.alpha);
+            col_beta.push_back(sr.beta);
+            col_bma.push_back(sr.beta_minus_alpha);
+            col_pneg.push_back(sr.prob_neg);
+            col_ppos.push_back(sr.prob_pos);
+            col_bf.push_back(sr.bayes_factor);
+            col_class.push_back(sr.classification);
         }
+        table.add_column("site", {"integer", "1-based codon site index"}, col_site);
+        table.add_column("alpha", {"number", "Mean posterior synonymous rate", "substitutions/site"}, col_alpha);
+        table.add_column("beta", {"number", "Mean posterior non-synonymous rate", "substitutions/site"}, col_beta);
+        table.add_column("beta_minus_alpha", {"number", "Mean posterior beta - alpha", "substitutions/site"}, col_bma);
+        table.add_column("prob_neg", {"number", "Posterior probability of negative selection P(alpha > beta | Data)"}, col_pneg);
+        table.add_column("prob_pos", {"number", "Posterior probability of positive selection P(beta > alpha | Data)"}, col_ppos);
+        table.add_column("bayes_factor", {"number", "Empirical Bayes Factor for positive selection"}, col_bf);
+        table.add_column("classification", {"string", "Selection classification: diversifying, purifying, or neutral"}, col_class);
+        j["site_results"] = table.to_json();
 
         return j.dump(2);
     }
 
-    // Legacy JSON export for HyPhy-Vision and Datamonkey parity
     std::string to_legacy_json(const FUBARResult& res, const std::string& input_filepath = "") const {
         nlohmann::json j;
 

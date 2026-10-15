@@ -8,6 +8,7 @@
 #include "hyphy/core/likelihood.hpp"
 #include "hyphy/core/progress_bar.hpp"
 #include "hyphy/core/provenance.hpp"
+#include "hyphy/core/json_output.hpp"
 #include "hyphy/analyses/site_visualizer.hpp"
 #include "hyphy/core/console.hpp"
 #include "hyphy/opt/optimizer.hpp"
@@ -658,166 +659,92 @@ struct SLACResult {
         const std::string& tree_string = "",
         const Provenance& prov = {}
     ) const {
-        nlohmann::json j;
-
-        j["$schema"] = "https://raw.githubusercontent.com/veg/hyphy-3/main/schemas/v3/slac.v3.schema.json";
-        j["schema_version"] = "3.0.0";
-
-        // Analysis block
-        j["analysis"]["id"] = "slac";
-        j["analysis"]["name"] = "Single-Likelihood Ancestor Counting";
-        j["analysis"]["version"] = "3.0.0";
-        j["analysis"]["category"] = "site_selection";
-        j["analysis"]["description"] = "SLAC uses maximum likelihood ancestral state reconstruction and minimum path substitution counting to estimate site-level dS and dN, with exact binomial hypothesis testing.";
-        j["analysis"]["citations"] = nlohmann::json::array({
+        AnalysisMetadata meta{
+            "slac",
+            "Single-Likelihood Ancestor Counting",
+            "3.0.0",
+            "site_selection",
+            "SLAC uses maximum likelihood ancestral state reconstruction and minimum path substitution counting to estimate site-level dS and dN, with exact binomial hypothesis testing.",
+            {citation("Kosakovsky Pond SL, Frost SDW (2005). Not So Different After All: A Comparison of Methods for Detecting Amino Acid Sites Under Selection. Mol Biol Evol 22(5): 1208-1222.",
+                      "10.1093/molbev/msi105", "15703277")},
             {
-                {"citation", "Kosakovsky Pond SL, Frost SDW (2005). Not So Different After All: A Comparison of Methods for Detecting Amino Acid Sites Under Selection. Mol Biol Evol 22(5): 1208-1222."},
-                {"doi", "10.1093/molbev/msi105"},
-                {"pmid", "15703277"}
+                {"pvalue_threshold", settings.p_value_threshold},
+                {"samples", settings.samples},
+                {"test_branches", settings.test_branches}
             }
-        });
-        j["analysis"]["settings"]["pvalue_threshold"] = settings.p_value_threshold;
-        j["analysis"]["settings"]["samples"] = settings.samples;
-        j["analysis"]["settings"]["test_branches"] = settings.test_branches;
+        };
 
-        // Software block
-        j["software"]["name"] = "hyphy";
-        j["software"]["version"] = "3.0.0";
-        j["software"]["git_commit"] = "6c1aa98";
-        j["software"]["build_type"] = "Release";
-        j["software"]["compiler"] = Provenance::detect_compiler();
-
-        // Provenance block
-        if (!prov.invocation.cli_command.empty() || !prov.inputs.empty()) {
-            j["provenance"] = prov.to_json();
-        } else {
-            Provenance auto_prov;
-            auto_prov.invocation.cli_command = "hyphy3 slac";
-            auto_prov.invocation.working_directory = Provenance::get_cwd();
-            if (!input_filepath.empty()) {
-                size_t sz = 0;
-                std::string hash = crypto::SHA256::hash_file(input_filepath, &sz);
-                auto_prov.inputs["alignment"] = {input_filepath, "FASTA/NEXUS", hash, sz};
-            }
-            auto_prov.execution.start_time = Provenance::current_iso8601();
-            auto_prov.execution.end_time = Provenance::current_iso8601();
-            auto_prov.execution.wall_time_seconds = runtime_seconds;
-            auto_prov.execution.cpu_threads = 1;
-            auto_prov.execution.hostname = Provenance::get_hostname();
-            auto_prov.execution.os = Provenance::detect_os();
-            auto_prov.execution.compiler = Provenance::detect_compiler();
-            j["provenance"] = auto_prov.to_json();
+        nlohmann::json j = new_analysis_json(meta, prov, input_filepath);
+        if (prov.invocation.cli_command.empty() && prov.inputs.empty() &&
+            j["provenance"].contains("execution")) {
+            j["provenance"]["execution"]["wall_time_seconds"] = runtime_seconds;
         }
+        j["dataset"] = dataset_block(aln);
+        j["phylogeny"] = phylogeny_block(
+            tree, tree_string,
+            [](const TreeNode& node) {
+                return std::map<std::string, Scalar>{{"mg94_baseline", node.branch_length}};
+            },
+            [this](const TreeNode& node) -> nlohmann::json {
+                if (node.id == tree.root_id) return nlohmann::json::object();
+                const bool is_test = std::find(
+                    tested_branch_names.begin(), tested_branch_names.end(),
+                    node.name) != tested_branch_names.end();
+                return {{"length", finite_or_null(node.branch_length)},
+                        {"tested", is_test}};
+            });
+        // SLAC also reports the legacy scalar summary for downstream parity.
+        j["phylogeny"]["tree_length"] = finite_or_null(total_tree_length);
 
-        // Dataset block
-        j["dataset"]["taxa_count"] = aln.num_taxa;
-        j["dataset"]["codon_sites"] = aln.num_codons;
-        j["dataset"]["nucleotide_sites"] = aln.num_codons * 3;
-        j["dataset"]["unique_patterns"] = aln.patterns.size();
-        j["dataset"]["taxa"] = aln.taxon_names;
-
-        nlohmann::json gcode;
-        gcode["id"] = aln.code ? aln.code->name : "Universal";
-        gcode["name"] = aln.code ? aln.code->name : "Universal";
-        gcode["sense_codons"] = aln.code ? aln.code->num_sense_codons : 61;
-        if (aln.code) {
-            gcode["stop_codons"] = aln.code->stop_codons;
-        } else {
-            gcode["stop_codons"] = {"TAA", "TAG", "TGA"};
+        // Model fits
+        if (gtr_log_l != 0.0 || gtr_aicc != 0.0) {
+            j["model_fits"]["Nucleotide GTR"] = nucleotide_gtr_fit(
+                aln, gtr_rates, gtr_log_l, gtr_aicc,
+                5 + static_cast<int>(tree.num_nodes()) - 1);
         }
-        j["dataset"]["genetic_code"] = gcode;
+        nlohmann::json mg94 = fit_entry(
+            "Muse-Gaut 94 codon model with GTR core",
+            baseline_log_l, baseline_aicc,
+            6 + static_cast<int>(tree.num_nodes()) - 1);
+        mg94["global_parameters"] = {{"omega", finite_or_null(global_omega)}};
+        j["model_fits"]["Global MG94xREV"] = mg94;
 
-        j["dataset"]["partitions"] = nlohmann::json::array({
-            {
-                {"id", "default"},
-                {"name", "Full Alignment"},
-                {"span", nlohmann::json::array({nlohmann::json::array({1, aln.num_codons})})},
-                {"sites_count", aln.num_codons},
-                {"patterns_count", aln.patterns.size()}
-            }
-        });
-
-        nlohmann::json seqs_json = nlohmann::json::object();
-        for (const auto& s : aln.sequences) {
-            seqs_json[s.name] = s.raw_seq;
-        }
-        j["dataset"]["sequences"] = seqs_json;
-
-        // Phylogeny block
-        std::string nwk = tree_string.empty() ? tree.to_newick() : tree_string;
-        j["phylogeny"]["newick"] = nwk;
-        j["phylogeny"]["tree_length"] = total_tree_length;
-
-        nlohmann::json nodes_json;
-        for (const auto& node : tree.nodes) {
-            if (node.id != tree.root_id) {
-                nodes_json[node.name]["length"] = node.branch_length;
-                bool is_test = std::find(tested_branch_names.begin(), tested_branch_names.end(), node.name) != tested_branch_names.end();
-                nodes_json[node.name]["tested"] = is_test;
-            }
-        }
-        j["phylogeny"]["nodes"] = nodes_json;
-
-        // Model fits block
-        j["model_fits"]["Nucleotide GTR"]["description"] = "General Time Reversible nucleotide baseline";
-        j["model_fits"]["Nucleotide GTR"]["log_likelihood"] = gtr_log_l;
-        j["model_fits"]["Nucleotide GTR"]["aicc"] = gtr_aicc;
-        j["model_fits"]["Nucleotide GTR"]["parameters_count"] = 5 + (tree.num_nodes() - 1);
-
-        j["model_fits"]["Global MG94xREV"]["description"] = "Muse-Gaut 94 codon model with GTR core";
-        j["model_fits"]["Global MG94xREV"]["log_likelihood"] = baseline_log_l;
-        j["model_fits"]["Global MG94xREV"]["aicc"] = baseline_aicc;
-        j["model_fits"]["Global MG94xREV"]["parameters_count"] = 6 + (tree.num_nodes() - 1);
-        j["model_fits"]["Global MG94xREV"]["global_parameters"]["omega"] = global_omega;
-
-        // Statistical tests block
+        // Statistical tests
         j["statistical_tests"]["site_level_summary"] = {
             {"method", "Single-Likelihood Ancestor Counting (SLAC)"},
             {"test_statistic", "Exact Binomial Distribution"},
             {"threshold", settings.p_value_threshold},
-            {"total_sites", total_sites},
-            {"diversifying_count", diversifying_sites},
-            {"purifying_count", purifying_sites},
-            {"neutral_count", neutral_sites},
-            {"tested_branches_count", num_tested_branches},
-            {"background_branches_count", num_background_branches},
-            {"total_tested_tree_length", total_tested_tree_length}
+            {"total_sites", static_cast<int>(total_sites)},
+            {"diversifying_count", static_cast<int>(diversifying_sites)},
+            {"purifying_count", static_cast<int>(purifying_sites)},
+            {"neutral_count", static_cast<int>(neutral_sites)},
+            {"tested_branches_count", static_cast<int>(num_tested_branches)},
+            {"background_branches_count", static_cast<int>(num_background_branches)},
+            {"total_tested_tree_length", finite_or_null(total_tested_tree_length)}
         };
 
-        // Site results block
-        j["site_results"]["columns"] = {
-            {"site", {{"type", "integer"}, {"description", "1-based codon position"}}},
-            {"ES", {{"type", "number"}, {"description", "Expected synonymous sites"}}},
-            {"EN", {{"type", "number"}, {"description", "Expected non-synonymous sites"}}},
-            {"S", {{"type", "number"}, {"description", "Inferred synonymous substitutions"}}},
-            {"N", {{"type", "number"}, {"description", "Inferred non-synonymous substitutions"}}},
-            {"P_S", {{"type", "number"}, {"description", "Expected proportion of synonymous sites"}}},
-            {"dS", {{"type", "number"}, {"description", "Inferred synonymous substitution rate"}}},
-            {"dN", {{"type", "number"}, {"description", "Inferred non-synonymous substitution rate"}}},
-            {"dN_minus_dS", {{"type", "number"}, {"description", "Scaled substitution rate difference"}}},
-            {"p_positive", {{"type", "number"}, {"description", "Binomial p-value for positive (diversifying) selection"}}},
-            {"p_negative", {{"type", "number"}, {"description", "Binomial p-value for negative (purifying) selection"}}},
-            {"total_branch_length", {{"type", "number"}, {"description", "Effective branch length contributing to inference"}}},
-            {"classification", {{"type", "string"}, {"description", "Selection status: Diversifying, Purifying, or Neutral"}}}
-        };
-
+        // Site results (columnar; ColumnarResults enforces equal-length).
+        // dS/dN/dN-dS are nullable: sites with zero nonsynonymous expectation
+        // have no rate estimate, so the column carries null per upstream.
+        ColumnarResults table;
         std::vector<int> col_site;
-        std::vector<Scalar> col_ES, col_EN, col_S, col_N, col_P_S, col_tbl;
-        std::vector<nlohmann::json> col_dS, col_dN, col_diff;
-        std::vector<Scalar> col_p_pos, col_p_neg;
+        std::vector<double> col_ES, col_EN, col_S, col_N, col_P_S, col_p_pos, col_p_neg, col_tbl;
+        nlohmann::json col_dS = nlohmann::json::array(),
+                       col_dN = nlohmann::json::array(),
+                       col_diff = nlohmann::json::array();
         std::vector<std::string> col_class;
 
         for (size_t s = 0; s < total_sites; ++s) {
             const auto& r = resolved_sites[s];
-            col_site.push_back(s + 1);
+            col_site.push_back(static_cast<int>(s + 1));
             col_ES.push_back(r.ES);
             col_EN.push_back(r.EN);
             col_S.push_back(r.S);
             col_N.push_back(r.N);
             col_P_S.push_back(r.P_S);
-            col_dS.push_back(r.has_dS ? nlohmann::json(r.dS) : nullptr);
-            col_dN.push_back(r.has_dN ? nlohmann::json(r.dN) : nullptr);
-            col_diff.push_back(r.has_dN_minus_dS ? nlohmann::json(r.dN_minus_dS) : nullptr);
+            col_dS.push_back(r.has_dS ? nlohmann::json(r.dS) : nlohmann::json(nullptr));
+            col_dN.push_back(r.has_dN ? nlohmann::json(r.dN) : nlohmann::json(nullptr));
+            col_diff.push_back(r.has_dN_minus_dS ? nlohmann::json(r.dN_minus_dS) : nlohmann::json(nullptr));
             col_p_pos.push_back(r.p_positive);
             col_p_neg.push_back(r.p_negative);
             col_tbl.push_back(r.total_branch_length);
@@ -831,58 +758,56 @@ struct SLACResult {
             }
         }
 
-        j["site_results"]["data"]["site"] = col_site;
-        j["site_results"]["data"]["ES"] = col_ES;
-        j["site_results"]["data"]["EN"] = col_EN;
-        j["site_results"]["data"]["S"] = col_S;
-        j["site_results"]["data"]["N"] = col_N;
-        j["site_results"]["data"]["P_S"] = col_P_S;
-        j["site_results"]["data"]["dS"] = col_dS;
-        j["site_results"]["data"]["dN"] = col_dN;
-        j["site_results"]["data"]["dN_minus_dS"] = col_diff;
-        j["site_results"]["data"]["p_positive"] = col_p_pos;
-        j["site_results"]["data"]["p_negative"] = col_p_neg;
-        j["site_results"]["data"]["total_branch_length"] = col_tbl;
-        j["site_results"]["data"]["classification"] = col_class;
+        table.add_column("site", {"integer", "1-based codon position", "1-based codon position"}, col_site);
+        table.add_column("ES", {"number", "Expected synonymous sites"}, col_ES);
+        table.add_column("EN", {"number", "Expected non-synonymous sites"}, col_EN);
+        table.add_column("S", {"number", "Inferred synonymous substitutions"}, col_S);
+        table.add_column("N", {"number", "Inferred non-synonymous substitutions"}, col_N);
+        table.add_column("P_S", {"number", "Expected proportion of synonymous sites"}, col_P_S);
+        table.add_column("dS", {"number", "Inferred synonymous substitution rate"}, col_dS);
+        table.add_column("dN", {"number", "Inferred non-synonymous substitution rate"}, col_dN);
+        table.add_column("dN_minus_dS", {"number", "Scaled substitution rate difference"}, col_diff);
+        table.add_column("p_positive", {"number", "Binomial p-value for positive (diversifying) selection"}, col_p_pos);
+        table.add_column("p_negative", {"number", "Binomial p-value for negative (purifying) selection"}, col_p_neg);
+        table.add_column("total_branch_length", {"number", "Effective branch length contributing to inference"}, col_tbl);
+        table.add_column("classification", {"string", "Selection status: Diversifying, Purifying, or Neutral"}, col_class);
 
         if (settings.samples > 0 && !resolved_sites.empty() && !resolved_sites[0].quantiles_median.empty()) {
-            std::vector<Scalar> S_med, S_lo, S_hi;
-            std::vector<Scalar> N_med, N_lo, N_hi;
-            std::vector<nlohmann::json> dS_med, dS_lo, dS_hi;
-            std::vector<nlohmann::json> dN_med, dN_lo, dN_hi;
+            std::vector<double> S_med, S_lo, S_hi, N_med, N_lo, N_hi;
+            nlohmann::json dS_med = nlohmann::json::array(), dS_lo = nlohmann::json::array(),
+                           dS_hi = nlohmann::json::array(), dN_med = nlohmann::json::array(),
+                           dN_lo = nlohmann::json::array(), dN_hi = nlohmann::json::array();
 
             for (size_t s = 0; s < total_sites; ++s) {
                 const auto& r = resolved_sites[s];
                 S_med.push_back(r.quantiles_median[2]);
                 S_lo.push_back(r.quantiles_2_5[2]);
                 S_hi.push_back(r.quantiles_97_5[2]);
-
                 N_med.push_back(r.quantiles_median[3]);
                 N_lo.push_back(r.quantiles_2_5[3]);
                 N_hi.push_back(r.quantiles_97_5[3]);
-
-                dS_med.push_back(r.has_dS ? nlohmann::json(r.quantiles_median[5]) : nullptr);
-                dS_lo.push_back(r.has_dS ? nlohmann::json(r.quantiles_2_5[5]) : nullptr);
-                dS_hi.push_back(r.has_dS ? nlohmann::json(r.quantiles_97_5[5]) : nullptr);
-
-                dN_med.push_back(r.has_dN ? nlohmann::json(r.quantiles_median[6]) : nullptr);
-                dN_lo.push_back(r.has_dN ? nlohmann::json(r.quantiles_2_5[6]) : nullptr);
-                dN_hi.push_back(r.has_dN ? nlohmann::json(r.quantiles_97_5[6]) : nullptr);
+                dS_med.push_back(r.has_dS ? nlohmann::json(r.quantiles_median[5]) : nlohmann::json(nullptr));
+                dS_lo.push_back(r.has_dS ? nlohmann::json(r.quantiles_2_5[5]) : nlohmann::json(nullptr));
+                dS_hi.push_back(r.has_dS ? nlohmann::json(r.quantiles_97_5[5]) : nlohmann::json(nullptr));
+                dN_med.push_back(r.has_dN ? nlohmann::json(r.quantiles_median[6]) : nlohmann::json(nullptr));
+                dN_lo.push_back(r.has_dN ? nlohmann::json(r.quantiles_2_5[6]) : nlohmann::json(nullptr));
+                dN_hi.push_back(r.has_dN ? nlohmann::json(r.quantiles_97_5[6]) : nlohmann::json(nullptr));
             }
 
-            j["site_results"]["data"]["S_median"] = S_med;
-            j["site_results"]["data"]["S_ci_lower"] = S_lo;
-            j["site_results"]["data"]["S_ci_upper"] = S_hi;
-            j["site_results"]["data"]["N_median"] = N_med;
-            j["site_results"]["data"]["N_ci_lower"] = N_lo;
-            j["site_results"]["data"]["N_ci_upper"] = N_hi;
-            j["site_results"]["data"]["dS_median"] = dS_med;
-            j["site_results"]["data"]["dS_ci_lower"] = dS_lo;
-            j["site_results"]["data"]["dS_ci_upper"] = dS_hi;
-            j["site_results"]["data"]["dN_median"] = dN_med;
-            j["site_results"]["data"]["dN_ci_lower"] = dN_lo;
-            j["site_results"]["data"]["dN_ci_upper"] = dN_hi;
+            table.add_column("S_median", {"number", "Median synonymous substitutions across samples"}, S_med);
+            table.add_column("S_ci_lower", {"number", "2.5% CI for synonymous substitutions"}, S_lo);
+            table.add_column("S_ci_upper", {"number", "97.5% CI for synonymous substitutions"}, S_hi);
+            table.add_column("N_median", {"number", "Median non-synonymous substitutions across samples"}, N_med);
+            table.add_column("N_ci_lower", {"number", "2.5% CI for non-synonymous substitutions"}, N_lo);
+            table.add_column("N_ci_upper", {"number", "97.5% CI for non-synonymous substitutions"}, N_hi);
+            table.add_column("dS_median", {"number", "Median dS across samples"}, dS_med);
+            table.add_column("dS_ci_lower", {"number", "2.5% CI for dS"}, dS_lo);
+            table.add_column("dS_ci_upper", {"number", "97.5% CI for dS"}, dS_hi);
+            table.add_column("dN_median", {"number", "Median dN across samples"}, dN_med);
+            table.add_column("dN_ci_lower", {"number", "2.5% CI for dN"}, dN_lo);
+            table.add_column("dN_ci_upper", {"number", "97.5% CI for dN"}, dN_hi);
         }
+        j["site_results"] = table.to_json();
 
         return j;
     }

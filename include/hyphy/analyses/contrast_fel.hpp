@@ -7,6 +7,7 @@
 #include "hyphy/core/likelihood.hpp"
 #include "hyphy/core/progress_bar.hpp"
 #include "hyphy/core/provenance.hpp"
+#include "hyphy/core/json_output.hpp"
 #include "hyphy/analyses/site_visualizer.hpp"
 #include "hyphy/opt/nelder_mead.hpp"
 #include "hyphy/opt/optimizer.hpp"
@@ -1099,6 +1100,7 @@ public:
     ) const {
         nlohmann::json j;
 
+        j["$schema"] = "https://raw.githubusercontent.com/veg/hyphy-3/main/schemas/v3/contrast_fel.v3.schema.json";
         j["schema_version"] = "3.0.0";
         j["analysis"] = {
             {"id", "contrast-fel"},
@@ -1108,6 +1110,7 @@ public:
             {"reference", "Mol Biol Evol (2021) 38(3):1184–1198"},
             {"shrinkage_lambda", shrinkage_lambda}
         };
+        j["software"] = software_block();
 
         j["provenance"] = prov.to_json();
 
@@ -1118,9 +1121,11 @@ public:
         j["dataset"]["nucleotide_sites"] = aln.num_nucleotides;
         j["dataset"]["taxa"] = aln.taxon_names;
 
-        // Phylogeny
+        // Phylogeny — contrast-FEL's node entries carry group membership and a
+        // scalar (rescaled) branch length rather than the shared
+        // branch_lengths map, so this block stays custom.
         j["phylogeny"]["newick"] = tree_string.empty() ? tree.to_newick() : tree_string;
-        j["phylogeny"]["tree_length"] = baseline_tree_length;
+        j["phylogeny"]["tree_length"] = finite_or_null(baseline_tree_length);
         nlohmann::json nodes_json = nlohmann::json::object();
         for (const auto& node : tree.nodes) {
             if (node.id != tree.root_id) {
@@ -1140,20 +1145,21 @@ public:
 
         // Model fits
         if (has_gtr_fit) {
-            j["model_fits"]["nucleotide_gtr"]["log_likelihood"] = gtr_log_l;
-            j["model_fits"]["nucleotide_gtr"]["aicc"] = gtr_aicc;
+            j["model_fits"]["nucleotide_gtr"]["log_likelihood"] = finite_or_null(gtr_log_l);
+            j["model_fits"]["nucleotide_gtr"]["aicc"] = finite_or_null(gtr_aicc);
             j["model_fits"]["nucleotide_gtr"]["rates"] = {
-                {"AC", gtr_rates.theta_AC},
-                {"AT", gtr_rates.theta_AT},
-                {"CG", gtr_rates.theta_CG},
-                {"CT", gtr_rates.theta_CT},
-                {"GT", gtr_rates.theta_GT}
+                {"AC", finite_or_null(gtr_rates.theta_AC)},
+                {"AT", finite_or_null(gtr_rates.theta_AT)},
+                {"CG", finite_or_null(gtr_rates.theta_CG)},
+                {"CT", finite_or_null(gtr_rates.theta_CT)},
+                {"GT", finite_or_null(gtr_rates.theta_GT)}
             };
         }
 
-        j["model_fits"]["codon_mg94"]["log_likelihood"] = global_log_l;
-        j["model_fits"]["codon_mg94"]["aicc"] = global_aicc;
-        j["model_fits"]["codon_mg94"]["omega"] = (base_params.alpha > 0.0) ? (base_params.beta / base_params.alpha) : 1.0;
+        j["model_fits"]["codon_mg94"]["log_likelihood"] = finite_or_null(global_log_l);
+        j["model_fits"]["codon_mg94"]["aicc"] = finite_or_null(global_aicc);
+        j["model_fits"]["codon_mg94"]["omega"] = finite_or_null(
+            (base_params.alpha > 0.0) ? (base_params.beta / base_params.alpha) : 1.0);
 
         // Summary
         auto sum = get_summary();
@@ -1166,29 +1172,8 @@ public:
             {"shrinkage_lambda", shrinkage_lambda}
         };
 
-        // Columnar site results
-        nlohmann::json cols = {
-            {"site", {{"type", "integer"}, {"description", "1-based codon site index"}}},
-            {"alpha", {{"type", "float"}, {"description", "Site synonymous substitution rate"}}},
-            {"alpha_null", {{"type", "float"}, {"description", "Synonymous rate under H0"}}},
-            {"beta_null", {{"type", "float"}, {"description", "Shared non-synonymous rate under H0"}}},
-            {"raw_lrt", {{"type", "float"}, {"description", "Unpenalized likelihood ratio test statistic"}}},
-            {"penalized_lrt", {{"type", "float"}, {"description", "Penalized likelihood ratio test statistic"}}},
-            {"p_value", {{"type", "float"}, {"description", "Asymptotic p-value from chi^2_{K-1}"}}},
-            {"q_value", {{"type", "float"}, {"description", "Benjamini-Hochberg false discovery rate"}}},
-            {"contrast_tag", {{"type", "string"}, {"description", "Directional contrast classification"}}},
-            {"substitutions", {{"type", "string"}, {"description", "Partitioned ancestral substitutions"}}}
-        };
-
-        for (size_t k = 0; k < testable_groups.size(); ++k) {
-            std::string beta_col = "beta_" + testable_groups[k].name;
-            cols[beta_col] = {{"type", "float"}, {"description", "Non-synonymous rate for group " + testable_groups[k].name}};
-        }
-        if (has_background) {
-            cols["beta_background"] = {{"type", "float"}, {"description", "Nuisance non-synonymous rate on background branches"}};
-        }
-        j["site_results"]["columns"] = cols;
-
+        // Site results (columnar; ColumnarResults enforces equal-length)
+        ColumnarResults table;
         std::vector<int> col_site;
         std::vector<double> col_a, col_a_null, col_b_null, col_raw_lrt, col_plrt, col_pval, col_qval;
         std::vector<std::string> col_tag, col_subs;
@@ -1214,24 +1199,28 @@ public:
             if (has_background) col_beta_bg.push_back(r.beta_background);
         }
 
-        j["site_results"]["data"]["site"] = col_site;
-        j["site_results"]["data"]["alpha"] = col_a;
-        j["site_results"]["data"]["alpha_null"] = col_a_null;
-        j["site_results"]["data"]["beta_null"] = col_b_null;
-        j["site_results"]["data"]["raw_lrt"] = col_raw_lrt;
-        j["site_results"]["data"]["penalized_lrt"] = col_plrt;
-        j["site_results"]["data"]["p_value"] = col_pval;
-        j["site_results"]["data"]["q_value"] = col_qval;
-        j["site_results"]["data"]["contrast_tag"] = col_tag;
-        j["site_results"]["data"]["substitutions"] = col_subs;
+        table.add_column("site", {"integer", "1-based codon site index"}, col_site);
+        table.add_column("alpha", {"number", "Site synonymous substitution rate"}, col_a);
+        table.add_column("alpha_null", {"number", "Synonymous rate under H0"}, col_a_null);
+        table.add_column("beta_null", {"number", "Shared non-synonymous rate under H0"}, col_b_null);
+        table.add_column("raw_lrt", {"number", "Unpenalized likelihood ratio test statistic"}, col_raw_lrt);
+        table.add_column("penalized_lrt", {"number", "Penalized likelihood ratio test statistic"}, col_plrt);
+        table.add_column("p_value", {"number", "Asymptotic p-value from chi^2_{K-1}"}, col_pval);
+        table.add_column("q_value", {"number", "Benjamini-Hochberg false discovery rate"}, col_qval);
+        table.add_column("contrast_tag", {"string", "Directional contrast classification"}, col_tag);
+        table.add_column("substitutions", {"string", "Partitioned ancestral substitutions"}, col_subs);
 
         for (size_t k = 0; k < testable_groups.size(); ++k) {
-            std::string beta_col = "beta_" + testable_groups[k].name;
-            j["site_results"]["data"][beta_col] = col_betas[k];
+            table.add_column("beta_" + testable_groups[k].name,
+                             {"number", "Non-synonymous rate for group " + testable_groups[k].name},
+                             col_betas[k]);
         }
         if (has_background) {
-            j["site_results"]["data"]["beta_background"] = col_beta_bg;
+            table.add_column("beta_background",
+                             {"number", "Nuisance non-synonymous rate on background branches"},
+                             col_beta_bg);
         }
+        j["site_results"] = table.to_json();
 
         return j;
     }

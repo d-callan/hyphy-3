@@ -10,6 +10,7 @@
 #include "hyphy/core/progress_bar.hpp"
 #include "nlohmann/json.hpp"
 #include "hyphy/core/provenance.hpp"
+#include "hyphy/core/json_output.hpp"
 
 #include <vector>
 #include <string>
@@ -74,6 +75,7 @@ struct ABSRELResult {
     ABSRELFitSummary gtr_fit;
     ABSRELFitSummary baseline_fit;
     ABSRELFitSummary full_adaptive_fit;
+    GTRParameters gtr_params; // populated so the GTR fit can emit substitution rates
     std::unordered_map<std::string, ABSRELBranchResult> branches;
     std::vector<std::string> tested_branches;
     std::vector<std::string> positive_branches;
@@ -174,154 +176,87 @@ struct ABSRELResult {
     }
 
     nlohmann::json to_modern_json(const Tree& tree, const Alignment& aln, const Provenance& prov = {}) const {
-        nlohmann::json j;
-
-        j["$schema"] = "https://raw.githubusercontent.com/veg/hyphy-3/main/schemas/v3/absrel.v3.schema.json";
-        j["schema_version"] = "3.0.0";
-
-        // Analysis block
-        j["analysis"]["id"] = "absrel";
-        j["analysis"]["name"] = "Adaptive Branch-Site Random Effects Likelihood";
-        j["analysis"]["version"] = "3.0.0";
-        j["analysis"]["category"] = "branch_site_selection";
-        j["analysis"]["description"] = "aBSREL (Adaptive branch-site random effects likelihood) uses an adaptive random effects branch-site model framework to test whether each branch has evolved under positive selection, inferring an optimal number of rate categories per branch.";
-        j["analysis"]["citations"] = nlohmann::json::array({
+        AnalysisMetadata meta{
+            "absrel",
+            "Adaptive Branch-Site Random Effects Likelihood",
+            "3.0.0",
+            "branch_site_selection",
+            "aBSREL (Adaptive branch-site random effects likelihood) uses an adaptive random effects branch-site model framework to test whether each branch has evolved under positive selection, inferring an optimal number of rate categories per branch.",
+            {citation("Smith MD, Wertheim JO, Weaver S, Murrell B, Scheffler K, Kosakovsky Pond SL (2015). Less Is More: An Adaptive Branch-Site Random Effects Model for Efficient Detection of Episodic Diversifying Selection. Mol Biol Evol 32(5): 1342-1353.",
+                      "10.1093/molbev/msv022", "25697341")},
             {
-                {"citation", "Smith MD, Wertheim JO, Weaver S, Murrell B, Scheffler K, Kosakovsky Pond SL (2015). Less Is More: An Adaptive Branch-Site Random Effects Model for Efficient Detection of Episodic Diversifying Selection. Mol Biol Evol 32(5): 1342-1353."},
-                {"doi", "10.1093/molbev/msv022"},
-                {"pmid", "25697341"}
+                {"p_threshold", p_threshold},
+                {"tested_branches", tested_branches.size()}
             }
-        });
+        };
 
-        j["analysis"]["settings"]["p_threshold"] = p_threshold;
-        j["analysis"]["settings"]["tested_branches"] = tested_branches.size();
-
-        // Software block
-        j["software"]["name"] = "hyphy";
-        j["software"]["version"] = "3.0.0";
-        j["software"]["git_commit"] = "6e22db3";
-        j["software"]["build_type"] = "Release";
-        j["software"]["compiler"] = Provenance::detect_compiler();
-
-        // Provenance block
-        if (!prov.invocation.cli_command.empty() || !prov.inputs.empty()) {
-            j["provenance"] = prov.to_json();
-        } else {
-            Provenance auto_prov;
-            auto_prov.invocation.cli_command = "hyphy3 absrel";
-            auto_prov.invocation.working_directory = Provenance::get_cwd();
-            auto_prov.execution.start_time = Provenance::current_iso8601();
-            auto_prov.execution.end_time = Provenance::current_iso8601();
-            auto_prov.execution.wall_time_seconds = runtime_seconds;
-            auto_prov.execution.cpu_threads = 1;
-            auto_prov.execution.hostname = Provenance::get_hostname();
-            auto_prov.execution.os = Provenance::detect_os();
-            auto_prov.execution.compiler = Provenance::detect_compiler();
-            j["provenance"] = auto_prov.to_json();
+        nlohmann::json j = new_analysis_json(meta, prov);
+        // Preserve measured runtime when the caller supplied no real provenance.
+        if (prov.invocation.cli_command.empty() && prov.inputs.empty() &&
+            j["provenance"].contains("execution")) {
+            j["provenance"]["execution"]["wall_time_seconds"] = runtime_seconds;
         }
-
-        // Dataset block
-        j["dataset"]["taxa_count"] = aln.num_taxa;
-        j["dataset"]["codon_sites"] = aln.num_codons;
-        j["dataset"]["nucleotide_sites"] = aln.num_codons * 3;
-        j["dataset"]["unique_patterns"] = aln.patterns.size();
-        j["dataset"]["taxa"] = aln.taxon_names;
-
-        nlohmann::json gcode;
-        gcode["id"] = aln.code ? aln.code->name : "Universal";
-        gcode["name"] = aln.code ? aln.code->name : "Universal";
-        gcode["sense_codons"] = aln.code ? static_cast<int>(aln.code->sense_codons.size()) : 61;
-        if (aln.code) {
-            gcode["stop_codons"] = aln.code->stop_codons;
-        } else {
-            gcode["stop_codons"] = {"TAA", "TAG", "TGA"};
-        }
-        j["dataset"]["genetic_code"] = gcode;
-
-        j["dataset"]["partitions"] = nlohmann::json::array({
-            {
-                {"id", "default"},
-                {"name", "Full Alignment"},
-                {"span", nlohmann::json::array({nlohmann::json::array({1, aln.num_codons})})},
-                {"sites_count", aln.num_codons},
-                {"patterns_count", aln.patterns.size()}
-            }
-        });
-
-        // Phylogeny block
-        j["phylogeny"]["newick"] = tree.to_newick();
-        nlohmann::json nodes_json;
-        double sum_bl_base = 0.0;
-        double sum_bl_full = 0.0;
-
-        for (const auto& node : tree.nodes) {
-            nlohmann::json node_entry;
-            node_entry["type"] = node.children.empty() ? "leaf" : "internal";
-
-            auto it = branches.find(node.name);
-            if (it != branches.end()) {
-                const auto& bres = it->second;
-                node_entry["branch_lengths"]["baseline_mg94"] = bres.baseline_branch_length;
-                node_entry["branch_lengths"]["full_adaptive"] = bres.full_branch_length;
-                node_entry["rate_classes"] = bres.rate_classes;
-                node_entry["baseline_omega"] = bres.baseline_omega;
-                node_entry["is_tested"] = bres.is_tested;
-                node_entry["is_positive"] = bres.is_positive;
-
-                if (node.id != tree.root_id) {
-                    sum_bl_base += bres.baseline_branch_length;
-                    sum_bl_full += bres.full_branch_length;
+        j["dataset"] = dataset_block(aln);
+        j["phylogeny"] = phylogeny_block(
+            tree, "",
+            [this](const TreeNode& node) {
+                std::map<std::string, Scalar> lengths;
+                auto it = branches.find(node.name);
+                if (it != branches.end()) {
+                    lengths["baseline_mg94"] = it->second.baseline_branch_length;
+                    lengths["full_adaptive"] = it->second.full_branch_length;
                 }
-
+                return lengths;
+            },
+            [this](const TreeNode& node) -> nlohmann::json {
+                auto it = branches.find(node.name);
+                if (it == branches.end()) return nlohmann::json::object();
+                const auto& bres = it->second;
+                nlohmann::json entry;
+                entry["rate_classes"] = bres.rate_classes;
+                entry["baseline_omega"] = finite_or_null(bres.baseline_omega);
+                entry["is_tested"] = bres.is_tested;
+                entry["is_positive"] = bres.is_positive;
+                const auto& rd = bres.rate_distribution;
+                if (rd.rates.size() != rd.weights.size()) {
+                    throw std::runtime_error(
+                        "absrel: rate_distribution length mismatch on branch '" +
+                        node.name + "' (rates=" + std::to_string(rd.rates.size()) +
+                        ", weights=" + std::to_string(rd.weights.size()) + ")");
+                }
                 nlohmann::json rdist = nlohmann::json::array();
-                for (size_t k = 0; k < bres.rate_distribution.rates.size(); ++k) {
+                for (size_t k = 0; k < rd.rates.size(); ++k) {
                     rdist.push_back({
-                        {"omega", bres.rate_distribution.rates[k]},
-                        {"proportion", bres.rate_distribution.weights[k]}
+                        {"omega", finite_or_null(rd.rates[k])},
+                        {"proportion", finite_or_null(rd.weights[k])}
                     });
                 }
-                node_entry["rate_distribution"] = rdist;
-
+                entry["rate_distribution"] = rdist;
                 if (bres.is_tested) {
-                    node_entry["lrt"] = bres.lrt;
-                    node_entry["uncorrected_p_value"] = bres.uncorrected_p_value;
-                    node_entry["corrected_p_value"] = bres.corrected_p_value;
-                    node_entry["sites_ebf_100"] = bres.sites_ebf_100;
+                    entry["lrt"] = finite_or_null(bres.lrt);
+                    entry["uncorrected_p_value"] = finite_or_null(bres.uncorrected_p_value);
+                    entry["corrected_p_value"] = finite_or_null(bres.corrected_p_value);
+                    entry["sites_ebf_100"] = bres.sites_ebf_100;
                 }
-            }
+                return entry;
+            });
 
-            nodes_json[node.name] = node_entry;
-        }
-
-        j["phylogeny"]["nodes"] = nodes_json;
-        j["phylogeny"]["tree_lengths"]["baseline_mg94"] = sum_bl_base;
-        j["phylogeny"]["tree_lengths"]["full_adaptive"] = sum_bl_full;
-
-        // Model fits block
+        // Model fits
         if (gtr_fit.parameters > 0 || gtr_fit.log_likelihood != 0.0) {
-            j["model_fits"]["nucleotide_gtr"] = {
-                {"description", "General Time Reversible nucleotide model with empirical frequencies"},
-                {"log_likelihood", gtr_fit.log_likelihood},
-                {"parameters_count", gtr_fit.parameters},
-                {"aicc", gtr_fit.aicc}
-            };
+            j["model_fits"]["nucleotide_gtr"] = nucleotide_gtr_fit(
+                aln, gtr_params, gtr_fit.log_likelihood, gtr_fit.aicc,
+                static_cast<int>(gtr_fit.parameters));
         }
+        j["model_fits"]["baseline_mg94"] = fit_entry(
+            "Baseline MG94xREV model with individual branch omegas and branch lengths",
+            baseline_fit.log_likelihood, baseline_fit.aicc,
+            static_cast<int>(baseline_fit.parameters));
+        j["model_fits"]["full_adaptive"] = fit_entry(
+            "Full adaptive aBSREL mixture model with branch-specific rate categories",
+            full_adaptive_fit.log_likelihood, full_adaptive_fit.aicc,
+            static_cast<int>(full_adaptive_fit.parameters));
 
-        j["model_fits"]["baseline_mg94"] = {
-            {"description", "Baseline MG94xREV model with individual branch omegas and branch lengths"},
-            {"log_likelihood", baseline_fit.log_likelihood},
-            {"parameters_count", baseline_fit.parameters},
-            {"aicc", baseline_fit.aicc}
-        };
-
-        j["model_fits"]["full_adaptive"] = {
-            {"description", "Full adaptive aBSREL mixture model with branch-specific rate categories"},
-            {"log_likelihood", full_adaptive_fit.log_likelihood},
-            {"parameters_count", full_adaptive_fit.parameters},
-            {"aicc", full_adaptive_fit.aicc}
-        };
-
-        // Statistical tests block
+        // Statistical tests
         j["statistical_tests"]["branch_level_summary"] = {
             {"method", "Adaptive Branch-Site Random Effects Likelihood (aBSREL)"},
             {"test_statistic", "Likelihood Ratio Test (LRT)"},
@@ -333,19 +268,8 @@ struct ABSRELResult {
             {"positive_branches", positive_branches}
         };
 
-        // Branch results (Columnar format)
-        j["branch_results"]["columns"] = {
-            {"branch", {{"type", "string"}, {"description", "Branch name in phylogeny"}}},
-            {"rate_classes", {{"type", "integer"}, {"description", "Number of inferred omega rate classes"}}},
-            {"baseline_omega", {{"type", "float"}, {"description", "Baseline single omega estimate"}}},
-            {"full_branch_length", {{"type", "float"}, {"unit", "substitutions/site"}, {"description", "Estimated branch length under full adaptive model"}}},
-            {"lrt", {{"type", "float"}, {"description", "Likelihood ratio test statistic for episodic positive selection"}}},
-            {"uncorrected_p_value", {{"type", "float"}, {"description", "Asymptotic uncorrected p-value"}}},
-            {"corrected_p_value", {{"type", "float"}, {"description", "Holm-Bonferroni corrected p-value"}}},
-            {"sites_ebf_100", {{"type", "integer"}, {"description", "Number of sites with Empirical Bayes Factor (EBF) >= 100 favoring selection"}}},
-            {"positive", {{"type", "boolean"}, {"description", "Flag indicating episodic diversifying selection at threshold"}}}
-        };
-
+        // Branch results (columnar; ColumnarResults enforces equal-length)
+        ColumnarResults table;
         std::vector<std::string> col_branch;
         std::vector<int> col_k, col_ebf;
         std::vector<double> col_base_omega, col_len, col_lrt, col_raw_p, col_adj_p;
@@ -367,19 +291,19 @@ struct ABSRELResult {
             }
         }
 
-        j["branch_results"]["data"]["branch"] = col_branch;
-        j["branch_results"]["data"]["rate_classes"] = col_k;
-        j["branch_results"]["data"]["baseline_omega"] = col_base_omega;
-        j["branch_results"]["data"]["full_branch_length"] = col_len;
-        j["branch_results"]["data"]["lrt"] = col_lrt;
-        j["branch_results"]["data"]["uncorrected_p_value"] = col_raw_p;
-        j["branch_results"]["data"]["corrected_p_value"] = col_adj_p;
-        j["branch_results"]["data"]["sites_ebf_100"] = col_ebf;
-        j["branch_results"]["data"]["positive"] = col_pos;
+        table.add_column("branch", {"string", "Branch name in phylogeny"}, col_branch);
+        table.add_column("rate_classes", {"integer", "Number of inferred omega rate classes"}, col_k);
+        table.add_column("baseline_omega", {"number", "Baseline single omega estimate"}, col_base_omega);
+        table.add_column("full_branch_length", {"number", "Estimated branch length under full adaptive model", "substitutions/site"}, col_len);
+        table.add_column("lrt", {"number", "Likelihood ratio test statistic for episodic positive selection"}, col_lrt);
+        table.add_column("uncorrected_p_value", {"number", "Asymptotic uncorrected p-value"}, col_raw_p);
+        table.add_column("corrected_p_value", {"number", "Holm-Bonferroni corrected p-value"}, col_adj_p);
+        table.add_column("sites_ebf_100", {"integer", "Number of sites with Empirical Bayes Factor (EBF) >= 100 favoring selection"}, col_ebf);
+        table.add_column("positive", {"boolean", "Flag indicating episodic diversifying selection at threshold"}, col_pos);
+        j["branch_results"] = table.to_json();
 
         return j;
     }
-
     nlohmann::json to_json(
         const Tree& tree,
         const Alignment& aln,
@@ -945,6 +869,7 @@ public:
         // Phase 1: GTR
         if (progress_cb) progress_cb("Phase 1: Fitting Nucleotide GTR Model", 0.05);
         fit_gtr();
+        result.gtr_params = gtr_params;
         result.gtr_fit = {gtr_log_l, 39, gtr_aicc};
 
         // Phase 2: Baseline MG94xREV

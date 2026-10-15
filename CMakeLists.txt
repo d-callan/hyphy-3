@@ -29,6 +29,30 @@ target_include_directories(hyphy3_core INTERFACE
     ${eigen3_SOURCE_DIR}
 )
 
+# Build metadata for the JSON output software block (consumed by
+# include/hyphy/core/json_output.hpp). git_commit is captured at configure
+# time; falls back to "unknown" outside a git checkout.
+execute_process(
+    COMMAND git rev-parse --short HEAD
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    OUTPUT_VARIABLE HYPHY3_GIT_COMMIT
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET
+)
+if(NOT HYPHY3_GIT_COMMIT)
+    set(HYPHY3_GIT_COMMIT "unknown")
+endif()
+if(NOT CMAKE_BUILD_TYPE)
+    set(HYPHY3_BUILD_TYPE_VALUE "unknown")
+else()
+    set(HYPHY3_BUILD_TYPE_VALUE "${CMAKE_BUILD_TYPE}")
+endif()
+target_compile_definitions(hyphy3_core INTERFACE
+    HYPHY3_VERSION="${PROJECT_VERSION}"
+    HYPHY3_GIT_COMMIT="${HYPHY3_GIT_COMMIT}"
+    HYPHY3_BUILD_TYPE="${HYPHY3_BUILD_TYPE_VALUE}"
+)
+
 # OpenMP support
 find_package(OpenMP)
 if(NOT OpenMP_CXX_FOUND AND EXISTS "/opt/homebrew/opt/libomp")
