@@ -260,6 +260,8 @@ NB_MODULE(_hyphy3, m) {
         .def_rw("error_sink_bf_threshold", &BUSTEDSettings::error_sink_bf_threshold)
         .def_rw("test_branches", &BUSTEDSettings::test_branches)
         .def_rw("phenotype_mode", &BUSTEDSettings::phenotype_mode)
+        .def_rw("relax_mode", &BUSTEDSettings::relax_mode)
+        .def_rw("include_relax_in_ph", &BUSTEDSettings::include_relax_in_ph)
         .def_rw("comparison_branches", &BUSTEDSettings::comparison_branches)
         .def_rw("p_value_threshold", &BUSTEDSettings::p_value_threshold);
 
@@ -306,6 +308,12 @@ NB_MODULE(_hyphy3, m) {
         .def_ro("phenotype_verdict", &BUSTEDResult::phenotype_verdict)
         .def_ro("constrained_background", &BUSTEDResult::constrained_background)
         .def_ro("shared_distributions", &BUSTEDResult::shared_distributions)
+        .def_ro("has_relax_test", &BUSTEDResult::has_relax_test)
+        .def_ro("relax_k", &BUSTEDResult::relax_k)
+        .def_ro("relax_lrt", &BUSTEDResult::relax_lrt)
+        .def_ro("relax_p_value", &BUSTEDResult::relax_p_value)
+        .def_ro("relax_direction", &BUSTEDResult::relax_direction)
+        .def_ro("relax_alternative", &BUSTEDResult::relax_alternative)
         .def_ro("settings", &BUSTEDResult::settings)
         .def_ro("evidence_ratios", &BUSTEDResult::evidence_ratios)
         .def_ro("runtime_seconds", &BUSTEDResult::runtime_seconds);

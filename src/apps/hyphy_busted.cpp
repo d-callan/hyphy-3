@@ -54,8 +54,10 @@ static void print_usage(const char* prog, bool ph_mode = false) {
               << "  " << Console::brand("--embeddings") << " <file>  Path to precomputed [N x 384] HyphAeon embeddings (.bin/.csv/.tsv)\n"
               << "  " << Console::brand("--code") << " <name>        Genetic code (default: Universal)\n"
               << "  " << Console::brand("--branches") << " <spec>    Branches to test (foreground/phenotype): All, Internal, Leaves, {TAG}, or names\n"
-              << "  " << Console::brand("--phenotype") << "          Enable BUSTED-PH (3-test phenotype-associated selection workflow)\n"
-              << "  " << Console::brand("--comparison") << " <spec>  Background/comparison branch set for BUSTED-PH (default: all non-test branches)\n"
+              << "  " << Console::brand("--phenotype") << "          Enable BUSTED-PH (3-test phenotype-associated selection + coupled-k RELAX)\n"
+              << "  " << Console::brand("--relax") << "              Fit coupled-k RELAX model (omega_FG = omega_BG^k, shared weights) vs k=1 Null\n"
+              << "  " << Console::brand("--no-relax") << "           Skip coupled-k RELAX fit when running BUSTED-PH\n"
+              << "  " << Console::brand("--comparison") << " <spec>  Background/comparison branch set for BUSTED-PH / RELAX (default: non-test branches)\n"
               << "  " << Console::brand("--auto") << "                Full-Auto BUSTED: 4-gate surprisal & score selector for SRV, MH, Error Sink & K\n"
               << "  " << Console::brand("--rates") << " <N>          Number of omega rate categories (default: 3)\n"
               << "  " << Console::brand("--srv") << "                Enable synonymous rate variation across sites (BUSTED-S)\n"
@@ -118,8 +120,13 @@ int run_busted(int argc, char* argv[]) {
             settings.test_branches = argv[++i];
         } else if (arg == "--phenotype" || arg == "--busted-ph") {
             settings.phenotype_mode = true;
-        } else if ((arg == "--comparison" || arg == "--background") && i + 1 < argc) {
-            settings.phenotype_mode = true;
+        } else if (arg == "--relax") {
+            settings.relax_mode = true;
+            settings.include_relax_in_ph = true;
+        } else if (arg == "--no-relax") {
+            settings.relax_mode = false;
+            settings.include_relax_in_ph = false;
+        } else if ((arg == "--comparison" || arg == "--background" || arg == "--reference") && i + 1 < argc) {
             settings.comparison_branches = argv[++i];
         } else if (arg == "--auto" || arg == "--full-auto") {
             settings.full_auto = true;
@@ -233,10 +240,10 @@ int run_busted(int argc, char* argv[]) {
     // Validate branch selection upfront before fitting GTR/MG94
     Tree::BranchSelection branch_sel;
     try {
-        branch_sel = tree.select_branches(settings.test_branches, "", {}, settings.phenotype_mode);
-        if (settings.phenotype_mode && branch_sel.num_unselected == 0) {
+        branch_sel = tree.select_branches(settings.test_branches, "", {}, settings.phenotype_mode || settings.relax_mode);
+        if ((settings.phenotype_mode || settings.relax_mode) && branch_sel.num_unselected == 0) {
             throw std::runtime_error(
-                "BUSTED-PH requires a proper subset of foreground/phenotype branches and a non-empty background/comparison set. "
+                "BUSTED-PH / RELAX requires a proper subset of foreground/test branches and a non-empty background/reference set. "
                 "Specify foreground branches via --branches <spec> or label branches with {TEST}/{Foreground} in the tree."
             );
         }
@@ -252,7 +259,7 @@ int run_busted(int argc, char* argv[]) {
         {"Unique Patterns", std::to_string(aln.patterns.size())},
         {"Tree Source", tree_source + " (" + std::to_string(tree.num_nodes()) + " nodes, " + std::to_string(tree.num_leaves()) + " leaves)"},
         {"Tested Branches", settings.test_branches + " (" + std::to_string(branch_sel.num_selected) + " test, " + std::to_string(branch_sel.num_unselected) + " background)"},
-        {"Analysis Mode", settings.phenotype_mode ? "BUSTED-PH (UIT on FG/Diff + AIC-c BG Screen)" : (settings.full_auto ? "Full-Auto (4-Gate Surprisal & Score Screen)" : "Standard BUSTED")},
+        {"Analysis Mode", settings.phenotype_mode ? (settings.include_relax_in_ph ? "BUSTED-PH + RELAX (UIT on FG/Diff + AIC-c BG + Coupled-k RELAX)" : "BUSTED-PH (UIT on FG/Diff + AIC-c BG Screen)") : (settings.relax_mode ? "BUSTED + Coupled-k RELAX" : (settings.full_auto ? "Full-Auto (4-Gate Surprisal & Score Screen)" : "Standard BUSTED"))},
         {"Rate Classes (K)", settings.full_auto ? "Auto (2..3)" : (std::to_string(settings.num_rate_classes) + (settings.auto_select_k ? " (Auto-K enabled)" : ""))},
         {"Synonymous Variation", settings.full_auto ? "Auto" : (settings.srv ? "Enabled (" + std::to_string(settings.num_syn_rate_classes) + " classes)" : "Disabled")},
         {"Multiple Hits", settings.full_auto ? "Auto" : settings.multiple_hits},
@@ -263,7 +270,7 @@ int run_busted(int argc, char* argv[]) {
     // 4. Initialize and run BUSTED / BUSTED-PH
     Panel::print_step(1, 2, "Fitting Baseline GTR & Global MG94 Models", "Exchangeability rates & branch lengths");
     BUSTEDAnalyzer analyzer = BUSTEDAnalyzer::create_and_fit(tree, aln);
-    analyzer.select_branch_partitions(settings.test_branches, settings.comparison_branches, settings.phenotype_mode);
+    analyzer.select_branch_partitions(settings.test_branches, settings.comparison_branches, settings.phenotype_mode || settings.relax_mode);
 
     std::cout << "  " << Console::muted("Nucleotide GTR Log-L : ") << Console::bold(std::to_string(analyzer.gtr_log_l)) << "\n"
               << "  " << Console::muted("Global MG94 Log-L    : ") << Console::bold(std::to_string(analyzer.mg94_log_l))
@@ -427,11 +434,21 @@ int run_busted(int argc, char* argv[]) {
             {"1. Union-Intersection (FG & Diff)", uit_ss.str()},
             {"   ├─ Foreground Selection (p_FG)", t_test_ss.str()},
             {"   └─ Regime Difference (p_diff)", s_test_ss.str()},
-            {"2. Background Neutrality (AIC-c)", b_test_ss.str()},
-            {"Unconstrained Two-Set Fit", u_ss.str()},
-            {"JSON Output File", output_file + json_desc},
-            {"Total Execution Time", time_ss.str()}
+            {"2. Background Neutrality (AIC-c)", b_test_ss.str()}
         };
+        if (res.has_relax_test) {
+            std::ostringstream r_ss;
+            r_ss << "k = " << std::fixed << std::setprecision(3) << res.relax_k
+                 << " (LRT = " << std::setprecision(3) << res.relax_lrt
+                 << ", p_RELAX = " << std::scientific << std::setprecision(4) << res.relax_p_value << ") "
+                 << ((res.relax_p_value <= res.settings.p_value_threshold)
+                     ? ((res.relax_k > 1.0) ? "[Intensification (k > 1)]" : "[Relaxation (k < 1)]")
+                     : "[No sig. k != 1 shift]");
+            sum_items.push_back({"3. Coupled-k RELAX Test (df=1)", r_ss.str()});
+        }
+        sum_items.push_back({"Unconstrained Two-Set Fit", u_ss.str()});
+        sum_items.push_back({"JSON Output File", output_file + json_desc});
+        sum_items.push_back({"Total Execution Time", time_ss.str()});
         Panel::print_summary_card("BUSTED-PH Phenotype Association Summary", sum_items, res.phenotype_verdict, res.phenotype_associated);
     } else {
         std::string conclusion;
@@ -447,10 +464,20 @@ int run_busted(int argc, char* argv[]) {
             {"p-value (mixture distribution)", p_ss.str() + " [threshold: 0.05]"},
             {"Unconstrained Model Fit", u_ss.str()},
             {"Constrained Null Model Fit", c_ss.str()},
-            {"Optimal Model Selection", "K = " + std::to_string(res.optimal_k) + " rate classes"},
-            {"JSON Output File", output_file + json_desc},
-            {"Total Execution Time", time_ss.str()}
+            {"Optimal Model Selection", "K = " + std::to_string(res.optimal_k) + " rate classes"}
         };
+        if (res.has_relax_test) {
+            std::ostringstream r_ss;
+            r_ss << "k = " << std::fixed << std::setprecision(3) << res.relax_k
+                 << " (LRT = " << std::setprecision(3) << res.relax_lrt
+                 << ", p_RELAX = " << std::scientific << std::setprecision(4) << res.relax_p_value << ") "
+                 << ((res.relax_p_value <= res.settings.p_value_threshold)
+                     ? ((res.relax_k > 1.0) ? "[Intensification (k > 1)]" : "[Relaxation (k < 1)]")
+                     : "[No sig. k != 1 shift]");
+            sum_items.push_back({"Coupled-k RELAX Test (df=1)", r_ss.str()});
+        }
+        sum_items.push_back({"JSON Output File", output_file + json_desc});
+        sum_items.push_back({"Total Execution Time", time_ss.str()});
 
         Panel::print_summary_card("BUSTED Episodic Selection Analysis Summary", sum_items, conclusion, is_sig);
     }

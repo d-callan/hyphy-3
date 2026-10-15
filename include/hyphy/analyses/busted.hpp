@@ -149,6 +149,8 @@ struct BUSTEDSettings {
     Scalar error_sink_bf_threshold = 100.0; // Bayes factor cutoff to flag branch-site errors
     std::string test_branches = "All"; // "All", "Internal", "Leaves", "Unlabeled", or tag/comma-separated names
     bool phenotype_mode = false;       // Run BUSTED-PH (Test selection, Background selection, and Shared distribution LRTs)
+    bool relax_mode = false;           // Fit coupled-k RELAX model (omega_FG = omega_BG^k, shared weights) vs shared_distributions (k = 1)
+    bool include_relax_in_ph = true;   // Automatically run coupled-k RELAX fit inside BUSTED-PH workflow
     std::string comparison_branches = ""; // Optional comparison/background branch set for BUSTED-PH (default: complement of test_branches)
 };
 
@@ -176,6 +178,13 @@ struct BUSTEDResult {
     std::string phenotype_verdict;
     BUSTEDFit constrained_background;
     BUSTEDFit shared_distributions;
+    // Coupled-k RELAX test fields (M_shared [k=1] vs M_RELAX [omega_FG = omega_BG^k, shared weights])
+    bool has_relax_test = false;
+    Scalar relax_k = 1.0;
+    Scalar relax_lrt = 0.0;
+    Scalar relax_p_value = 1.0;
+    std::string relax_direction = "None"; // "Intensification", "Relaxation", or "None"
+    BUSTEDFit relax_alternative;
 
     std::vector<Scalar> evidence_ratios; // Bayes factors per site for omega_K > 1
     std::vector<Scalar> site_error_bfs;  // Max error sink Bayes factor across branches per site
@@ -2954,6 +2963,309 @@ public:
         return fit;
     }
 
+    // Fits coupled-k RELAX two-set model:
+    //   Reference (Background, partition 1): K-class distribution (omegas_b[c], weights[c])
+    //   Test (Foreground, partition 0):      K-class distribution (omegas_t[c] = (omegas_b[c])^k, weights[c])
+    // Warm-started from shared_null_fit (the exact k = 1 RELAX Null model), guaranteeing lnL_RELAX >= lnL_shared.
+    BUSTEDFit fit_relax_coupled_model(
+        const BUSTEDFit& shared_null_fit,
+        size_t K = 3,
+        bool refine_branches = true,
+        bool srv = false,
+        size_t num_syn_rates = 3,
+        const std::string& multiple_hits = "None",
+        ProgressBar* pbar = nullptr,
+        const std::string& model_desc = "",
+        bool use_error_sink = false,
+        Scalar max_eps_sink = 0.01,
+        Scalar* out_relax_k = nullptr
+    ) const {
+        BUSTEDFit fit = shared_null_fit;
+        fit.num_rate_classes = K;
+        fit.has_background_distribution = true;
+
+        bool allow_double = (multiple_hits == "Double" || multiple_hits == "Double+Triple");
+        bool allow_triple = (multiple_hits == "Double+Triple");
+        Scalar max_omega = use_error_sink ? 50.0 : 2000.0;
+
+        std::vector<Scalar> omegas_b = shared_null_fit.test_distribution.omegas;
+        std::vector<Scalar> weights = shared_null_fit.test_distribution.weights;
+        if (omegas_b.size() != K || weights.size() != K) {
+            omegas_b.resize(K, 1.0);
+            weights.assign(K, 1.0 / static_cast<Scalar>(K));
+        }
+
+        size_t M = srv ? num_syn_rates : 1;
+        std::vector<Scalar> syn_rates = (srv && shared_null_fit.test_distribution.syn_rates.size() == M)
+            ? shared_null_fit.test_distribution.syn_rates : std::vector<Scalar>(M, 1.0);
+        std::vector<Scalar> syn_weights = (srv && shared_null_fit.test_distribution.syn_weights.size() == M)
+            ? shared_null_fit.test_distribution.syn_weights : std::vector<Scalar>(M, 1.0 / static_cast<Scalar>(M));
+
+        Scalar delta = shared_null_fit.delta;
+        Scalar psi = shared_null_fit.psi;
+        Scalar eps_sink_t = shared_null_fit.error_sink_weight;
+        Scalar eps_sink_b = shared_null_fit.error_sink_weight;
+
+        std::vector<Scalar> base_bl = shared_null_fit.branch_lengths;
+        if (base_bl.size() != tree.num_nodes()) {
+            base_bl.assign(tree.num_nodes(), 0.0);
+            for (const auto& node : tree.nodes) {
+                if (node.id != tree.root_id) {
+                    base_bl[node.id] = shared_null_fit.tree_scale * branch_tau[node.id];
+                }
+            }
+        }
+        std::vector<Scalar> cur_bl = base_bl;
+        auto get_scaled_bl = [&](Scalar scale_s) -> const std::vector<Scalar>* {
+            for (const auto& node : tree.nodes) {
+                if (node.id != tree.root_id) {
+                    cur_bl[node.id] = scale_s * base_bl[node.id];
+                }
+            }
+            return &cur_bl;
+        };
+
+        auto couple_omegas = [&](const std::vector<Scalar>& wb, Scalar kv) {
+            std::vector<Scalar> wt(wb.size());
+            for (size_t c = 0; c < wb.size(); ++c) {
+                if (std::abs(wb[c] - 1.0) < 1e-12) {
+                    wt[c] = 1.0;
+                } else if (wb[c] <= 1e-12) {
+                    wt[c] = (kv > 0.0) ? 1e-8 : 1.0;
+                } else {
+                    wt[c] = std::clamp(std::pow(wb[c], kv), 1e-8, max_omega);
+                }
+            }
+            return wt;
+        };
+
+        Scalar s = 1.0;
+        Scalar k_relax = 1.0;
+        std::vector<Scalar> omegas_t = couple_omegas(omegas_b, k_relax);
+
+        Scalar best_tracked_ll = evaluate_two_set_log_l(
+            1.0, omegas_t, weights, omegas_b, weights, syn_rates, syn_weights, get_scaled_bl(s), nullptr, delta, psi, eps_sink_t, eps_sink_b
+        );
+
+        // Initial 1D search on k_relax holding shared distribution fixed
+        {
+            std::vector<Scalar> k_grid = {0.0, 0.1, 0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 3.0, 5.0, 10.0};
+            Scalar best_k = k_relax;
+            for (Scalar kc : k_grid) {
+                auto wt_c = couple_omegas(omegas_b, kc);
+                Scalar ll_c = evaluate_two_set_log_l(
+                    1.0, wt_c, weights, omegas_b, weights, syn_rates, syn_weights, get_scaled_bl(s), nullptr, delta, psi, eps_sink_t, eps_sink_b
+                );
+                if (ll_c > best_tracked_ll) {
+                    best_tracked_ll = ll_c;
+                    best_k = kc;
+                }
+            }
+            auto [brent_k, brent_nll] = Brent1D::minimize([&](Scalar kc) {
+                Scalar kc_clamped = std::clamp(kc, 0.0, 50.0);
+                auto wt_c = couple_omegas(omegas_b, kc_clamped);
+                return -evaluate_two_set_log_l(
+                    1.0, wt_c, weights, omegas_b, weights, syn_rates, syn_weights, get_scaled_bl(s), nullptr, delta, psi, eps_sink_t, eps_sink_b
+                );
+            }, std::max(0.0, best_k * 0.25), best_k, std::min(50.0, std::max(2.0, best_k * 2.5)), 1e-4, 35);
+            if (-brent_nll >= best_tracked_ll) {
+                best_tracked_ll = -brent_nll;
+                k_relax = std::clamp(brent_k, 0.0, 50.0);
+            } else {
+                k_relax = best_k;
+            }
+            omegas_t = couple_omegas(omegas_b, k_relax);
+        }
+
+        size_t B_t = std::max<size_t>(1, num_test_branches);
+        size_t B_b = std::max<size_t>(1, num_background_branches);
+        Scalar frac_t = static_cast<Scalar>(B_t) / static_cast<Scalar>(B_t + B_b);
+        Scalar frac_b = static_cast<Scalar>(B_b) / static_cast<Scalar>(B_t + B_b);
+
+        int max_ecm = (K == 1 && !srv && !allow_double && !use_error_sink) ? 1 : 3;
+        for (int ecm_iter = 0; ecm_iter < max_ecm; ++ecm_iter) {
+            // 1. Shared weights E-step
+            if (K >= 2 || use_error_sink) {
+                Scalar cand_eps_t = eps_sink_t, cand_eps_b = eps_sink_b;
+                auto [wt_t, wt_b] = compute_expected_two_set_weights(
+                    1.0, omegas_t, weights, omegas_b, weights, syn_rates, syn_weights, get_scaled_bl(s), delta, psi,
+                    eps_sink_t, eps_sink_b,
+                    use_error_sink ? &cand_eps_t : nullptr,
+                    use_error_sink ? &cand_eps_b : nullptr,
+                    max_eps_sink
+                );
+                std::vector<Scalar> w_cand(K);
+                Scalar sum_w = 0.0;
+                for (size_t c = 0; c < K; ++c) {
+                    w_cand[c] = std::clamp(frac_t * wt_t[c] + frac_b * wt_b[c], 1e-6, 1.0 - 1e-6);
+                    sum_w += w_cand[c];
+                }
+                for (size_t c = 0; c < K; ++c) w_cand[c] /= sum_w;
+                Scalar cand_eps = frac_t * cand_eps_t + frac_b * cand_eps_b;
+                Scalar cand_ll = evaluate_two_set_log_l(
+                    1.0, omegas_t, w_cand, omegas_b, w_cand, syn_rates, syn_weights, get_scaled_bl(s), nullptr, delta, psi, cand_eps, cand_eps
+                );
+                if (cand_ll >= best_tracked_ll - 1e-9) {
+                    weights = w_cand;
+                    eps_sink_t = cand_eps;
+                    eps_sink_b = cand_eps;
+                    best_tracked_ll = std::max(best_tracked_ll, cand_ll);
+                }
+            }
+
+            // 2. SRV weights E-step
+            if (srv && M >= 2) {
+                auto q_cand = compute_expected_two_set_syn_weights(
+                    1.0, omegas_t, weights, omegas_b, weights, syn_rates, syn_weights, get_scaled_bl(s), delta, psi, eps_sink_t, eps_sink_b
+                );
+                Scalar cand_ll = evaluate_two_set_log_l(
+                    1.0, omegas_t, weights, omegas_b, weights, syn_rates, q_cand, get_scaled_bl(s), nullptr, delta, psi, eps_sink_t, eps_sink_b
+                );
+                if (cand_ll >= best_tracked_ll - 1e-9) {
+                    syn_weights = q_cand;
+                    best_tracked_ll = std::max(best_tracked_ll, cand_ll);
+                }
+            }
+
+            // 3. Joint M-step on (s, omegas_b, k_relax)
+            if (K == 1) {
+                auto opt = NelderMeadND<3>::minimize([&](const std::array<Scalar, 3>& x) {
+                    std::vector<Scalar> wb = {x[1]};
+                    auto wt = couple_omegas(wb, x[2]);
+                    return -evaluate_two_set_log_l(1.0, wt, weights, wb, weights, syn_rates, syn_weights, get_scaled_bl(x[0]), nullptr, delta, psi, eps_sink_t, eps_sink_b);
+                }, {s, omegas_b[0], k_relax}, {0.05, 1e-4, 0.0}, {20.0, max_omega, 50.0}, 1e-4, 40);
+                if (-opt.f >= best_tracked_ll) {
+                    s = opt.x[0]; omegas_b[0] = opt.x[1]; k_relax = opt.x[2];
+                    best_tracked_ll = -opt.f;
+                }
+            } else if (K == 2) {
+                std::vector<std::array<Scalar, 4>> extra_grid;
+                if (ecm_iter == 0) {
+                    extra_grid = {
+                        {s, omegas_b[0], std::max(2.0, omegas_b[1]), 0.2},
+                        {s, omegas_b[0], std::max(2.0, omegas_b[1]), 1.0},
+                        {s, omegas_b[0], std::max(2.0, omegas_b[1]), 2.0}
+                    };
+                }
+                auto opt = NelderMeadND<4>::minimize([&](const std::array<Scalar, 4>& x) {
+                    std::vector<Scalar> wb = {x[1], x[2]};
+                    auto wt = couple_omegas(wb, x[3]);
+                    return -evaluate_two_set_log_l(1.0, wt, weights, wb, weights, syn_rates, syn_weights, get_scaled_bl(x[0]), nullptr, delta, psi, eps_sink_t, eps_sink_b);
+                }, {s, omegas_b[0], omegas_b[1], k_relax}, {0.05, 1e-4, 1.0, 0.0}, {20.0, 1.0, max_omega, 50.0}, 1e-4, 45, extra_grid);
+                if (-opt.f >= best_tracked_ll) {
+                    s = opt.x[0]; omegas_b[0] = opt.x[1]; omegas_b[1] = opt.x[2]; k_relax = opt.x[3];
+                    best_tracked_ll = -opt.f;
+                }
+            } else if (K == 3) {
+                std::vector<std::array<Scalar, 5>> extra_grid;
+                if (ecm_iter == 0) {
+                    extra_grid = {
+                        {s, omegas_b[0], omegas_b[1], std::max(2.0, omegas_b[2]), 0.2},
+                        {s, omegas_b[0], omegas_b[1], std::max(2.0, omegas_b[2]), 1.0},
+                        {s, omegas_b[0], omegas_b[1], std::max(2.0, omegas_b[2]), 2.0}
+                    };
+                }
+                auto opt = NelderMeadND<5>::minimize([&](const std::array<Scalar, 5>& x) {
+                    if (x[1] > x[2]) return 1e20;
+                    std::vector<Scalar> wb = {x[1], x[2], x[3]};
+                    auto wt = couple_omegas(wb, x[4]);
+                    return -evaluate_two_set_log_l(1.0, wt, weights, wb, weights, syn_rates, syn_weights, get_scaled_bl(x[0]), nullptr, delta, psi, eps_sink_t, eps_sink_b);
+                }, {s, omegas_b[0], omegas_b[1], omegas_b[2], k_relax}, {0.05, 1e-4, 1e-4, 1.0, 0.0}, {20.0, 1.0, 1.0, max_omega, 50.0}, 1e-4, 50, extra_grid);
+                if (-opt.f >= best_tracked_ll) {
+                    s = opt.x[0]; omegas_b[0] = opt.x[1]; omegas_b[1] = opt.x[2]; omegas_b[2] = opt.x[3]; k_relax = opt.x[4];
+                    best_tracked_ll = -opt.f;
+                }
+            }
+            omegas_t = couple_omegas(omegas_b, k_relax);
+
+            if (pbar) {
+                std::ostringstream ss;
+                ss << model_desc << " (ECM " << (ecm_iter + 1) << "/" << max_ecm << ", k="
+                   << std::fixed << std::setprecision(2) << k_relax << "): lnL = " << best_tracked_ll;
+                pbar->set_status(ss.str());
+                pbar->tick();
+            }
+        }
+
+        std::vector<Scalar> bl = *get_scaled_bl(s);
+
+        if (refine_branches) {
+            auto cand_bl = refine_two_set_branch_lengths(
+                bl, omegas_t, weights, omegas_b, weights, syn_rates, syn_weights, delta, psi, 1, eps_sink_t, eps_sink_b
+            );
+            Scalar cand_bl_ll = evaluate_two_set_log_l(
+                1.0, omegas_t, weights, omegas_b, weights, syn_rates, syn_weights, &cand_bl, nullptr, delta, psi, eps_sink_t, eps_sink_b
+            );
+            if (cand_bl_ll >= best_tracked_ll) {
+                bl = cand_bl;
+                best_tracked_ll = cand_bl_ll;
+            }
+            if (pbar) {
+                std::ostringstream ss;
+                ss << model_desc << ": Branch lengths refined";
+                pbar->set_status(ss.str());
+                pbar->tick();
+            }
+
+            // Final 1D polish on k_relax with refined branch lengths
+            auto [brent_k, brent_nll] = Brent1D::minimize([&](Scalar kc) {
+                Scalar kc_clamped = std::clamp(kc, 0.0, 50.0);
+                auto wt_c = couple_omegas(omegas_b, kc_clamped);
+                return -evaluate_two_set_log_l(
+                    1.0, wt_c, weights, omegas_b, weights, syn_rates, syn_weights, &bl, nullptr, delta, psi, eps_sink_t, eps_sink_b
+                );
+            }, std::max(0.0, k_relax * 0.5), k_relax, std::min(50.0, std::max(1.5, k_relax * 1.5)), 1e-4, 30);
+            if (-brent_nll >= best_tracked_ll) {
+                best_tracked_ll = -brent_nll;
+                k_relax = std::clamp(brent_k, 0.0, 50.0);
+                omegas_t = couple_omegas(omegas_b, k_relax);
+            }
+            if (allow_double && pbar) {
+                pbar->tick();
+            }
+        }
+
+        Scalar best_lnL = evaluate_two_set_log_l(
+            1.0, omegas_t, weights, omegas_b, weights, syn_rates, syn_weights, &bl, &fit.site_log_likelihoods, delta, psi, eps_sink_t, eps_sink_b
+        );
+        if (best_lnL < shared_null_fit.log_likelihood) {
+            fit = shared_null_fit;
+            k_relax = 1.0;
+        } else {
+            fit.log_likelihood = best_lnL;
+            fit.tree_scale = s * shared_null_fit.tree_scale;
+            fit.branch_lengths = bl;
+            fit.delta = delta;
+            fit.psi = psi;
+            fit.error_sink_weight = eps_sink_t;
+
+            fit.test_distribution.omegas = omegas_t;
+            fit.test_distribution.weights = weights;
+            fit.test_distribution.error_sink_weight = eps_sink_t;
+            fit.background_distribution.omegas = omegas_b;
+            fit.background_distribution.weights = weights;
+            fit.background_distribution.error_sink_weight = eps_sink_b;
+            if (srv) {
+                fit.test_distribution.syn_rates = syn_rates;
+                fit.test_distribution.syn_weights = syn_weights;
+                fit.background_distribution.syn_rates = syn_rates;
+                fit.background_distribution.syn_weights = syn_weights;
+            }
+        }
+
+        if (out_relax_k) *out_relax_k = k_relax;
+
+        size_t N_codons = aln.num_codons;
+        size_t num_branches = tree.num_nodes() - 1;
+        size_t num_mixture_params = (2 * K - 1) + 1 + (use_error_sink ? 1 : 0); // shared weights + BG omegas + k_relax
+        size_t num_syn_params = srv ? 2 * (M - 1) : 0;
+        size_t num_mh_params = (allow_double ? 1 : 0) + (allow_triple ? 1 : 0);
+        size_t K_params = 5 + (refine_branches ? num_branches : 1) + num_mixture_params + num_syn_params + num_mh_params;
+        fit.aicc = -2.0 * fit.log_likelihood + 2.0 * K_params * N_codons / std::max(1.0, static_cast<double>(N_codons) - static_cast<double>(K_params) - 1.0);
+
+        return fit;
+    }
+
     // Run complete BUSTED or BUSTED-PH analysis with options
     BUSTEDResult run(
         BUSTEDSettings settings = {},
@@ -2961,10 +3273,10 @@ public:
         bool force_progress = false
     ) const {
         auto t0 = std::chrono::high_resolution_clock::now();
-        select_branch_partitions(settings.test_branches, settings.comparison_branches, settings.phenotype_mode);
-        if (settings.phenotype_mode && num_background_branches == 0) {
+        select_branch_partitions(settings.test_branches, settings.comparison_branches, settings.phenotype_mode || settings.relax_mode);
+        if ((settings.phenotype_mode || settings.relax_mode) && num_background_branches == 0) {
             throw std::runtime_error(
-                "BUSTED-PH requires a proper subset of foreground/phenotype branches and a non-empty background/comparison set. "
+                "BUSTED-PH / RELAX mode requires a proper subset of foreground/test branches and a non-empty background/reference set. "
                 "Specify foreground branches via --branches <spec> or label branches with {TEST}/{Foreground} in the tree."
             );
         }
@@ -2980,17 +3292,27 @@ public:
             size_t max_ecm = (K == 1 && !settings.srv && !allow_double && !settings.error_sink) ? 1 : 6;
             return max_ecm + (settings.refine_branch_lengths ? 1 : 0) + ((settings.refine_branch_lengths && allow_double) ? 1 : 0);
         };
+        auto count_relax_steps = [&](size_t K) -> size_t {
+            size_t max_ecm = (K == 1 && !settings.srv && !allow_double && !settings.error_sink) ? 1 : 3;
+            return max_ecm + (settings.refine_branch_lengths ? 1 : 0) + ((settings.refine_branch_lengths && allow_double) ? 1 : 0);
+        };
 
+        bool run_relax_in_ph = settings.phenotype_mode && (settings.include_relax_in_ph || settings.relax_mode);
         size_t total_steps = 0;
         if (settings.phenotype_mode) {
-            total_steps = count_steps(settings.num_rate_classes) * 4;
+            total_steps = count_steps(settings.num_rate_classes) * 4
+                        + (run_relax_in_ph ? count_relax_steps(settings.num_rate_classes) : 0);
         } else if (settings.auto_select_k) {
             for (size_t k = 1; k <= settings.max_k; ++k) {
                 total_steps += count_steps(k);
             }
             total_steps += count_steps(settings.max_k);
+            if (settings.relax_mode) {
+                total_steps += count_steps(settings.max_k) + count_relax_steps(settings.max_k);
+            }
         } else {
-            total_steps = count_steps(settings.num_rate_classes) * 2;
+            total_steps = count_steps(settings.num_rate_classes) * 2
+                        + (settings.relax_mode ? (count_steps(settings.num_rate_classes) + count_relax_steps(settings.num_rate_classes)) : 0);
         }
 
         std::unique_ptr<ProgressBar> pbar;
@@ -3010,7 +3332,7 @@ public:
             res.has_background_test = true;
             res.shared_df = static_cast<int>(2 * K - 1);
 
-            // 1. Fit Shared Distributions Model (M_shared: D_T == D_B on Test U Background)
+            // 1. Fit Shared Distributions Model (M_shared: D_T == D_B on Test U Background; also exact RELAX Null k = 1)
             {
                 auto saved_is_test = is_test_branch;
                 auto saved_num_test = num_test_branches;
@@ -3024,13 +3346,30 @@ public:
                 }
                 res.shared_distributions = fit_model(
                     false, K, settings.refine_branch_lengths, settings.srv, settings.num_syn_rate_classes,
-                    settings.multiple_hits, pbar.get(), "Shared Dist K=" + std::to_string(K),
+                    settings.multiple_hits, pbar.get(), "Shared Dist (RELAX Null k=1) K=" + std::to_string(K),
                     settings.error_sink, settings.error_sink_max_weight
                 );
                 res.shared_distributions.has_background_distribution = true;
                 res.shared_distributions.background_distribution = res.shared_distributions.test_distribution;
                 is_test_branch = saved_is_test;
                 num_test_branches = saved_num_test;
+            }
+
+            // 1b. Fit Coupled-k RELAX Alternative Model (M_RELAX: omega_FG = omega_BG^k, shared weights)
+            if (run_relax_in_ph) {
+                res.has_relax_test = true;
+                res.relax_alternative = fit_relax_coupled_model(
+                    res.shared_distributions, K, settings.refine_branch_lengths, settings.srv, settings.num_syn_rate_classes,
+                    settings.multiple_hits, pbar.get(), "RELAX Coupled-k K=" + std::to_string(K),
+                    settings.error_sink, settings.error_sink_max_weight, &res.relax_k
+                );
+                res.relax_lrt = std::max(0.0, 2.0 * (res.relax_alternative.log_likelihood - res.shared_distributions.log_likelihood));
+                res.relax_p_value = busted_chi2_p_value(res.relax_lrt, 1.0);
+                if (res.relax_p_value <= settings.p_value_threshold) {
+                    res.relax_direction = (res.relax_k > 1.0) ? "Intensification" : "Relaxation";
+                } else {
+                    res.relax_direction = "None";
+                }
             }
 
             // 2. Fit Constrained Test Model (M_null_T: omega_K^(T) = 1, omega_K^(B) >= 1)
@@ -3053,6 +3392,11 @@ public:
             // Warm-start from the best nested model's Test/Background distributions
             const BUSTEDRateDistribution* warm_t = &res.constrained_background.test_distribution;
             const BUSTEDRateDistribution* warm_b = &res.constrained.background_distribution;
+            if (res.has_relax_test && res.relax_alternative.log_likelihood > res.constrained_background.log_likelihood &&
+                res.relax_alternative.log_likelihood > res.constrained.log_likelihood) {
+                warm_t = &res.relax_alternative.test_distribution;
+                warm_b = &res.relax_alternative.background_distribution;
+            }
             res.unconstrained = fit_two_set_model(
                 false, false, K, settings.refine_branch_lengths, settings.srv, settings.num_syn_rate_classes,
                 settings.multiple_hits, pbar.get(), "Unconstrained Two-Set K=" + std::to_string(K),
@@ -3060,11 +3404,12 @@ public:
                 warm_t, warm_b
             );
 
-            // Ensure proper nesting of log-likelihoods
+            // Ensure proper nesting of log-likelihoods (M_shared c M_RELAX c M_unconstrained)
             Scalar max_nested_ll = std::max({
                 res.constrained.log_likelihood,
                 res.constrained_background.log_likelihood,
-                res.shared_distributions.log_likelihood
+                res.shared_distributions.log_likelihood,
+                res.has_relax_test ? res.relax_alternative.log_likelihood : res.shared_distributions.log_likelihood
             });
             if (res.unconstrained.log_likelihood < max_nested_ll) {
                 res.unconstrained.log_likelihood = max_nested_ll;
@@ -3180,6 +3525,45 @@ public:
                 // Asymptotic null: 0.5 * chi^2_0 + 0.5 * chi^2_2
                 res.p_value = 0.5 * std::exp(-res.lrt / 2.0);
             }
+
+            // If --relax was requested on standard BUSTED, fit Shared (k=1) and RELAX (k free)
+            if (settings.relax_mode) {
+                size_t K = res.optimal_k;
+                res.has_relax_test = true;
+                {
+                    auto saved_is_test = is_test_branch;
+                    auto saved_num_test = num_test_branches;
+                    num_test_branches = 0;
+                    for (const auto& node : tree.nodes) {
+                        if (node.id != tree.root_id) {
+                            bool in_shared = (branch_partition[node.id] <= 1);
+                            is_test_branch[node.id] = in_shared;
+                            if (in_shared) num_test_branches++;
+                        }
+                    }
+                    res.shared_distributions = fit_model(
+                        false, K, settings.refine_branch_lengths, settings.srv, settings.num_syn_rate_classes,
+                        settings.multiple_hits, pbar.get(), "RELAX Null (k=1) K=" + std::to_string(K),
+                        settings.error_sink, settings.error_sink_max_weight
+                    );
+                    res.shared_distributions.has_background_distribution = true;
+                    res.shared_distributions.background_distribution = res.shared_distributions.test_distribution;
+                    is_test_branch = saved_is_test;
+                    num_test_branches = saved_num_test;
+                }
+                res.relax_alternative = fit_relax_coupled_model(
+                    res.shared_distributions, K, settings.refine_branch_lengths, settings.srv, settings.num_syn_rate_classes,
+                    settings.multiple_hits, pbar.get(), "RELAX Coupled-k K=" + std::to_string(K),
+                    settings.error_sink, settings.error_sink_max_weight, &res.relax_k
+                );
+                res.relax_lrt = std::max(0.0, 2.0 * (res.relax_alternative.log_likelihood - res.shared_distributions.log_likelihood));
+                res.relax_p_value = busted_chi2_p_value(res.relax_lrt, 1.0);
+                if (res.relax_p_value <= settings.p_value_threshold) {
+                    res.relax_direction = (res.relax_k > 1.0) ? "Intensification" : "Relaxation";
+                } else {
+                    res.relax_direction = "None";
+                }
+            }
         }
 
         if (pbar) {
@@ -3190,7 +3574,12 @@ public:
                         << (res.phenotype_associated ? "\033[0m" : "")
                         << " (p_UIT=" << std::fixed << std::setprecision(4) << res.union_intersection_p_value
                         << ", ΔAICc_BG=" << std::setprecision(2) << res.background_delta_aicc
-                        << ", p_BG=" << std::setprecision(4) << res.background_p_value << ")";
+                        << ", p_BG=" << std::setprecision(4) << res.background_p_value;
+                if (res.has_relax_test) {
+                    summary << ", RELAX k=" << std::setprecision(2) << res.relax_k
+                            << " [p=" << std::setprecision(4) << res.relax_p_value << "]";
+                }
+                summary << ")";
             } else if (res.p_value <= settings.p_value_threshold) {
                 summary << "\033[1;32mEvidence of episodic diversifying selection\033[0m: LRT = "
                         << std::fixed << std::setprecision(2) << res.lrt
@@ -3293,6 +3682,14 @@ public:
                 {"background_neutral_supported", res.background_neutral_supported},
                 {"ranking_score", res.ranking_score},
                 {"verdict", res.phenotype_verdict}
+            };
+        }
+        if (res.has_relax_test) {
+            j["test results relaxation"] = {
+                {"LRT", res.relax_lrt},
+                {"p-value", res.relax_p_value},
+                {"relaxation or intensification parameter", res.relax_k},
+                {"direction", res.relax_direction}
             };
         }
 
@@ -3407,7 +3804,8 @@ public:
                 {"Log Likelihood", res.constrained_background.log_likelihood},
                 {"Rate Distributions", con_bg_rates}
             };
-
+        }
+        if (res.has_background_test || res.has_relax_test) {
             nlohmann::json shared_rates = {
                 {"Test", format_distro(res.shared_distributions.test_distribution)},
                 {"Background", format_distro(res.shared_distributions.background_distribution)}
@@ -3416,6 +3814,18 @@ public:
                 {"AIC-c", res.shared_distributions.aicc},
                 {"Log Likelihood", res.shared_distributions.log_likelihood},
                 {"Rate Distributions", shared_rates}
+            };
+        }
+        if (res.has_relax_test) {
+            nlohmann::json relax_rates = {
+                {"Test", format_distro(res.relax_alternative.test_distribution)},
+                {"Background", format_distro(res.relax_alternative.background_distribution)}
+            };
+            fits["RELAX alternative (coupled-k)"] = {
+                {"AIC-c", res.relax_alternative.aicc},
+                {"Log Likelihood", res.relax_alternative.log_likelihood},
+                {"relaxation or intensification parameter", res.relax_k},
+                {"Rate Distributions", relax_rates}
             };
         }
 
@@ -3508,6 +3918,7 @@ public:
         j["analysis"]["settings"]["multiple_hits"] = res.settings.multiple_hits;
         j["analysis"]["settings"]["error_sink"] = res.settings.error_sink;
         j["analysis"]["settings"]["phenotype_mode"] = res.settings.phenotype_mode;
+        j["analysis"]["settings"]["relax_mode"] = res.has_relax_test;
         if (!res.settings.comparison_branches.empty()) {
             j["analysis"]["settings"]["comparison_branches"] = res.settings.comparison_branches;
         }
@@ -3672,9 +4083,18 @@ public:
             j["model_fits"]["constrained_background"] = format_fit_modern(
                 res.constrained_background, "Constrained background BUSTED-PH model fixing omega_k <= 1 on background/comparison branches"
             );
+        }
+        if (res.has_background_test || res.has_relax_test) {
             j["model_fits"]["shared_distributions"] = format_fit_modern(
-                res.shared_distributions, "Shared-distribution BUSTED-PH model forcing identical omega distributions on test and background branches"
+                res.shared_distributions, "Shared-distribution BUSTED-PH / RELAX Null (k=1) model forcing identical omega distributions on test and background branches"
             );
+        }
+        if (res.has_relax_test) {
+            auto relax_json = format_fit_modern(
+                res.relax_alternative, "Coupled-k RELAX alternative model (omega_FG,c = (omega_BG,c)^k with shared category weights)"
+            );
+            relax_json["relaxation_parameter_k"] = res.relax_k;
+            j["model_fits"]["relax_alternative"] = relax_json;
         }
 
         if (has_gtr_fit) {
@@ -3763,6 +4183,23 @@ public:
                 {"p_value_background", res.background_p_value},
                 {"p_value_shared", res.shared_p_value},
                 {"threshold", res.settings.p_value_threshold}
+            };
+        }
+        if (res.has_relax_test) {
+            j["statistical_tests"]["relaxation"] = {
+                {"method", "RELAX Coupled-k Likelihood Ratio Test"},
+                {"test_statistic", "LRT"},
+                {"statistic_value", res.relax_lrt},
+                {"distribution", "chi^2_1"},
+                {"degrees_of_freedom", 1},
+                {"relaxation_parameter_k", res.relax_k},
+                {"direction", res.relax_direction},
+                {"null_hypothesis", "k = 1 (identical omega distributions on test and background branches)"},
+                {"alternative_hypothesis", "k != 1 (omega_FG,c = (omega_BG,c)^k with shared category weights)"},
+                {"p_value", res.relax_p_value},
+                {"decision", (res.relax_p_value <= res.settings.p_value_threshold)
+                    ? ((res.relax_k > 1.0) ? "Significant intensification of selection (k > 1)" : "Significant relaxation of selection (k < 1)")
+                    : "No significant relaxation or intensification of selection"}
             };
         }
 
