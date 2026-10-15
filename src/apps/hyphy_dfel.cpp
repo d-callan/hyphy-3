@@ -29,8 +29,8 @@ void print_dfel_usage(const char* prog) {
 
     std::cout << Console::bold("Model & Rooting Options:") << "\n"
               << "  " << Console::brand("--tree, -t       ") << "  Path to Newick phylogenetic tree (optional; auto-inferred via Ohmic if omitted)\n"
-              << "  " << Console::brand("--ohmic, --omhic ") << "  Infer Ohmic network & Wheatstone bridges via HyphAeon 384D transformer\n"
-              << "  " << Console::brand("--no-hyphaeon    ") << "  Use empirical codon conductances instead of HyphAeon 384D transformer\n"
+              << "  " << Console::brand("--ohmic, --omhic ") << "  Infer Ohmic network & Wheatstone bridges (empirical conductances)\n"
+              << "  " << Console::brand("--hyphaeon    ") << "     Opt-in: HyphAeon 384D transformer conductances (needs Python aeon-core)\n"
               << "  " << Console::brand("--embeddings <f> ") << "  Path to precomputed [N x D] taxon embeddings TSV/CSV for Ohmic\n"
               << "  " << Console::brand("--root, -r       ") << "  Rooting strategy: 'auto' (ML auto-rooting, default), 'keep' (input root), or <taxon>\n"
               << "  " << Console::brand("--heterogeneity  ") << "  P-value threshold to trigger directional regimes (default: 0.05)\n"
@@ -99,7 +99,7 @@ int run_dfel(int argc, char* argv[]) {
     bool full_model = true;
     bool all_sites = false;
     bool use_ohmic = false;
-    bool use_hyphaeon = true;
+    bool use_hyphaeon = false;
     JSONFormat json_format = JSONFormat::ModernV3;
 
     for (int i = 1; i < argc; ++i) {

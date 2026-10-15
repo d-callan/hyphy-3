@@ -35,8 +35,8 @@ static void print_relax_usage(const char* prog) {
               << "  " << Console::brand("--alignment") << " <file>   Path to codon alignment (FASTA or NEXUS)\n\n"
               << Console::bold("Optional arguments:") << "\n"
               << "  " << Console::brand("--tree") << " <file>        Path to Newick tree file (optional; auto-inferred via Ohmic if omitted)\n"
-              << "  " << Console::brand("--ohmic, --omhic") << "     Infer Ohmic network & Wheatstone bridges via HyphAeon 384D transformer\n"
-              << "  " << Console::brand("--no-hyphaeon") << "        Use empirical codon conductances instead of HyphAeon 384D transformer\n"
+              << "  " << Console::brand("--ohmic, --omhic") << "     Infer Ohmic network & Wheatstone bridges (empirical conductances)\n"
+              << "  " << Console::brand("--hyphaeon") << "           Opt-in: HyphAeon 384D transformer conductances (needs Python aeon-core)\n"
               << "  " << Console::brand("--embeddings") << " <file>  Path to precomputed [N x D] taxon embeddings TSV/CSV for Ohmic\n"
               << "  " << Console::brand("--code") << " <name>        Genetic code (default: Universal)\n"
               << "  " << Console::brand("--test, --branches") << " <spec> Branch tag, names, or regex to mark as Test set (default: {TEST}/{T}/{FG})\n"
@@ -65,7 +65,7 @@ int run_relax(int argc, char* argv[]) {
     bool show_progress = ProgressBar::is_terminal();
     bool force_progress = false;
     bool use_ohmic = false;
-    bool use_hyphaeon = true;
+    bool use_hyphaeon = false;
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];

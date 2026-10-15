@@ -450,6 +450,25 @@ pip install .
 
 HyPhy 3 provides both a unified driver (`hyphy3 <analysis>`) and dedicated standalone tools (`hyphy3-fel`, `hyphy3-meme`, `hyphy3-busted`, `hyphy3-absrel`, `hyphy3-ohmic`, etc.). Every standard selection analysis supports `--ohmic` (or `--omhic`), `--hyphaeon` / `--no-hyphaeon`, `--embeddings <file>`, and **automatic tree-free FASTA inference** when `--tree` is omitted:
 
+### Optional: HyphAeon transformer conductances (`--hyphaeon`)
+
+HyphAeon is **off by default**. It only affects runs where hyphy-3 infers the tree itself (no `--tree` and no tree in the input file, or `--ohmic`). Enabling it runs a small embedded Python helper that needs the public [`aeon-core`](https://github.com/veg/HyphAeon) package (with PyTorch):
+
+```bash
+pip install "aeon-core @ git+https://github.com/veg/HyphAeon#subdirectory=aeon-core"
+```
+
+Model weights (~8 MB) are fetched from [huggingface.co/datamonkey/hyphaeon](https://huggingface.co/datamonkey/hyphaeon) on first use. hyphy-3 asks before downloading in an interactive terminal. Non-interactive jobs must opt in with `HYPHY3_HYPHAEON_DOWNLOAD=1`. If HyphAeon is requested but unavailable, the run stops with an error rather than silently falling back.
+
+| Environment variable | Purpose |
+|:---|:---|
+| `HYPHY3_PYTHON` | Python interpreter to use (default: `python3` on `PATH`) |
+| `HYPHY3_HYPHAEON_DOWNLOAD` | `1` = allow weight download without prompting, `0` = never download |
+| `HYPHAEON_WEIGHTS` | Use a local weights file instead of the Hugging Face cache |
+| `HYPHAEON_VARIANT` | Model variant (default `general`; e.g. `viral`) |
+| `HYPHAEON_CACHE` | aeon-core cache location (weights go to its sibling `huggingface/` directory) |
+| `HYPHAEON_DEVICE` | `cpu` to force CPU inference (default: CUDA > MPS > CPU) |
+
 ### Available CLI Options by Analysis
 
 | Analysis | Command | Key Options | Description |
@@ -482,8 +501,11 @@ hyphy3 --help
 # 1. Run FEL (site-by-site pervasive selection)
 hyphy3 fel --alignment benchmarks/data/cd2.fna --tree benchmarks/data/cd2.nwk --pvalue 0.1 --threads 8
 
-# 1b. Run FEL directly on a tree-free FASTA alignment with Ohmic + HyphAeon 384D Wheatstone bridges
+# 1b. Run FEL directly on a tree-free FASTA alignment with Ohmic Wheatstone bridges
 hyphy3 fel --alignment benchmarks/data/cd2.fna --ohmic --quick --threads 8
+
+# 1c. Same, adding optional HyphAeon 384D transformer conductances (requires aeon-core; see above)
+hyphy3 fel --alignment benchmarks/data/cd2.fna --ohmic --hyphaeon --quick --threads 8
 
 # 2. Run Contrast-FEL (test for differential selection between branch sets)
 hyphy3 contrast-fel --alignment benchmarks/data/cd2.fna --tree benchmarks/data/cd2.nwk --branches "Internal,Leaves" --shrinkage 1.0 --threads 8

@@ -4,6 +4,7 @@
 #include "hyphy/core/alignment.hpp"
 #include "hyphy/core/tree.hpp"
 #include "hyphy/core/neighbor_joining.hpp"
+#include "hyphy/core/hyphaeon.hpp"
 #include <Eigen/Eigenvalues>
 #include <array>
 #include <vector>
@@ -406,59 +407,10 @@ struct OhmicNetwork {
         throw std::runtime_error("OhmicNetwork::load_embeddings_file: Unrecognized format or row count mismatch in " + filepath);
     }
 
-    // Extract [N x 384] HyphAeon Multi-Scale Transformer representations (192D dS + 192D dN) via aeon_core
+    // Extract [N x 384] HyphAeon Multi-Scale Transformer representations (192D dS + 192D dN) via aeon_core.
+    // See hyphy/core/hyphaeon.hpp: no hard-coded paths, prompted weight download, throws on failure.
     static Matrix extract_hyphaeon_embeddings(const Alignment& aln) {
-        size_t N = aln.num_taxa;
-        if (N == 0) return Matrix();
-
-        auto tmp_dir = std::filesystem::temp_directory_path();
-        std::string pid_str = std::to_string(reinterpret_cast<uintptr_t>(&aln));
-        std::string tmp_fasta = (tmp_dir / ("hyphy3_hyphaeon_" + pid_str + ".fasta")).string();
-        std::string tmp_bin   = (tmp_dir / ("hyphy3_hyphaeon_" + pid_str + ".bin")).string();
-
-        {
-            std::ofstream out(tmp_fasta);
-            for (size_t i = 0; i < N; ++i) {
-                out << ">" << aln.taxon_names[i] << "\n" << aln.sequences[i].raw_seq << "\n";
-            }
-        }
-
-        std::string py_bin = "/Users/sergei/miniconda3/bin/python3";
-        if (!std::filesystem::exists(py_bin)) {
-            py_bin = "python3";
-        }
-
-        std::string cmd = py_bin +
-            " -c \""
-            "import sys, struct, numpy as np, torch; "
-            "sys.path.insert(0, '/Users/sergei/Projects/stupid-trees/src'); "
-            "from aeon_core.inference import load_model, get_device; "
-            "from aeon_core.dataset import load_alignment_and_tree; "
-            "from stupid_trees.diffusion_batched import extract_chunked_multiscale_representations; "
-            "device = get_device(cpu=False); "
-            "model = load_model(device=device); "
-            "c_t, a_t, d_t, z_t, _, taxa, _ = load_alignment_and_tree('" + tmp_fasta + "', use_tn93=True, prune_duplicates=False); "
-            "dist_mat = d_t.squeeze(0).cpu().numpy().astype(np.float64); "
-            "mds_coords = z_t.squeeze(0).cpu().numpy(); "
-            "tc = model.precompute_tree_cache(dist_mat, mds_coords); "
-            "_, t_repr = extract_chunked_multiscale_representations(model, c_t, a_t, tc, device=device, chunk_size=16); "
-            "arr = np.asarray(t_repr, dtype=np.float64); "
-            "f = open('" + tmp_bin + "', 'wb'); "
-            "f.write(struct.pack('<II', arr.shape[0], arr.shape[1])); "
-            "f.write(arr.tobytes()); "
-            "f.close()"
-            "\" > /dev/null 2>&1";
-
-        int rc = std::system(cmd.c_str());
-        std::filesystem::remove(tmp_fasta);
-        if (rc != 0 || !std::filesystem::exists(tmp_bin)) {
-            std::filesystem::remove(tmp_bin);
-            return Matrix();
-        }
-
-        Matrix emb = load_embeddings_file(tmp_bin, N);
-        std::filesystem::remove(tmp_bin);
-        return emb;
+        return hyphaeon::extract_embeddings(aln);
     }
 
     // Split [N x 2d] HyphAeon embeddings into L2-normalized 192D dS and 192D dN tracks
@@ -480,7 +432,7 @@ struct OhmicNetwork {
         const Alignment& aln,
         const std::string& tree_file,
         bool force_ohmic,
-        bool use_hyphaeon = true,
+        bool use_hyphaeon = false,
         const std::string& embeddings_file = "",
         OhmicNetwork* out_net = nullptr,
         std::string* out_source_desc = nullptr
