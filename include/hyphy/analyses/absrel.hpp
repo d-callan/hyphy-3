@@ -621,19 +621,42 @@ public:
     }
 
     // Phase 2: Fit Baseline MG94xREV Model (each branch has 1 omega)
-    ABSRELFitSummary fit_baseline(int max_cycles = 4) {
+    ABSRELFitSummary fit_baseline(
+        int max_cycles = 4,
+        bool show_progress = false,
+        bool force_progress = false,
+        std::function<void(const std::string&, double)> progress_cb = nullptr
+    ) {
         int S = gcode->num_sense_codons;
         size_t num_patterns = aln.patterns.size();
+        size_t num_branches = tree.num_nodes() - 1;
+
+        std::unique_ptr<ProgressBar> pbar_p2;
+        if (show_progress && (force_progress || ProgressBar::is_terminal())) {
+            pbar_p2 = std::make_unique<ProgressBar>(
+                num_branches,
+                "[aBSREL] Baseline Model",
+                "branches",
+                force_progress,
+                ProgressBar::Style::SmoothBlocks
+            );
+        }
 
         std::vector<Matrix> P_branches = compute_all_branch_transition_matrices();
         Scalar prev_ll = compute_tree_log_likelihood(P_branches);
 
         for (int cycle = 0; cycle < max_cycles; ++cycle) {
+            size_t b_idx = 0;
             // Precompute V and D for each branch across all patterns
             // To be memory efficient, we iterate over branches
             for (const auto& node : tree.nodes) {
                 if (node.id == tree.root_id) continue;
                 int32_t bid = node.id;
+
+                if (pbar_p2) {
+                    std::string stat = node.name + " (cycle " + std::to_string(cycle + 1) + "/" + std::to_string(max_cycles) + ")";
+                    pbar_p2->set_status(stat);
+                }
 
                 // Collect V and D for branch bid across all patterns
                 std::vector<Vector> V_patterns(num_patterns);
@@ -684,6 +707,20 @@ public:
                 // Update this branch's transition matrix immediately
                 MG94Matrix updated_mat = build_q_matrix(opt_omega);
                 P_branches[bid] = updated_mat.transition_matrix(opt_alpha);
+
+                if (pbar_p2 && cycle == 0) {
+                    pbar_p2->tick();
+                } else if (pbar_p2) {
+                    std::ostringstream ss;
+                    ss << node.name << " (c" << (cycle + 1) << " w=" << std::fixed << std::setprecision(2) << opt_omega << ")";
+                    pbar_p2->set_status(ss.str());
+                }
+
+                b_idx++;
+                if (progress_cb) {
+                    double cycle_frac = static_cast<double>(cycle * num_branches + b_idx) / static_cast<double>(max_cycles * num_branches);
+                    progress_cb("Phase 2: Baseline Model (" + node.name + ")", 0.20 + 0.20 * cycle_frac);
+                }
             }
 
             Scalar cur_ll = compute_tree_log_likelihood(P_branches);
@@ -694,9 +731,15 @@ public:
             prev_ll = cur_ll;
         }
 
-        size_t num_branches = tree.num_nodes() - 1;
         size_t baseline_params = 5 + 9 + 2 * num_branches;
         Scalar baseline_aicc = compute_aicc(prev_ll, baseline_params);
+
+        if (pbar_p2) {
+            std::ostringstream summary;
+            summary << "Baseline fit complete: lnL = " << std::fixed << std::setprecision(2) << prev_ll
+                    << " (AICc = " << baseline_aicc << ")";
+            pbar_p2->finish(summary.str());
+        }
 
         return {prev_ll, baseline_params, baseline_aicc};
     }
@@ -952,7 +995,7 @@ public:
 
         // Phase 2: Baseline MG94xREV
         if (progress_cb) progress_cb("Phase 2: Fitting Baseline MG94xREV Model", 0.20);
-        auto base_summary = fit_baseline(4);
+        auto base_summary = fit_baseline(4, show_progress, force_progress, progress_cb);
         result.baseline_fit = base_summary;
 
         // Record baseline results per branch
@@ -1006,6 +1049,10 @@ public:
             int32_t bid = sorted_branches[b_idx];
             const std::string& bname = tree.nodes[bid].name;
 
+            if (pbar_p3) {
+                pbar_p3->set_status(bname + ": testing complexity (M=1.." + std::to_string(settings.max_rate_classes) + ")");
+            }
+
             // Compute local (V, D) context for branch bid
             std::vector<Vector> V_patterns(num_patterns);
             std::vector<Vector> D_patterns(num_patterns);
@@ -1026,6 +1073,9 @@ public:
             best_fit.alpha = branch_alpha[bid];
 
             for (int M = 2; M <= settings.max_rate_classes; ++M) {
+                if (pbar_p3) {
+                    pbar_p3->set_status(bname + ": evaluating M=" + std::to_string(M) + " rate classes...");
+                }
                 LocalBranchFit cand_fit = optimize_branch_mixture(bid, M, V_patterns, D_patterns, false);
                 size_t cand_params = current_params + 2;
                 Scalar cand_aicc = compute_aicc(cand_fit.log_l, cand_params);
@@ -1051,9 +1101,15 @@ public:
             }
 
             if (pbar_p3) {
-                std::string stat = bname + ": " + std::to_string(current_classes) + " rate class(es)";
+                std::string stat = bname + ": " + std::to_string(current_classes) + " rate class" + (current_classes > 1 ? "es" : "");
                 pbar_p3->set_status(stat);
                 pbar_p3->tick();
+            }
+
+            if (progress_cb) {
+                double frac = 0.40 + 0.25 * (static_cast<double>(b_idx + 1) / static_cast<double>(sorted_branches.size()));
+                std::string msg = "Phase 3: Branch Complexity (" + bname + " -> " + std::to_string(current_classes) + " rate class" + (current_classes > 1 ? "es" : "") + ")";
+                progress_cb(msg, frac);
             }
         }
 
@@ -1324,9 +1380,16 @@ public:
             );
         }
 
+        size_t t_idx = 0;
         for (const std::string& bname : to_test) {
             auto& bres = result.branches[bname];
             int32_t bid = bres.node_id;
+
+            if (pbar_p5) {
+                size_t cpos = cand_pos_count.load(std::memory_order_relaxed);
+                std::string tag = (cpos > 0) ? (" (+" + std::to_string(cpos) + " pos)") : "";
+                pbar_p5->set_status(bname + tag);
+            }
 
             Scalar max_omega = *std::max_element(branch_omegas[bid].begin(), branch_omegas[bid].end());
             if (max_omega <= 1.0) {
@@ -1335,6 +1398,11 @@ public:
                 bres.sites_ebf_100 = 0;
                 if (pbar_p5) {
                     pbar_p5->tick();
+                }
+                t_idx++;
+                if (progress_cb) {
+                    double frac = 0.80 + 0.15 * (static_cast<double>(t_idx) / static_cast<double>(to_test.size()));
+                    progress_cb("Phase 5: Hypothesis Testing (" + bname + ": w_max <= 1)", frac);
                 }
                 continue;
             }
@@ -1485,9 +1553,17 @@ public:
             if (pbar_p5) {
                 size_t cpos = cand_pos_count.load(std::memory_order_relaxed);
                 if (cpos > 0) {
-                    pbar_p5->set_status("\033[1;32m+" + std::to_string(cpos) + "\033[0m candidate positive");
+                    pbar_p5->set_status("\033[1;32m+" + std::to_string(cpos) + "\033[0m candidate positive (" + bname + ")");
+                } else {
+                    pbar_p5->set_status(bname);
                 }
                 pbar_p5->tick();
+            }
+
+            t_idx++;
+            if (progress_cb) {
+                double frac = 0.80 + 0.15 * (static_cast<double>(t_idx) / static_cast<double>(to_test.size()));
+                progress_cb("Phase 5: Hypothesis Testing (" + bname + ": p=" + std::to_string(bres.uncorrected_p_value).substr(0, 6) + ")", frac);
             }
         }
 

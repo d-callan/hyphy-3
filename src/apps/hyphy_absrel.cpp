@@ -191,7 +191,8 @@ int run_absrel(int argc, char* argv[]) {
         {"Genetic Code", code->name}
     });
 
-    Panel::print_step(1, 2, "Fitting Baseline GTR & MG94xREV Models", "Exchangeability rates & branch lengths");
+    Panel::print_step(1, 1, "Running aBSREL Adaptive Branch-Site Workflow", 
+                      "Baseline MG94xREV, step-up complexity selection & lineage testing");
 
     std::function<void(const std::string&, double)> progress_cb = nullptr;
     if (!show_progress && !force_progress) {
@@ -201,7 +202,6 @@ int run_absrel(int argc, char* argv[]) {
         };
     }
 
-    Panel::print_step(2, 2, "Running Adaptive Model Selection & Lineage Testing", "OpenMP parallel");
     auto res = absrel.run(progress_cb, show_progress, force_progress);
 
     // Branch table
