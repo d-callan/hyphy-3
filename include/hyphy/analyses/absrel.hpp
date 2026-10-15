@@ -631,10 +631,18 @@ public:
         size_t num_patterns = aln.patterns.size();
         size_t num_branches = tree.num_nodes() - 1;
 
+        std::vector<int32_t> branch_ids;
+        branch_ids.reserve(num_branches);
+        for (const auto& node : tree.nodes) {
+            if (node.id != tree.root_id) {
+                branch_ids.push_back(node.id);
+            }
+        }
+
         std::unique_ptr<ProgressBar> pbar_p2;
         if (show_progress && (force_progress || ProgressBar::is_terminal())) {
             pbar_p2 = std::make_unique<ProgressBar>(
-                num_branches,
+                max_cycles * num_branches,
                 "[aBSREL] Baseline Model",
                 "branches",
                 force_progress,
@@ -646,33 +654,31 @@ public:
         Scalar prev_ll = compute_tree_log_likelihood(P_branches);
 
         for (int cycle = 0; cycle < max_cycles; ++cycle) {
-            size_t b_idx = 0;
-            // Precompute V and D for each branch across all patterns
-            // To be memory efficient, we iterate over branches
-            for (const auto& node : tree.nodes) {
-                if (node.id == tree.root_id) continue;
-                int32_t bid = node.id;
+            // 1. Single Inside-Outside pass for all patterns across entire tree
+            std::vector<std::vector<Vector>> V_all(tree.num_nodes(), std::vector<Vector>(num_patterns));
+            std::vector<std::vector<Vector>> D_all(tree.num_nodes(), std::vector<Vector>(num_patterns));
 
-                if (pbar_p2) {
-                    std::string stat = node.name + " (cycle " + std::to_string(cycle + 1) + "/" + std::to_string(max_cycles) + ")";
-                    pbar_p2->set_status(stat);
+            #pragma omp parallel for schedule(dynamic)
+            for (size_t p = 0; p < num_patterns; ++p) {
+                const auto& pattern = aln.patterns[p];
+                auto io = LikelihoodEngine::compute_inside_outside(
+                    tree, pattern, leaf_to_taxon, P_branches, codon_freqs, S
+                );
+                for (int32_t bid : branch_ids) {
+                    V_all[bid][p] = std::move(io.V[bid]);
+                    D_all[bid][p] = std::move(io.D[bid]);
                 }
+            }
 
-                // Collect V and D for branch bid across all patterns
-                std::vector<Vector> V_patterns(num_patterns);
-                std::vector<Vector> D_patterns(num_patterns);
+            std::vector<Scalar> new_alpha(tree.num_nodes());
+            std::vector<Scalar> new_omega(tree.num_nodes());
 
-                #pragma omp parallel for schedule(dynamic)
-                for (size_t p = 0; p < num_patterns; ++p) {
-                    const auto& pattern = aln.patterns[p];
-                    auto io = LikelihoodEngine::compute_inside_outside(
-                        tree, pattern, leaf_to_taxon, P_branches, codon_freqs, S
-                    );
-                    V_patterns[p] = io.V[bid];
-                    D_patterns[p] = io.D[bid];
-                }
+            // 2. Parallel branch optimization using cached Inside-Outside context
+            #pragma omp parallel for schedule(dynamic)
+            for (size_t bi = 0; bi < branch_ids.size(); ++bi) {
+                int32_t bid = branch_ids[bi];
+                const auto& node = tree.nodes[bid];
 
-                // Objective function for branch bid: optimize log(alpha) and log(omega)
                 auto branch_obj = [&](Scalar log_alpha, Scalar log_omega) -> Scalar {
                     Scalar cur_alpha = std::exp(log_alpha);
                     Scalar cur_omega = std::exp(log_omega);
@@ -683,7 +689,7 @@ public:
 
                     Scalar ll = 0.0;
                     for (size_t p = 0; p < num_patterns; ++p) {
-                        Scalar Lp = V_patterns[p].dot(P_b * D_patterns[p]);
+                        Scalar Lp = V_all[bid][p].dot(P_b * D_all[bid][p]);
                         if (Lp > 0.0) {
                             ll += aln.patterns[p].weight * std::log(Lp);
                         } else {
@@ -696,31 +702,29 @@ public:
                 Scalar init_log_alpha = std::log(std::clamp(branch_alpha[bid], 1e-4, 20.0));
                 Scalar init_log_omega = std::log(std::clamp(branch_omegas[bid][0], 1e-3, 50.0));
 
-                auto opt_res = NelderMead2D::minimize(branch_obj, init_log_alpha, init_log_omega, -10.0, 10.0, 1e-4, 150);
-                Scalar opt_alpha = std::exp(opt_res.a);
-                Scalar opt_omega = std::exp(opt_res.b);
+                auto opt_res = NelderMead2D::minimize(branch_obj, init_log_alpha, init_log_omega, -10.0, 10.0, 1e-4, 80);
+                new_alpha[bid] = std::exp(opt_res.a);
+                new_omega[bid] = std::exp(opt_res.b);
 
-                branch_alpha[bid] = opt_alpha;
-                branch_omegas[bid][0] = opt_omega;
-                branch_weights[bid][0] = 1.0;
-
-                // Update this branch's transition matrix immediately
-                MG94Matrix updated_mat = build_q_matrix(opt_omega);
-                P_branches[bid] = updated_mat.transition_matrix(opt_alpha);
-
-                if (pbar_p2 && cycle == 0) {
+                if (pbar_p2) {
                     pbar_p2->tick();
-                } else if (pbar_p2) {
                     std::ostringstream ss;
-                    ss << node.name << " (c" << (cycle + 1) << " w=" << std::fixed << std::setprecision(2) << opt_omega << ")";
+                    ss << node.name << " (c" << (cycle + 1) << "/" << max_cycles << " w=" << std::fixed << std::setprecision(2) << new_omega[bid] << ")";
                     pbar_p2->set_status(ss.str());
                 }
+            }
 
-                b_idx++;
-                if (progress_cb) {
-                    double cycle_frac = static_cast<double>(cycle * num_branches + b_idx) / static_cast<double>(max_cycles * num_branches);
-                    progress_cb("Phase 2: Baseline Model (" + node.name + ")", 0.20 + 0.20 * cycle_frac);
-                }
+            for (int32_t bid : branch_ids) {
+                branch_alpha[bid] = new_alpha[bid];
+                branch_omegas[bid][0] = new_omega[bid];
+                branch_weights[bid][0] = 1.0;
+                MG94Matrix updated_mat = build_q_matrix(new_omega[bid]);
+                P_branches[bid] = updated_mat.transition_matrix(new_alpha[bid]);
+            }
+
+            if (progress_cb) {
+                double cycle_frac = static_cast<double>(cycle + 1) / static_cast<double>(max_cycles);
+                progress_cb("Phase 2: Baseline Model (cycle " + std::to_string(cycle + 1) + "/" + std::to_string(max_cycles) + ")", 0.20 + 0.20 * cycle_frac);
             }
 
             Scalar cur_ll = compute_tree_log_likelihood(P_branches);
@@ -735,6 +739,7 @@ public:
         Scalar baseline_aicc = compute_aicc(prev_ll, baseline_params);
 
         if (pbar_p2) {
+            pbar_p2->set_total(pbar_p2->completed());
             std::ostringstream summary;
             summary << "Baseline fit complete: lnL = " << std::fixed << std::setprecision(2) << prev_ll
                     << " (AICc = " << baseline_aicc << ")";
