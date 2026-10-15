@@ -1591,8 +1591,8 @@ inline nlohmann::json PRIMEResult::to_legacy_json(
     };
 
     j["fits"] = {
-        {"Global MG94xREV", {{"Log-likelihood", global_fit.log_likelihood}}},
-        {"Nucleotide GTR", {{"Log-likelihood", global_fit.gtr_log_l}}}
+        {"Global MG94xREV", {{"Log Likelihood", global_fit.log_likelihood}}},
+        {"Nucleotide GTR", {{"Log Likelihood", global_fit.gtr_log_l}}}
     };
 
     j["runtime"] = "3.0.0";

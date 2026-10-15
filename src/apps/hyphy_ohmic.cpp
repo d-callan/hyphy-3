@@ -3,6 +3,10 @@
 #include "hyphy/core/tree.hpp"
 #include "hyphy/core/console.hpp"
 #include "hyphy/analyses/ohmic.hpp"
+#if __has_include("hyphy/report/html_report.hpp")
+#include "hyphy/report/html_report.hpp"
+#define HYPHY3_HAS_HTML_REPORT 1
+#endif
 
 #include <iostream>
 #include <string>
@@ -33,7 +37,9 @@ static void print_ohmic_usage(const char* prog) {
               << Console::bold("Required arguments:") << "\n"
               << "  " << Console::brand("--alignment, -a") << " <file>         Path to sequence alignment (NEXUS or FASTA)\n\n"
               << Console::bold("Optional arguments:") << "\n"
-              << "  " << Console::brand("--datatype, -d") << " <type>          Model datatype: 'nucleotide' (GTR, default) or 'codon' (MG94xREV)\n"
+              << "  " << Console::brand("--datatype, --model, -d") << " <type>   Model datatype: 'nucleotide' (GTR, default) or 'codon' (MG94xREV)\n"
+              << "  " << Console::brand("--codon") << "                        Shorthand for --datatype codon\n"
+              << "  " << Console::brand("--nucleotide") << "                   Shorthand for --datatype nucleotide\n"
               << "  " << Console::brand("--hyphaeon") << "                     Use HyphAeon 384D multi-scale transformer embeddings (default)\n"
               << "  " << Console::brand("--no-hyphaeon") << "                  Disable HyphAeon transformer (use empirical conductances only)\n"
               << "  " << Console::brand("--embeddings") << " <file>            Path to precomputed [N x D] taxon embeddings TSV/CSV\n"
@@ -43,17 +49,20 @@ static void print_ohmic_usage(const char* prog) {
               << "  " << Console::brand("--woodbury-rank") << " <p>            Rank p for ScalableWoodbury landmarks (default: 256)\n"
               << "  " << Console::brand("--threads, -t") << " <N>              Number of OpenMP worker threads\n"
               << "  " << Console::brand("--output, -o") << " <file>            Path to output JSON file (default: <alignment>.OHMIC.json)\n"
+              << "  " << Console::brand("--html") << " <file>                  Also write a self-contained interactive HTML report\n"
               << "  " << Console::brand("--format") << " <fmt>                 Output format: 'modern' (default) or 'legacy'\n"
               << "  " << Console::brand("--quiet, -q") << "                    Suppress progress output\n"
               << "  " << Console::brand("--help, -h") << "                     Show this help message\n\n"
               << Console::bold("Examples:") << "\n"
               << "  " << prog << " --alignment tests/data/cd2.fna\n"
-              << "  " << prog << " --alignment tests/data/bglobin.nex --datatype codon --threads 8\n\n";
+              << "  " << prog << " --alignment tests/data/bglobin.nex --datatype codon --threads 8\n"
+              << "  " << prog << " --alignment tests/data/cd2.fna --no-hyphaeon\n\n";
 }
 
 int run_ohmic(int argc, char* argv[]) {
     std::string alignment_file;
     std::string output_file;
+    std::string html_file;
     std::string datatype = "nucleotide";
     std::string scale_mode_str = "auto";
     std::string output_format = "modern";
@@ -71,8 +80,14 @@ int run_ohmic(int argc, char* argv[]) {
             alignment_file = argv[++i];
         } else if ((arg == "--output" || arg == "-o") && i + 1 < argc) {
             output_file = argv[++i];
-        } else if ((arg == "--datatype" || arg == "-d") && i + 1 < argc) {
+        } else if (arg == "--html" && i + 1 < argc) {
+            html_file = argv[++i];
+        } else if ((arg == "--datatype" || arg == "-d" || arg == "--model" || arg == "-m") && i + 1 < argc) {
             datatype = argv[++i];
+        } else if (arg == "--codon") {
+            datatype = "codon";
+        } else if (arg == "--nucleotide" || arg == "--nuc") {
+            datatype = "nucleotide";
         } else if (arg == "--hyphaeon") {
             use_hyphaeon = true;
         } else if (arg == "--no-hyphaeon") {
@@ -89,10 +104,12 @@ int run_ohmic(int argc, char* argv[]) {
             woodbury_rank = std::stoull(argv[++i]);
         } else if ((arg == "--threads" || arg == "-t") && i + 1 < argc) {
             num_threads = std::stoi(argv[++i]);
-        } else if (arg == "--format" && i + 1 < argc) {
+        } else if ((arg == "--format" || arg == "--json-format") && i + 1 < argc) {
             output_format = argv[++i];
         } else if (arg == "--legacy-json") {
             output_format = "legacy";
+        } else if (arg == "--modern-json") {
+            output_format = "modern";
         } else if (arg == "--quiet" || arg == "-q") {
             quiet = true;
         } else if (arg == "--help" || arg == "-h") {
@@ -154,6 +171,41 @@ int run_ohmic(int argc, char* argv[]) {
         settings.network_settings.scale_mode = OhmicScaleMode::Auto;
     }
 
+    std::string model_desc = use_codon
+        ? "Codon MG94xREV (Empirical F3x4 Frequencies)"
+        : "Nucleotide GTR (Empirical Base Frequencies)";
+
+    std::string hyphaeon_cfg_desc;
+    if (!embeddings_file.empty()) {
+        hyphaeon_cfg_desc = "Precomputed Taxon Embeddings (" + embeddings_file + ")";
+    } else if (use_hyphaeon) {
+        hyphaeon_cfg_desc = "HyphAeon 384D Transformer (192D dS + 192D dN) [Default]";
+    } else {
+        hyphaeon_cfg_desc = "Empirical TN93 Conductances (No Transformer / Disabled)";
+    }
+
+    size_t num_sites_nuc = aln.num_nucleotides > 0 ? aln.num_nucleotides : (aln.sequences.empty() ? 0 : aln.sequences[0].raw_seq.size());
+    std::string sites_desc = use_codon
+        ? (std::to_string(aln.num_codons) + " codons (" + std::to_string(aln.num_codons * 3) + " nt)")
+        : (std::to_string(num_sites_nuc) + " sites");
+
+    if (!quiet) {
+        Panel::print_card("Dataset & Model Configuration", {
+            {"Alignment File", alignment_file},
+            {"Sequences / Taxa", std::to_string(aln.num_taxa)},
+            {"Sequence Sites", sites_desc},
+            {"Substitution Model", model_desc},
+            {"Conductance / Topology", hyphaeon_cfg_desc},
+            {"Electrical Solver", scale_mode_str + " mode"},
+            {"Min Shunt Stress", std::to_string(min_stress)},
+            {"Max Bridges (K)", std::to_string(max_bridges)},
+            {"Woodbury Rank", std::to_string(woodbury_rank)}
+        });
+
+        Panel::print_step(1, 1, "Inferring Ohmic Phylogenetic Network & Wheatstone Pruning",
+                          "Computing effective resistances, Wheatstone bridge hubs, and ML likelihood evaluation");
+    }
+
     try {
         OhmicAnalyzer analyzer(aln, settings);
         OhmicResult result = analyzer.run();
@@ -169,6 +221,14 @@ int run_ohmic(int argc, char* argv[]) {
         }
         out << json_out.dump(2) << "\n";
         out.close();
+
+#ifdef HYPHY3_HAS_HTML_REPORT
+        if (!html_file.empty()) {
+            hyphy::report::write_html_report(output_file, html_file);
+        }
+#else
+        (void)html_file;
+#endif
 
         if (!quiet) {
             std::ostringstream lnl_s, lnl_o, dlnl, aicc_s, aicc_o, daicc, foster_ss, time_ss;
@@ -186,13 +246,36 @@ int run_ohmic(int argc, char* argv[]) {
                 ? "ExactDense (Full Laplacian Pseudoinverse)"
                 : "ScalableWoodbury (O(N log N) Low-Rank Resistance)";
 
+            std::string actual_conductance_model;
+            if (!embeddings_file.empty()) {
+                actual_conductance_model = result.network.used_hyphaeon_embeddings
+                    ? ("Precomputed Embeddings (D=" + std::to_string(result.network.hyphaeon_embeddings.cols()) + ", fused)")
+                    : "Empirical TN93 Conductances (Embeddings load failed)";
+            } else if (result.network.used_hyphaeon_embeddings) {
+                actual_conductance_model = "HyphAeon 384D Transformer (192D dS + 192D dN fused)";
+            } else if (use_hyphaeon) {
+                actual_conductance_model = "Empirical TN93 Conductances (HyphAeon unavailable / fallback)";
+            } else {
+                actual_conductance_model = "Empirical TN93 Conductances (Transformer disabled)";
+            }
+
+            std::string actual_sub_model = result.settings.use_codon_model
+                ? "Codon MG94xREV (Empirical F3x4)"
+                : "Nucleotide GTR (Empirical Frequencies)";
+
+            std::string sites_summary = result.settings.use_codon_model
+                ? (std::to_string(result.num_sites) + " codons")
+                : (std::to_string(result.num_sites) + " sites");
+
             bool improved = (result.delta_log_l > 0.01);
             std::string status_conclusion = improved
                 ? Console::success("✔ Wheatstone pruning resolved topological conflict and improved likelihood over a single tree.")
                 : Console::muted("ℹ Alignment is well-represented by a single Consensus Backbone tree.");
 
             std::vector<std::pair<std::string, std::string>> summary_items = {
-                {"Alignment", alignment_file + " (" + std::to_string(result.num_taxa) + " taxa, " + std::to_string(result.num_sites) + " sites)"},
+                {"Alignment", alignment_file + " (" + std::to_string(result.num_taxa) + " taxa, " + sites_summary + ")"},
+                {"Substitution Model", actual_sub_model},
+                {"Conductance / Topology", actual_conductance_model},
                 {"Electrical Solver", mode_label + " [" + std::to_string(result.num_super_nodes) + " super-nodes]"},
                 {"Foster Sum Invariant", (result.network.active_mode == OhmicScaleMode::ExactDense) ? foster_ss.str() : "N/A (Woodbury Mode)"},
                 {"Wheatstone Bridges (K)", std::to_string(result.num_bridges) + " active 4-way bridges, " + std::to_string(result.num_collapsed_polytomies) + " collapsed polytomies"},
@@ -220,6 +303,11 @@ int run_ohmic(int argc, char* argv[]) {
 
 #ifndef HYPHY3_COMBINED_DRIVER
 int main(int argc, char* argv[]) {
-    return run_ohmic(argc, argv);
+    try {
+        return run_ohmic(argc, argv);
+    } catch (const std::exception& e) {
+        std::cerr << Console::danger("Error: ") << e.what() << "\n";
+        return 1;
+    }
 }
 #endif

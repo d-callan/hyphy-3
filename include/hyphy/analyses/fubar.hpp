@@ -1039,14 +1039,14 @@ public:
 
         // MLE headers and content
         j["MLE"] = {
-            {"headers", {
-                {"alpha", "Mean posterior synonymous substitution rate at a site"},
-                {"beta", "Mean posterior non-synonymous substitution rate at a site"},
-                {"beta-alpha", "Mean posterior beta-alpha"},
-                {"Prob[alpha>beta]", "Posterior probability of negative selection at a site"},
-                {"Prob[alpha<beta]", "Posterior probability of positive selection at a site"},
-                {"BayesFactor[alpha<beta]", "Empirical Bayes Factor for positive selection at a site"}
-            }},
+            {"headers", nlohmann::json::array({
+                nlohmann::json::array({"alpha", "Mean posterior synonymous substitution rate at a site"}),
+                nlohmann::json::array({"beta", "Mean posterior non-synonymous substitution rate at a site"}),
+                nlohmann::json::array({"beta-alpha", "Mean posterior beta-alpha"}),
+                nlohmann::json::array({"Prob[alpha>beta]", "Posterior probability of negative selection at a site"}),
+                nlohmann::json::array({"Prob[alpha<beta]", "Posterior probability of positive selection at a site"}),
+                nlohmann::json::array({"BayesFactor[alpha<beta]", "Empirical Bayes Factor for positive selection at a site"})
+            })},
             {"content", {
                 {"0", nlohmann::json::array()}
             }}

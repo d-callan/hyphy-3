@@ -23,12 +23,14 @@ public:
         const Alignment& aln,
         const GTRMatrix& gtr_model,
         Scalar branch_scale = 1.0,
-        const std::vector<size_t>* custom_leaf_to_taxon = nullptr
+        const std::vector<size_t>* custom_leaf_to_taxon = nullptr,
+        std::vector<Scalar>* out_pattern_log_l = nullptr
     ) {
         const Tree& tree = net.collapsed_tree;
         size_t num_nodes = tree.num_nodes();
         size_t num_bridges = net.bridges.size();
         size_t num_patterns = aln.patterns.size();
+        if (out_pattern_log_l) out_pattern_log_l->assign(num_patterns, 0.0);
 
         std::vector<Matrix4> P_branches(num_nodes, Matrix4::Identity());
         for (const auto& node : tree.nodes) {
@@ -134,11 +136,11 @@ public:
             }
 
             Scalar pattern_likelihood = gtr_model.pi.dot(node_L[tree.root_id]);
-            if (pattern_likelihood > 0.0) {
-                total_log_l += pattern.weight * (std::log(pattern_likelihood) + node_log_scale[tree.root_id]);
-            } else {
-                total_log_l += pattern.weight * (-1e20);
-            }
+            Scalar plog = (pattern_likelihood > 0.0)
+                ? (std::log(pattern_likelihood) + node_log_scale[tree.root_id])
+                : (-1e20);
+            if (out_pattern_log_l) (*out_pattern_log_l)[p] = plog;
+            total_log_l += pattern.weight * plog;
         }
 
         return total_log_l;
@@ -150,12 +152,14 @@ public:
         const Alignment& aln,
         const MG94Matrix& mg94_model,
         Scalar branch_scale = 1.0,
-        const std::vector<size_t>* custom_leaf_to_taxon = nullptr
+        const std::vector<size_t>* custom_leaf_to_taxon = nullptr,
+        std::vector<Scalar>* out_pattern_log_l = nullptr
     ) {
         const Tree& tree = net.collapsed_tree;
         size_t num_nodes = tree.num_nodes();
         size_t num_bridges = net.bridges.size();
         size_t num_patterns = aln.patterns.size();
+        if (out_pattern_log_l) out_pattern_log_l->assign(num_patterns, 0.0);
         int S = static_cast<int>(mg94_model.pi.size());
 
         std::vector<Matrix> P_branches(num_nodes, Matrix::Identity(S, S));
@@ -265,11 +269,11 @@ public:
                 }
 
                 Scalar pattern_likelihood = mg94_model.pi.dot(node_L[tree.root_id]);
-                if (pattern_likelihood > 0.0) {
-                    total_log_l += pattern.weight * (std::log(pattern_likelihood) + node_log_scale[tree.root_id]);
-                } else {
-                    total_log_l += pattern.weight * (-1e20);
-                }
+                Scalar plog = (pattern_likelihood > 0.0)
+                    ? (std::log(pattern_likelihood) + node_log_scale[tree.root_id])
+                    : (-1e20);
+                if (out_pattern_log_l) (*out_pattern_log_l)[p] = plog;
+                total_log_l += pattern.weight * plog;
             }
         }
 

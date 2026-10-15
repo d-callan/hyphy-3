@@ -142,6 +142,47 @@ public:
         if (mat_pos == std::string::npos) {
             throw std::runtime_error("NEXUS file does not contain a MATRIX block: " + filepath);
         }
+
+        // Parse optional TAXLABELS block and FORMAT NOLABELS / DIMENSIONS NCHAR before MATRIX
+        std::vector<std::string> taxlabels;
+        size_t tl_pos = find_case_insensitive(text, "TAXLABELS");
+        if (tl_pos != std::string::npos && tl_pos < mat_pos) {
+            size_t tl_end = text.find(';', tl_pos + 9);
+            if (tl_end != std::string::npos && tl_end < mat_pos) {
+                std::string tl_body = text.substr(tl_pos + 9, tl_end - (tl_pos + 9));
+                size_t ti = 0, tn = tl_body.size();
+                while (ti < tn) {
+                    while (ti < tn && std::isspace(static_cast<unsigned char>(tl_body[ti]))) ti++;
+                    if (ti >= tn) break;
+                    std::string name;
+                    if (tl_body[ti] == '\'' || tl_body[ti] == '"') {
+                        char q = tl_body[ti++];
+                        while (ti < tn && tl_body[ti] != q) name += tl_body[ti++];
+                        if (ti < tn) ti++;
+                    } else {
+                        while (ti < tn && !std::isspace(static_cast<unsigned char>(tl_body[ti]))) {
+                            name += tl_body[ti++];
+                        }
+                    }
+                    if (!name.empty()) taxlabels.push_back(name);
+                }
+            }
+        }
+
+        bool nolabels = false;
+        size_t fmt_pos = find_case_insensitive(text, "FORMAT");
+        while (fmt_pos != std::string::npos && fmt_pos < mat_pos) {
+            size_t fmt_end = text.find(';', fmt_pos);
+            if (fmt_end != std::string::npos && fmt_end <= mat_pos) {
+                std::string fmt_block = text.substr(fmt_pos, fmt_end - fmt_pos);
+                if (find_case_insensitive(fmt_block, "NOLABELS") != std::string::npos) {
+                    nolabels = true;
+                    break;
+                }
+            }
+            fmt_pos = find_case_insensitive(text, "FORMAT", fmt_pos + 6);
+        }
+
         mat_pos += 6; // skip "MATRIX"
 
         size_t mat_end = text.find(';', mat_pos);
@@ -154,6 +195,7 @@ public:
         // Parse sequences in MATRIX
         size_t idx = 0;
         size_t n = mat_content.size();
+        size_t nolabel_row_idx = 0;
         while (idx < n) {
             // skip whitespace
             while (idx < n && std::isspace(static_cast<unsigned char>(mat_content[idx]))) {
@@ -162,23 +204,31 @@ public:
             if (idx >= n) break;
 
             std::string taxon;
-            if (mat_content[idx] == '\'' || mat_content[idx] == '"') {
-                char quote = mat_content[idx++];
-                while (idx < n && mat_content[idx] != quote) {
-                    taxon += mat_content[idx++];
+            if (nolabels) {
+                if (taxlabels.empty()) {
+                    throw std::runtime_error("NEXUS FORMAT specifies NOLABELS, but no TAXLABELS were found: " + filepath);
                 }
-                if (idx < n) idx++; // skip closing quote
+                taxon = taxlabels[nolabel_row_idx % taxlabels.size()];
+                nolabel_row_idx++;
             } else {
-                while (idx < n && !std::isspace(static_cast<unsigned char>(mat_content[idx]))) {
-                    taxon += mat_content[idx++];
+                if (mat_content[idx] == '\'' || mat_content[idx] == '"') {
+                    char quote = mat_content[idx++];
+                    while (idx < n && mat_content[idx] != quote) {
+                        taxon += mat_content[idx++];
+                    }
+                    if (idx < n) idx++; // skip closing quote
+                } else {
+                    while (idx < n && !std::isspace(static_cast<unsigned char>(mat_content[idx]))) {
+                        taxon += mat_content[idx++];
+                    }
                 }
-            }
 
-            // skip whitespace to sequence
-            while (idx < n && std::isspace(static_cast<unsigned char>(mat_content[idx]))) {
-                idx++;
+                // skip whitespace to sequence
+                while (idx < n && std::isspace(static_cast<unsigned char>(mat_content[idx]))) {
+                    idx++;
+                }
+                if (idx >= n) break;
             }
-            if (idx >= n) break;
 
             // read sequence characters
             std::string seq;
@@ -187,7 +237,15 @@ public:
                 if (std::isalpha(static_cast<unsigned char>(c)) || c == '-' || c == '?' || c == '.') {
                     seq += (c == '.' ? '-' : c);
                     idx++;
+                } else if (c == '\n' || c == '\r') {
+                    idx++;
+                    break;
                 } else if (std::isspace(static_cast<unsigned char>(c))) {
+                    if (nolabels) {
+                        // In NOLABELS mode, horizontal spaces within a line are ignored; newline ends row
+                        idx++;
+                        continue;
+                    }
                     // Check if next non-space character is the start of a new taxon
                     size_t lookahead = idx;
                     while (lookahead < n && std::isspace(static_cast<unsigned char>(mat_content[lookahead]))) lookahead++;

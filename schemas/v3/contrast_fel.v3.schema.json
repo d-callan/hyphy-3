@@ -131,11 +131,25 @@
           ],
           "properties": {
             "total_sites": { "type": "integer" },
+            "degrees_of_freedom": { "type": "integer" },
             "significant_p_threshold": { "type": ["number", "null"] },
             "significant_p_sites": { "type": "integer" },
             "significant_q_threshold": { "type": ["number", "null"] },
             "significant_q_sites": { "type": "integer" },
             "shrinkage_lambda": { "type": ["number", "null"] }
+          }
+        },
+        "pairwise_contrasts": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["group_a", "group_b", "significant_p_sites", "significant_adjusted_p_sites"],
+            "properties": {
+              "group_a": { "type": "string" },
+              "group_b": { "type": "string" },
+              "significant_p_sites": { "type": "integer" },
+              "significant_adjusted_p_sites": { "type": "integer" }
+            }
           }
         }
       }
@@ -184,7 +198,10 @@
             "substitutions": { "type": "array", "items": { "type": "string" } }
           },
           "patternProperties": {
-            "^beta_": { "type": "array", "items": { "type": ["number", "null"] } }
+            "^beta_": { "type": "array", "items": { "type": ["number", "null"] } },
+            "^lrt_": { "type": "array", "items": { "type": ["number", "null"] } },
+            "^p_value_": { "type": "array", "items": { "type": ["number", "null"] } },
+            "^p_adjusted_": { "type": "array", "items": { "type": ["number", "null"] } }
           }
         }
       }

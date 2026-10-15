@@ -414,10 +414,13 @@ public:
     MG94Parameters base_params;
 
     std::vector<bool> is_test_branch;
+    std::vector<int> branch_partition; // 0 = Reference, 1 = Test, 2 = Unclassified
     std::vector<size_t> leaf_to_taxon;
     std::vector<std::string> test_branch_names;
     std::vector<std::string> ref_branch_names;
+    std::vector<std::string> unclassified_branch_names;
     std::unordered_map<std::string, std::string> branch_class;
+    Scalar unclassified_omega = 1.0;
 
     RELAXAnalyzer(
         Tree t,
@@ -427,6 +430,7 @@ public:
         code = aln.code ? aln.code : GeneticCode::universal();
         size_t num_nodes = tree.num_nodes();
         is_test_branch.assign(num_nodes, false);
+        branch_partition.assign(num_nodes, 0);
         leaf_to_taxon.assign(num_nodes, static_cast<size_t>(-1));
 
         for (const auto& node : tree.nodes) {
@@ -447,47 +451,115 @@ public:
     }
 
     void partition_branches() {
+        auto to_lower = [](std::string s) {
+            std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return std::tolower(c); });
+            return s;
+        };
+        auto trim = [](std::string s) {
+            while (!s.empty() && (std::isspace(static_cast<unsigned char>(s.front())) || s.front() == '{')) s.erase(s.begin());
+            while (!s.empty() && (std::isspace(static_cast<unsigned char>(s.back())) || s.back() == '}')) s.pop_back();
+            return s;
+        };
+
         bool has_tagged_test = false;
+        bool has_tagged_ref = false;
 
         for (const auto& node : tree.nodes) {
-            if (node.id != tree.root_id) {
-                if (node.model_tag == "T" || node.model_tag == "Test" || node.model_tag == "test") {
+            if (node.id != tree.root_id && !node.model_tag.empty()) {
+                std::string tl = to_lower(trim(node.model_tag));
+                if (tl == "t" || tl == "test" || tl == "fg" || tl == "foreground") {
                     has_tagged_test = true;
+                } else if (tl == "r" || tl == "ref" || tl == "reference" || tl == "bg" || tl == "background") {
+                    has_tagged_ref = true;
                 }
             }
         }
 
-        std::regex test_regex;
-        bool use_test_regex = false;
-        if (!settings.test_branch_regex.empty()) {
-            try {
-                test_regex = std::regex(settings.test_branch_regex, std::regex::icase);
-                use_test_regex = true;
-            } catch (const std::exception& e) {
-                std::cerr << "Warning: Invalid test branch regex: " << e.what() << "\n";
+        auto matches_spec = [&](const TreeNode& node, const std::string& spec_str, const std::vector<std::string>& explicit_names) -> bool {
+            std::string node_name_l = to_lower(node.name);
+            std::string node_tag_l = to_lower(trim(node.model_tag));
+
+            if (!explicit_names.empty()) {
+                for (const auto& nm : explicit_names) {
+                    std::string nl = to_lower(trim(nm));
+                    if (nl == node_name_l || (!node_tag_l.empty() && nl == node_tag_l)) return true;
+                }
+                return false;
             }
-        }
+            if (spec_str.empty()) return false;
+
+            std::string cleaned_spec = trim(spec_str);
+            std::string spec_l = to_lower(cleaned_spec);
+            if (spec_l == "all") return true;
+            if (spec_l == "internal") return !node.is_leaf;
+            if (spec_l == "leaves" || spec_l == "terminal" || spec_l == "tips") return node.is_leaf;
+            if (spec_l == "unlabeled" || spec_l == "untagged") return node.model_tag.empty();
+            if (!node_tag_l.empty() && spec_l == node_tag_l) return true;
+            if (spec_l == node_name_l) return true;
+
+            // Check comma-separated tokens if present
+            if (cleaned_spec.find(',') != std::string::npos) {
+                std::stringstream ss(cleaned_spec);
+                std::string tok;
+                while (std::getline(ss, tok, ',')) {
+                    std::string tl = to_lower(trim(tok));
+                    if (tl.empty()) continue;
+                    if (tl == node_name_l || (!node_tag_l.empty() && tl == node_tag_l)) return true;
+                    if (tl == "internal" && !node.is_leaf) return true;
+                    if ((tl == "leaves" || tl == "terminal") && node.is_leaf) return true;
+                    if ((tl == "unlabeled" || tl == "untagged") && node.model_tag.empty()) return true;
+                }
+            }
+
+            // Fallback to case-insensitive regex against branch name or model tag
+            try {
+                std::regex rx(cleaned_spec, std::regex::icase);
+                if (std::regex_search(node.name, rx)) return true;
+                if (!node.model_tag.empty() && std::regex_search(node.model_tag, rx)) return true;
+            } catch (const std::exception&) {
+            }
+            return false;
+        };
+
+        bool explicit_test = !settings.test_branch_regex.empty() || !settings.test_branch_names.empty();
+        bool explicit_ref = !settings.reference_branch_regex.empty() || !settings.reference_branch_names.empty();
 
         for (const auto& node : tree.nodes) {
             if (node.id == tree.root_id) continue;
 
             bool is_test = false;
-
-            if (use_test_regex) {
-                is_test = std::regex_search(node.name, test_regex);
-            } else if (!settings.test_branch_names.empty()) {
-                is_test = (std::find(settings.test_branch_names.begin(), settings.test_branch_names.end(), node.name) != settings.test_branch_names.end());
+            if (explicit_test) {
+                is_test = matches_spec(node, settings.test_branch_regex, settings.test_branch_names);
             } else if (has_tagged_test) {
-                is_test = (node.model_tag == "T" || node.model_tag == "Test" || node.model_tag == "test");
+                std::string tl = to_lower(trim(node.model_tag));
+                is_test = (tl == "t" || tl == "test" || tl == "fg" || tl == "foreground");
+            }
+
+            bool is_ref = false;
+            if (!is_test) {
+                if (explicit_ref) {
+                    is_ref = matches_spec(node, settings.reference_branch_regex, settings.reference_branch_names);
+                } else if (has_tagged_ref) {
+                    std::string tl = to_lower(trim(node.model_tag));
+                    is_ref = (tl == "r" || tl == "ref" || tl == "reference" || tl == "bg" || tl == "background");
+                } else {
+                    is_ref = true;
+                }
             }
 
             is_test_branch[node.id] = is_test;
             if (is_test) {
+                branch_partition[node.id] = 1;
                 test_branch_names.push_back(node.name);
                 branch_class[node.name] = "Test";
-            } else {
+            } else if (is_ref) {
+                branch_partition[node.id] = 0;
                 ref_branch_names.push_back(node.name);
                 branch_class[node.name] = "Reference";
+            } else {
+                branch_partition[node.id] = 2;
+                unclassified_branch_names.push_back(node.name);
+                branch_class[node.name] = "Unclassified";
             }
         }
     }
@@ -520,6 +592,16 @@ public:
         // Precompute transition matrices for all 3 classes across all tree branches
         std::vector<std::vector<Matrix>> P_branches(3, std::vector<Matrix>(num_nodes));
 
+        MG94Matrix mat_U;
+        Scalar conv_U = 1.0;
+        if (!unclassified_branch_names.empty()) {
+            MG94Parameters p_U = base_params;
+            p_U.alpha = 1.0;
+            p_U.beta = unclassified_omega;
+            mat_U.update(p_U, aln.pos_nuc_frequencies, aln.codon_frequencies_f3x4, *code);
+            conv_U = (mat_U.scale_factor > 1e-12) ? (3.0 / mat_U.scale_factor) : 1.0;
+        }
+
         for (int c = 0; c < 3; ++c) {
             MG94Parameters p_R = base_params;
             p_R.alpha = 1.0;
@@ -539,8 +621,10 @@ public:
                 if (node.id != t.root_id) {
                     int nid = node.id;
                     Scalar bl = custom_branch_lengths ? (*custom_branch_lengths)[nid] : (node.branch_length * tree_scale);
-                    if (is_test_branch[nid]) {
+                    if (branch_partition[nid] == 1) {
                         P_branches[c][nid] = mat_T.transition_matrix(bl * conv_T);
+                    } else if (branch_partition[nid] == 2) {
+                        P_branches[c][nid] = mat_U.transition_matrix(bl * conv_U);
                     } else {
                         P_branches[c][nid] = mat_R.transition_matrix(bl * conv_R);
                     }
@@ -641,6 +725,16 @@ public:
         std::vector<std::vector<Matrix>> P_c(3, std::vector<Matrix>(num_nodes));
         std::vector<std::vector<Matrix>> dP_c(3, std::vector<Matrix>(num_nodes));
 
+        MG94Matrix mat_U;
+        Scalar conv_U = 1.0;
+        if (!unclassified_branch_names.empty()) {
+            MG94Parameters p_U = base_params;
+            p_U.alpha = 1.0;
+            p_U.beta = unclassified_omega;
+            mat_U.update(p_U, aln.pos_nuc_frequencies, aln.codon_frequencies_f3x4, *code);
+            conv_U = (mat_U.scale_factor > 1e-12) ? (3.0 / mat_U.scale_factor) : 1.0;
+        }
+
         for (int c = 0; c < 3; ++c) {
             if (weights[c] <= 1e-12) continue;
 
@@ -662,10 +756,14 @@ public:
                 if (node.id != tree.root_id) {
                     int nid = node.id;
                     Scalar bl = branch_lengths[nid];
-                    if (is_test_branch[nid]) {
+                    if (branch_partition[nid] == 1) {
                         Matrix P = mat_T.transition_matrix(bl * conv_T);
                         P_c[c][nid] = P;
                         dP_c[c][nid] = conv_T * (mat_T.Q * P);
+                    } else if (branch_partition[nid] == 2) {
+                        Matrix P = mat_U.transition_matrix(bl * conv_U);
+                        P_c[c][nid] = P;
+                        dP_c[c][nid] = conv_U * (mat_U.Q * P);
                     } else {
                         Matrix P = mat_R.transition_matrix(bl * conv_R);
                         P_c[c][nid] = P;

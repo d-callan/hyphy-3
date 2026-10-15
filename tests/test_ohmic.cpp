@@ -24,16 +24,25 @@ using namespace hyphy::core;
 using namespace hyphy::analyses;
 
 inline std::string resolve_test_path(const std::string& path) {
-    if (std::ifstream(path).good()) return path;
-    if (std::ifstream("../" + path).good()) return "../" + path;
-    if (std::ifstream("../../" + path).good()) return "../../" + path;
-    // Also check benchmarks/data/<basename>
     auto slash = path.find_last_of('/');
     std::string base = (slash != std::string::npos) ? path.substr(slash + 1) : path;
-    std::string bench_path = "benchmarks/data/" + base;
-    if (std::ifstream(bench_path).good()) return bench_path;
-    if (std::ifstream("../" + bench_path).good()) return "../" + bench_path;
-    if (std::ifstream("../../" + bench_path).good()) return "../../" + bench_path;
+    std::vector<std::string> candidates = {
+        path,
+        "../" + path,
+        "../../" + path,
+        "benchmarks/data/" + base,
+        "../benchmarks/data/" + base,
+        "../../benchmarks/data/" + base,
+        "/Users/sergei/Development/hyphy-3/benchmarks/data/" + base,
+        "/Users/sergei/Development/hyphy-3/tests/data/" + base
+#ifdef HYPHY3_SOURCE_DIR
+        , std::string(HYPHY3_SOURCE_DIR) + "/benchmarks/data/" + base
+        , std::string(HYPHY3_SOURCE_DIR) + "/tests/data/" + base
+#endif
+    };
+    for (const auto& c : candidates) {
+        if (std::ifstream(c).good()) return c;
+    }
     return path;
 }
 

@@ -96,9 +96,13 @@ print(f"Detected {sum(1 for r in results if r.p_value <= 0.1)} sites under selec
 Inspect selection profiles, branch rate partitions, and site evidence plots in an interactive, publication-ready dashboard:
 
 ```bash
-# Generate standalone self-contained HTML report from any HyPhy 3 JSON
-python3 viz/fel-viewer/build_standalone_html.py results.dFEL.json report.html
-open report.html
+# Write a self-contained HTML report alongside the JSON (FEL and MEME)
+hyphy3 fel --alignment data.nex --output results.FEL.json --html results.FEL.html
+
+# ...or create one later from an existing result file (hyphy3 or legacy HyPhy 2.5 / Datamonkey JSON)
+hyphy3 report results.MEME.json --html results.MEME.html
+
+open results.FEL.html    # or double-click it; works offline, straight from disk
 ```
 
 ---
@@ -197,6 +201,7 @@ This allows joint L-BFGS optimization across all branch lengths simultaneously i
 | **BUSTED-S** | Gene-wide selection robust to synonymous variation? | Gene-wide with SRV | Discrete site-to-site α and ω mixture | Site α & ω | Optional | 100% Verified |
 | **BUSTED-MH** | Gene-wide selection accounting for multi-nucleotide hits? | Gene-wide with MH | Reversible 1-hit, 2-hit (δ), 3-hit (ψ) generator | Site α & ω | Double, Double+Triple | 100% Verified |
 | **BUSTED-E** | Gene-wide selection robust to alignment/sequencing errors? | Gene-wide with Error Sink | Huber ε-contaminated saturation replacement kernel | Site α & ω + P_sink | Optional | 100% Verified |
+| **BUSTED-PH** | Is episodic positive selection specifically associated with a phenotype/trait? | Phenotype-associated (3-way branch partition) | 4-model workflow, Union-Intersection Test ($\max(p_{FG}, p_{\text{diff}}) \le \alpha$) + $\text{AIC}_c$ BG neutrality | Separate FG, BG & Unclassified $\omega$ | Optional | 100% Verified |
 | **BUSTED-Auto** | Principled automatic selection of Sink, MH, SRV, and K? | Gene-wide Full-Auto | 4-Gate Surprisal & Score Model Selector | Auto-selected | Auto-selected | 100% Verified |
 | **aBSREL** | Which specific lineages/branches evolved under selection? | Lineage-specific | Adaptive complexity selection (AICc Step-Up) | Branch-site ω | — | |Δ ln L| < 2.0 |
 | **RELAX** | Has selection relaxed (K < 1) or intensified (K > 1) on test branches? | Branch-set contrast | 3-rate mixture with exponent K, χ²₁ LRT | Site mixture | — | 100% Verified |
@@ -253,6 +258,17 @@ Q_ij = (α or β) × ψ × ∏_{p ∈ D} r_{i_p → j_p} π_{j_p}^(p)    (|D|K =
 - **BUSTED-E (`--error-sink`, Saturation Replacement Kernel)**:
   - Formulates a Huber ε-contaminated transition probability model P̃_b(t_b) = (1 - ε_sink) P_bio(t_b) + ε_sink P_sink, where P_sink(i, j) = π_j / (1 - π_i) for i ≠ j and 0 for i = j.
   - Evaluates the rank-1 + diagonal bilinear form in O(S) per branch-site, estimates ε_sink via exact EM responsibility accumulation, and flags anomalous misaligned or frameshifted branch-sites via Empirical Bayes Factors (BF ≥ 20).
+- **BUSTED-PH (`hyphy3 busted-ph` or `--phenotype`, Phenotype-Associated Selection + Coupled-$k$ RELAX)**:
+  - Tests whether episodic positive selection is specifically associated with a designated **Foreground/Phenotype** branch set (`--branches`) relative to a **Background/Comparison** branch set (`--comparison`, defaulting to the complement of foreground branches), with optional **Unclassified/Nuisance** branches modeled via a third independent $\omega$ distribution.
+  - Fits a 5-model nested hierarchy ($M_{\text{shared}} \subset M_{\text{RELAX}} \subset M_{\text{unc}}$ and $M_{\text{null,FG}}, M_{\text{null,BG}} \subset M_{\text{unc}}$) using analytical Inside-Outside two-set EM and L-BFGS branch refinement, inheriting full support for `+S` (`--srv`), `+MH` (`--multiple-hits`), `-E` (`--error-sink`), and `--auto`:
+    1. **Shared Distributions / RELAX Null ($M_{\text{shared}}, k=1$)**: Foreground and Background branches share a single unconstrained $\omega$ distribution ($\Theta_{FG} = \Theta_{BG}$).
+    2. **Coupled-$k$ RELAX Alternative ($M_{\text{RELAX}}, \text{df}=1$)**: Foreground and Background share category weights $p_1, \dots, p_K$ and couple their $\omega$ rates via a single selection intensity exponent $\omega_{FG,c} = (\omega_{BG,c})^k$ ($k \in [0, 50]$), decomposing the $(2K-1)$-df regime difference into a 1-df coupled relaxation ($k < 1$) / intensification ($k > 1$) component ($p_{\text{RELAX}}$ via $\chi^2_1$; also available on standard `hyphy3 busted` via `--relax`, or skippable via `--no-relax`).
+    3. **Unconstrained ($M_{\text{unc}}$)**: Separate unconstrained $\omega$ distributions $\Theta_{FG}$ ($\omega_{FG,K} \ge 1$) and $\Theta_{BG}$ ($\omega_{BG,K} \ge 1$).
+    4. **Constrained Foreground ($M_{\text{null,FG}}$)**: Constrains $\omega_{FG,K} = 1$ while $\Theta_{BG}$ remains unconstrained ($p_{FG}$ via $\frac{1}{2}\chi^2_0 + \frac{1}{2}\chi^2_2$).
+    5. **Constrained Background ($M_{\text{null,BG}}$)**: Constrains $\omega_{BG,K} = 1$ while $\Theta_{FG}$ remains unconstrained ($p_{BG}$ via $\frac{1}{2}\chi^2_0 + \frac{1}{2}\chi^2_2$).
+  - **Two-Stage Decision Procedure**:
+    1. **Union-Intersection Test (UIT)**: Requires joint evidence of foreground selection and regime difference, $p_{\text{UIT}} = \max(p_{FG}, p_{\text{diff}}) \le \alpha$ (where $p_{\text{diff}}$ is the $\chi^2_{2K-1}$ LRT comparing $M_{\text{shared}}$ vs. $M_{\text{unc}}$).
+    2. **Lack of Evidence for Background Selection ($\text{AIC}_c$ Screen)**: Requires that the background-neutral model is supported by $\text{AIC}_c$, $\Delta\text{AIC}_c^{(BG)} = \text{AIC}_c(M_{\text{null,BG}}) - \text{AIC}_c(M_{\text{unc}}) \le 2.0$ (asymptotically equivalent to $\text{LRT}_{BG} \le 4.0 \iff p_{BG} > 0.068$), plus a composite ranking score $-\log_{10}(\max(10^{-8}, p_{FG})) - \log_{10}(\max(10^{-8}, p_{\text{diff}})) + \log_{10}(\max(10^{-8}, p_{BG}))$.
 - **BUSTED-Auto (`--auto`, 4-Gate Surprisal & Score Model Selector)**:
   - Eliminates combinatorial 36-model grid searches by diagnosing and selecting the optimal model configuration from a single fast baseline fit:
     - **Gate 1 (Error Sink):** Evaluates branch-site surprisal gain ΔI_sink (in bits) and spatial adjacency, activating `--error-sink` only if a 3-step EM probe yields Δ ln L > 2.0.
@@ -447,6 +463,7 @@ HyPhy 3 provides both a unified driver (`hyphy3 <analysis>`) and dedicated stand
 | **BUSTED-S** | `hyphy3 busted` | `--srv`, `--syn-rates 3` | Synonymous rate variation across sites |
 | **BUSTED-MH** | `hyphy3 busted` | `--multiple-hits [None\|Double\|Double+Triple]` | Multi-nucleotide substitutions (2-hit and 3-hit) |
 | **BUSTED-E** | `hyphy3 busted` | `--error-sink`, `--error-sink-bf 20.0` | Saturation replacement kernel for alignment/sequencing error quarantine |
+| **BUSTED-PH**| `hyphy3 busted-ph` | `--branches <FG>`, `--comparison <BG>`, `--srv`, `--multiple-hits`, `--output` | Phenotype-associated episodic selection (Union-Intersection + $\text{AIC}_c$ BG neutrality) |
 | **BUSTED-Auto**| `hyphy3 busted` | `--auto` (`--full-auto`) | 4-Gate Surprisal & Score Automatic Model Selector (Sink, MH, SRV, K) |
 | **BUSTED Auto-K**| `hyphy3 busted` | `--auto-k` | Automatic selection of rate categories via AICc step-up |
 | **aBSREL** | `hyphy3 absrel`| `--alignment`, `--tree`, `--ohmic`, `--rates 3`, `--threads N`, `--output` | Lineage-specific adaptive selection |
@@ -491,6 +508,9 @@ hyphy3 busted --alignment benchmarks/data/adh.fna --tree benchmarks/data/adh.nwk
 
 # 9. Run BUSTED with Automatic Model Selection (Auto-K via AICc step-up)
 hyphy3 busted --alignment benchmarks/data/adh.fna --tree benchmarks/data/adh.nwk --auto-k --threads 8
+
+# 9b. Run BUSTED-PH (test whether positive selection is associated with a phenotype/branch set)
+hyphy3 busted-ph --alignment tests/data/Fig4E.nex --branches Test --comparison Reference --output Fig4E.BUSTED-PH.json --threads 8
 
 # 10. Run aBSREL (adaptive lineage-specific selection)
 hyphy3 absrel --alignment benchmarks/data/bglobin.nex --tree benchmarks/data/bglobin.nex --output bglobin.absrel.json --threads 8
@@ -779,14 +799,22 @@ HyPhy 3 features a modern, interactive visualization engine designed according t
     - Branch attribution with Empirical Bayes Factor (EBF) rankings (MEME).
     - Bivariate posterior mass distribution across the 20 × 20 rate grid (FUBAR).
 
-### 2. Standalone Single-File HTML Reports (`build_standalone_html.py`)
+### 2. Standalone Single-File HTML Reports (`hyphy3 --html`, `hyphy3 report`)
 
-HyPhy 3 includes a standalone bundler that produces **100% self-contained, single-file HTML reports**:
+The viewer is compiled into the `hyphy3` binary, so reports need nothing beyond `hyphy3` itself: no Node, Python, or files shipped alongside the binary. Each report is **one self-contained HTML file**:
 
 ```bash
-# Generate a self-contained interactive report from any HyPhy 3 JSON output
-python3 viz/fel-viewer/build_standalone_html.py results.FEL.json results.html
+# As part of an analysis run
+hyphy3 meme --alignment data.nex --output results.MEME.json --html results.MEME.html
+
+# From an existing result file (hyphy3 v3 or legacy HyPhy 2.5 / Datamonkey JSON)
+hyphy3 report results.FEL.json --html results.FEL.html
 ```
+
+Reports are currently available for **FEL** and **MEME**; other analyses are refused with a clear message until their viewers are added.
+
+- **How the viewer gets embedded**: at build time, `cmake/EmbedViewer.cmake` bundles the ES modules under `viz/fel-viewer/src` (following their imports from `index.js`) together with the stylesheet into a generated header. Editing the viewer and re-running the build is all that's needed.
+- **Developing the viewer**: the sources are plain browser ES modules with no build step. Serve `viz/fel-viewer/` with any static file server and open `index.html`.
 
 - **Zero Network Dependencies**: Inlines the complete JavaScript runtime, CSS styling, and JSON dataset directly into the HTML document.
 - **Universal Portability**: Double-click to open in Safari, Chrome, Firefox, or Edge. Works directly via `file://` URLs, in air-gapped laboratory environments, HPC clusters, and email attachments.
@@ -819,8 +847,9 @@ hyphy-3/
 │   └── python/                 # Nanobind C++ Python bridge (bindings.cpp)
 ├── python/
 │   └── hyphy3/                 # Pure Python high-level API & wrappers
-├── viz/                        # Interactive browser visualizers & standalone HTML generator
-│   └── fel-viewer/             # Braun-inspired synchronized Tree/Alignment/Overview viewer
+├── viz/                        # Interactive browser visualizers (embedded into hyphy3 for HTML reports)
+│   └── fel-viewer/             # Braun-inspired FEL / MEME results viewer (plain ES modules)
+├── cmake/                      # Build helpers (EmbedViewer.cmake bundles the viewer into the binary)
 ├── mac/                        # Native macOS applications
 │   └── HyPhyStudio/            # Swift 6 / SwiftUI macOS desktop studio
 ├── examples/

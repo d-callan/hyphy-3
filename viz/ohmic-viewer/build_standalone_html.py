@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Generates a 100% self-contained, single-file HTML report for HyPhy FEL results.
+Generates a 100% self-contained, single-file HTML report for HyPhy OHMIC results.
 Inlines the JS engine, CSS stylesheet, and JSON dataset directly into the HTML.
 Zero network access required; works directly via file://, double-click in Finder, or inside Cocoa WKWebView.
 """
@@ -10,10 +10,11 @@ import os
 import json
 import re
 
+
 def build_standalone_html(json_path, output_html_path, title=None):
     dir_path = os.path.dirname(os.path.abspath(__file__))
-    dist_js_path = os.path.join(dir_path, "dist", "hyphy-fel-viewer.umd.cjs")
-    dist_css_path = os.path.join(dir_path, "dist", "fel-viewer.css")
+    dist_js_path = os.path.join(dir_path, "dist", "hyphy-ohmic-viewer.umd.cjs")
+    dist_css_path = os.path.join(dir_path, "dist", "ohmic-viewer.css")
 
     if not os.path.exists(dist_js_path) or not os.path.exists(dist_css_path):
         raise FileNotFoundError("Please build the library first via 'npm run build -- --mode lib'")
@@ -31,17 +32,8 @@ def build_standalone_html(json_path, output_html_path, title=None):
     with open(json_path, "r", encoding="utf-8") as f:
         data_json_str = f.read()
 
-    data_obj = json.loads(data_json_str)
-    a_id = (data_obj.get("analysis", {}).get("id") or "").lower()
-    a_info = (data_obj.get("analysis", {}).get("info") or "").lower()
-    has_beta_plus = "beta_plus" in data_obj.get("site_results", {}).get("data", {})
-    headers = [str(h[0]).lower() for h in data_obj.get("MLE", {}).get("headers", [])]
-    has_meme_header = any(("beta" in h and ("+" in h or "plus" in h or "2" in h)) for h in headers)
-    is_meme = a_id == "meme" or "meme" in a_info or has_beta_plus or has_meme_header
-
-    method_badge = "MEME • Episodic Selection" if is_meme else "FEL • Pervasive Selection"
-    viewer_tag = "hyphy-meme-viewer" if is_meme else "hyphy-fel-viewer"
-
+    method_badge = "OHMIC • Electrical Network & Wheatstone Pruning"
+    viewer_tag = "hyphy-ohmic-viewer"
     doc_title = title or f"HyPhy {method_badge} — {os.path.basename(json_path)}"
 
     html = f"""<!DOCTYPE html>
@@ -122,7 +114,7 @@ def build_standalone_html(json_path, output_html_path, title=None):
       overflow-y: auto;
       overflow-x: hidden;
     }}
-    hyphy-fel-viewer, hyphy-meme-viewer {{
+    hyphy-ohmic-viewer, hyphy-ohmic-widget {{
       width: 100%;
       height: 100%;
       display: block;
@@ -144,7 +136,7 @@ def build_standalone_html(json_path, output_html_path, title=None):
       </div>
     </nav>
     <div id="viewer-mount">
-      <{viewer_tag} id="fel-viewer" theme="light"></{viewer_tag}>
+      <{viewer_tag} id="ohmic-viewer" theme="light"></{viewer_tag}>
     </div>
   </div>
 
@@ -155,7 +147,7 @@ def build_standalone_html(json_path, output_html_path, title=None):
     const payload = {data_json_str};
 
     function startViewer() {{
-      const viewer = document.getElementById('fel-viewer');
+      const viewer = document.getElementById('ohmic-viewer');
       if (window.customElements && customElements.whenDefined) {{
         customElements.whenDefined('{viewer_tag}').then(function() {{
           if (viewer && typeof viewer.load === 'function') {{
@@ -164,10 +156,10 @@ def build_standalone_html(json_path, output_html_path, title=None):
         }});
       }} else if (viewer && typeof viewer.load === 'function') {{
         viewer.load(payload);
-      }} else if (typeof HyPhyFELViewer !== 'undefined' && HyPhyFELViewer.HyPhyFELViewer) {{
+      }} else if (typeof HyPhyOhmicViewer !== 'undefined' && HyPhyOhmicViewer.HyPhyOhmicViewer) {{
         const mount = document.getElementById('viewer-mount');
         mount.innerHTML = '';
-        const v = new HyPhyFELViewer.HyPhyFELViewer(mount, {{ theme: 'light' }});
+        const v = new HyPhyOhmicViewer.HyPhyOhmicViewer(mount, {{ theme: 'light' }});
         v.load(payload);
       }}
     }}
@@ -187,21 +179,13 @@ def build_standalone_html(json_path, output_html_path, title=None):
 
     print(f"Generated standalone HTML report: {output_html_path} ({os.path.getsize(output_html_path):,} bytes)")
 
+
 if __name__ == "__main__":
     dir_path = os.path.dirname(os.path.abspath(__file__))
     if len(sys.argv) < 3:
-        # Default test run: build reports for bglobin, fig4e, and cd2_meme
-        bglobin_json = os.path.join(dir_path, "public", "samples", "bglobin.json")
-        if os.path.exists(bglobin_json):
-            build_standalone_html(bglobin_json, os.path.join(dir_path, "dist", "bglobin_report.html"))
-
-        fig4e_json = os.path.join(dir_path, "public", "samples", "fig4e.json")
-        if os.path.exists(fig4e_json):
-            build_standalone_html(fig4e_json, os.path.join(dir_path, "dist", "fig4e_report.html"))
-
-        cd2_json = os.path.join(dir_path, "public", "samples", "cd2_meme.json")
-        if os.path.exists(cd2_json):
-            build_standalone_html(cd2_json, os.path.join(dir_path, "dist", "cd2_meme_report.html"))
+        for name in ["cd2_ohmic", "bglobin_ohmic", "adh_ohmic"]:
+            json_p = os.path.join(dir_path, "public", "samples", f"{name}.json")
+            if os.path.exists(json_p):
+                build_standalone_html(json_p, os.path.join(dir_path, "dist", f"{name}_report.html"))
     else:
         build_standalone_html(sys.argv[1], sys.argv[2])
-

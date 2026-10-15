@@ -70,11 +70,25 @@ public:
 
     std::string input_filepath;
     std::string tree_string;
+    std::string test_branches = "All";
+    std::vector<bool> is_test_branch;
+    size_t num_tested = 0;
+    size_t num_background = 0;
 
-
-    MEMEAnalyzer(Tree t, Alignment a, MG94Parameters params = MG94Parameters{})
-        : tree(t), aln(std::move(a)), base_params(params), fel_analyzer(t, aln, params) {
+    MEMEAnalyzer(Tree t, Alignment a, MG94Parameters params = MG94Parameters{}, std::string branches_spec = "All")
+        : tree(t), aln(std::move(a)), base_params(params), fel_analyzer(t, aln, params), test_branches(std::move(branches_spec)) {
         prepare_branch_lengths();
+        select_test_branches(test_branches);
+    }
+
+    void select_test_branches(const std::string& spec) {
+        test_branches = spec;
+        auto sel = tree.select_branches(spec, "", {}, false);
+        is_test_branch = std::move(sel.is_selected);
+        num_tested = sel.num_selected;
+        num_background = sel.num_unselected;
+        fel_analyzer.settings.test_branches = spec;
+        fel_analyzer.partition_branches();
     }
 
     static MEMEAnalyzer create_and_fit(
@@ -82,8 +96,12 @@ public:
         Alignment aln,
         Scalar pvalue_threshold = 0.1,
         std::function<void(const std::string&, double)> progress_cb = nullptr,
-        bool full_model = true
+        bool full_model = true,
+        std::string branches_spec = "All"
     ) {
+        // Validate branch selection upfront before fitting GTR/MG94
+        input_tree.select_branches(branches_spec, "", {}, false);
+
         if (progress_cb) progress_cb("Phase 1: Fitting Nucleotide GTR Model", 0.1);
         GTRFitter gtr_fitter(input_tree, aln);
         auto gtr_res = gtr_fitter.fit();
@@ -107,7 +125,7 @@ public:
             base_p.beta = mg_res.x_opt(0);
         }
 
-        MEMEAnalyzer analyzer(mg_res.tree, std::move(aln), base_p);
+        MEMEAnalyzer analyzer(mg_res.tree, std::move(aln), base_p, std::move(branches_spec));
         analyzer.p_value_threshold = pvalue_threshold;
         analyzer.global_log_l = mg_res.log_likelihood;
         size_t K_mg = 5 + 1 + (mg_res.tree.num_nodes() - 1);
@@ -195,6 +213,7 @@ public:
         std::vector<double> thread_node_scale(num_nodes, 0.0);
         std::vector<Matrix> P_branches(num_nodes);
 
+        bool has_bg = (num_background > 0);
         auto eval_pattern_meme_lnl = [&](Scalar a, Scalar w1, Scalar p1, Scalar b_plus) -> Scalar {
             Scalar b1 = a * w1;
             MG94Parameters p_1 = base_params;
@@ -205,15 +224,26 @@ public:
             p_p.alpha = a;
             p_p.beta = b_plus;
 
-            MG94Matrix mg1, mg_plus;
+            MG94Matrix mg1, mg_plus, mg_bg;
             mg1.update(p_1, aln.pos_nuc_frequencies, aln.codon_frequencies_f3x4, gcode);
             mg_plus.update(p_p, aln.pos_nuc_frequencies, aln.codon_frequencies_f3x4, gcode);
+            if (has_bg) {
+                MG94Parameters p_bg = base_params;
+                p_bg.alpha = a;
+                p_bg.beta = (fel_res.beta_nuisance > 0.0) ? fel_res.beta_nuisance : b1;
+                mg_bg.update(p_bg, aln.pos_nuc_frequencies, aln.codon_frequencies_f3x4, gcode);
+            }
 
             Scalar p_plus_wt = 1.0 - p1;
             for (const auto& node : tree.nodes) {
                 if (node.id != tree.root_id) {
-                    P_branches[node.id] = p1 * mg1.transition_matrix(node.branch_length) +
-                                          p_plus_wt * mg_plus.transition_matrix(node.branch_length);
+                    bool is_test = (static_cast<size_t>(node.id) < is_test_branch.size()) ? is_test_branch[node.id] : true;
+                    if (is_test) {
+                        P_branches[node.id] = p1 * mg1.transition_matrix(node.branch_length) +
+                                              p_plus_wt * mg_plus.transition_matrix(node.branch_length);
+                    } else {
+                        P_branches[node.id] = mg_bg.transition_matrix(node.branch_length);
+                    }
                 }
             }
 
@@ -305,16 +335,27 @@ public:
             p_p.alpha = res.alpha;
             p_p.beta = res.beta_plus;
 
-            MG94Matrix mg1, mg_plus;
+            MG94Matrix mg1, mg_plus, mg_bg;
             mg1.update(p_1, aln.pos_nuc_frequencies, aln.codon_frequencies_f3x4, gcode);
             mg_plus.update(p_p, aln.pos_nuc_frequencies, aln.codon_frequencies_f3x4, gcode);
+            if (has_bg) {
+                MG94Parameters p_bg = base_params;
+                p_bg.alpha = res.alpha;
+                p_bg.beta = (fel_res.beta_nuisance > 0.0) ? fel_res.beta_nuisance : res.beta1;
+                mg_bg.update(p_bg, aln.pos_nuc_frequencies, aln.codon_frequencies_f3x4, gcode);
+            }
 
             std::vector<Matrix> P1(num_nodes), P_plus(num_nodes), P_mix(num_nodes);
             for (const auto& node : tree.nodes) {
                 if (node.id != tree.root_id) {
+                    bool is_test = (static_cast<size_t>(node.id) < is_test_branch.size()) ? is_test_branch[node.id] : true;
                     P1[node.id] = mg1.transition_matrix(node.branch_length);
                     P_plus[node.id] = mg_plus.transition_matrix(node.branch_length);
-                    P_mix[node.id] = res.p1 * P1[node.id] + res.p_plus * P_plus[node.id];
+                    if (is_test) {
+                        P_mix[node.id] = res.p1 * P1[node.id] + res.p_plus * P_plus[node.id];
+                    } else {
+                        P_mix[node.id] = mg_bg.transition_matrix(node.branch_length);
+                    }
                 }
             }
 
@@ -322,6 +363,11 @@ public:
             std::vector<Matrix> P_temp = P_mix;
             for (const auto& node : tree.nodes) {
                 if (node.id != tree.root_id) {
+                    bool is_test = (static_cast<size_t>(node.id) < is_test_branch.size()) ? is_test_branch[node.id] : true;
+                    if (!is_test) {
+                        res.branch_ebf[node.id] = 1.0;
+                        continue;
+                    }
                     // Conditional on branch node.id being in class 1
                     P_temp[node.id] = P1[node.id];
                     Scalar log_L1 = FELAnalyzer::compute_pattern_log_likelihood(tree, pattern, leaf_to_taxon, mg1, P_temp, thread_node_L, thread_node_scale);
@@ -496,22 +542,22 @@ public:
         j["branch attributes"] = branch_attrs;
 
         // MLE headers and content
-        j["MLE"]["headers"] = {
-            {"&alpha;", "Synonymous substitution rate at a site"},
-            {"&beta;<sup>1</sup>", "Non-synonymous substitution rate at a site for the negative/neutral evolution component 1"},
-            {"p<sup>1</sup>", "Mixture distribution weight allocated to negative/neutral evolution component 1"},
-            {"&beta;<sup>+</sup>", "Non-synonymous substitution rate at a site for the positive selection component"},
-            {"p<sup>+</sup>", "Mixture distribution weight allocated to the positive selection component"},
-            {"LRT", "Likelihood ratio test statistic for episodic diversification, i.e., p<sup>+</sup> > 0 and &beta;<sup>+</sup> > &alpha;"},
-            {"p-value", "Asymptotic p-value for episodic diversification, i.e., p<sup>+</sup> > 0 and &beta;<sup>+</sup> > &alpha;"},
-            {"# branches under selection", "The count of branches with empirical Bayes factor >= 100 for the &beta;<sup>+</sup> rate"},
-            {"Total branch length", "The total length of branches contributing to inference at this site"},
-            {"MEME LogL", "Site Log-likelihood under the MEME model"},
-            {"FEL LogL", "Site Log-likelihood under the FEL model"},
-            {"LRT MEME vs FEL", "Likelihood ratio test statistic p-value for MEME vs FEL"},
-            {"FEL &alpha;", "Synonymous substitution rate at a site under the FEL model"},
-            {"FEL &beta;", "Non-synonymous substitution rate at a site under the FEL model"}
-        };
+        j["MLE"]["headers"] = nlohmann::json::array({
+            nlohmann::json::array({"&alpha;", "Synonymous substitution rate at a site"}),
+            nlohmann::json::array({"&beta;<sup>1</sup>", "Non-synonymous substitution rate at a site for the negative/neutral evolution component 1"}),
+            nlohmann::json::array({"p<sup>1</sup>", "Mixture distribution weight allocated to negative/neutral evolution component 1"}),
+            nlohmann::json::array({"&beta;<sup>+</sup>", "Non-synonymous substitution rate at a site for the positive selection component"}),
+            nlohmann::json::array({"p<sup>+</sup>", "Mixture distribution weight allocated to the positive selection component"}),
+            nlohmann::json::array({"LRT", "Likelihood ratio test statistic for episodic diversification, i.e., p<sup>+</sup> > 0 and &beta;<sup>+</sup> > &alpha;"}),
+            nlohmann::json::array({"p-value", "Asymptotic p-value for episodic diversification, i.e., p<sup>+</sup> > 0 and &beta;<sup>+</sup> > &alpha;"}),
+            nlohmann::json::array({"# branches under selection", "The count of branches with empirical Bayes factor >= 100 for the &beta;<sup>+</sup> rate"}),
+            nlohmann::json::array({"Total branch length", "The total length of branches contributing to inference at this site"}),
+            nlohmann::json::array({"MEME LogL", "Site Log-likelihood under the MEME model"}),
+            nlohmann::json::array({"FEL LogL", "Site Log-likelihood under the FEL model"}),
+            nlohmann::json::array({"LRT MEME vs FEL", "Likelihood ratio test statistic p-value for MEME vs FEL"}),
+            nlohmann::json::array({"FEL &alpha;", "Synonymous substitution rate at a site under the FEL model"}),
+            nlohmann::json::array({"FEL &beta;", "Non-synonymous substitution rate at a site under the FEL model"})
+        });
 
         std::vector<std::vector<Scalar>> content(site_results.size());
         for (size_t s = 0; s < site_results.size(); ++s) {
@@ -539,7 +585,8 @@ public:
         nlohmann::json tested_dict;
         for (const auto& node : tree.nodes) {
             if (node.id != tree.root_id) {
-                tested_dict[node.name] = "test";
+                bool is_test = (static_cast<size_t>(node.id) < is_test_branch.size()) ? is_test_branch[node.id] : true;
+                tested_dict[node.name] = is_test ? "test" : "background";
             }
         }
         j["tested"]["0"] = tested_dict;
@@ -558,7 +605,8 @@ public:
                       "10.1371/journal.pgen.1002764", "22844254")},
             {
                 {"pvalue_threshold", p_value_threshold},
-                {"code", aln.code ? aln.code->name : "Universal"}
+                {"code", aln.code ? aln.code->name : "Universal"},
+                {"test_branches", test_branches}
             }
         };
 
@@ -566,7 +614,19 @@ public:
         j["dataset"] = dataset_block(aln);
         j["phylogeny"] = phylogeny_block(
             tree, tree_string,
-            mg94_branch_lengths_fn(conversion_factor, has_gtr_fit, gtr_branch_lengths));
+            mg94_branch_lengths_fn(conversion_factor, has_gtr_fit, gtr_branch_lengths),
+            [this](const TreeNode& node) {
+                nlohmann::json extras;
+                if (node.id != tree.root_id) {
+                    extras["tested"] =
+                        (static_cast<size_t>(node.id) < is_test_branch.size())
+                            ? is_test_branch[node.id] : true;
+                }
+                if (!node.model_tag.empty()) {
+                    extras["model_tags"] = nlohmann::json::array({node.model_tag});
+                }
+                return extras;
+            });
 
         // Model fits
         if (has_gtr_fit) {

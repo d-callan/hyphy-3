@@ -165,6 +165,62 @@ struct OhmicNetwork {
         return D;
     }
 
+    // For coding alignments (L >= 30 and L % 3 == 0), downweight multi-nucleotide non-synonymous
+    // codon jumps (the hallmark of functional convergence) when inferring the vertical backbone tree,
+    // while rescaling to preserve the exact mean evolutionary distance of D_tn93.
+    static Matrix compute_synonymous_backbone_distances(const Alignment& aln, const Matrix& D_tn93) {
+        size_t N = aln.num_taxa;
+        if (N == 0 || aln.sequences.empty()) return D_tn93;
+        size_t L = aln.sequences[0].raw_seq.size();
+        if (L < 30 || (L % 3) != 0) return D_tn93;
+
+        auto gcode = aln.code ? aln.code : GeneticCode::universal();
+        Matrix D_syn = Matrix::Zero(static_cast<Eigen::Index>(N), static_cast<Eigen::Index>(N));
+        Scalar sum_tn93 = 0.0, sum_syn = 0.0;
+
+        for (size_t i = 0; i < N; ++i) {
+            const std::string& seq_i = aln.sequences[i].raw_seq;
+            for (size_t j = i + 1; j < N; ++j) {
+                const std::string& seq_j = aln.sequences[j].raw_seq;
+                size_t L_pair = std::min(seq_i.size(), seq_j.size());
+                Scalar valid_nt = 0.0;
+                Scalar weighted_diff = 0.0;
+
+                for (size_t s = 0; s + 2 < L_pair; s += 3) {
+                    int8_t c_i = gcode->triplet_to_sense(seq_i[s], seq_i[s + 1], seq_i[s + 2]);
+                    int8_t c_j = gcode->triplet_to_sense(seq_j[s], seq_j[s + 1], seq_j[s + 2]);
+                    if (c_i < 0 || c_j < 0) continue;
+                    valid_nt += 3.0;
+                    if (c_i == c_j) continue;
+
+                    int ndiff = gcode->count_nucleotide_differences(c_i, c_j);
+                    if (gcode->is_synonymous(c_i, c_j)) {
+                        weighted_diff += static_cast<Scalar>(ndiff) * 1.0;
+                    } else if (ndiff == 1) {
+                        weighted_diff += static_cast<Scalar>(ndiff) * 0.35;
+                    } else {
+                        weighted_diff += 0.0;
+                    }
+                }
+
+                Scalar d_val = D_tn93(static_cast<Eigen::Index>(i), static_cast<Eigen::Index>(j));
+                if (valid_nt >= 30.0) {
+                    Scalar p_w = weighted_diff / valid_nt;
+                    Scalar jc_arg = std::max<Scalar>(0.05, 1.0 - (4.0 / 3.0) * p_w);
+                    d_val = std::max<Scalar>(0.0, -0.75 * std::log(jc_arg));
+                }
+                D_syn(static_cast<Eigen::Index>(i), static_cast<Eigen::Index>(j)) = d_val;
+                D_syn(static_cast<Eigen::Index>(j), static_cast<Eigen::Index>(i)) = d_val;
+                sum_tn93 += D_tn93(static_cast<Eigen::Index>(i), static_cast<Eigen::Index>(j));
+                sum_syn += d_val;
+            }
+        }
+        if (sum_syn > 1e-12 && sum_tn93 > 1e-12) {
+            D_syn *= (sum_tn93 / sum_syn);
+        }
+        return 0.85 * D_syn + 0.15 * D_tn93;
+    }
+
     // Split bitmask representation
     using SplitMask = std::vector<uint64_t>;
 
@@ -492,7 +548,7 @@ struct OhmicNetwork {
         } else if (!settings.embeddings_filepath.empty()) {
             net.hyphaeon_embeddings = load_embeddings_file(settings.embeddings_filepath, N);
             net.used_hyphaeon_embeddings = (net.hyphaeon_embeddings.rows() == static_cast<Eigen::Index>(N));
-        } else if (settings.use_hyphaeon_transformer) {
+        } else if (settings.use_hyphaeon_transformer && !settings.use_hamming_distance) {
             net.hyphaeon_embeddings = extract_hyphaeon_embeddings(aln);
             net.used_hyphaeon_embeddings = (net.hyphaeon_embeddings.rows() == static_cast<Eigen::Index>(N) &&
                                             net.hyphaeon_embeddings.cols() >= 2);
@@ -613,29 +669,6 @@ struct OhmicNetwork {
                 sim_ds_mat = sim_ds_mat.cwiseMax(0.0).cwiseMin(1.0);
                 sim_dn_mat = ((norm_dn * norm_dn.transpose()).array() + 1.0) * 0.5;
                 sim_dn_mat = sim_dn_mat.cwiseMax(0.0).cwiseMin(1.0);
-
-                Matrix d_ds = Matrix::Ones(static_cast<Eigen::Index>(N), static_cast<Eigen::Index>(N)) - sim_ds_mat;
-                Matrix d_dn = Matrix::Ones(static_cast<Eigen::Index>(N), static_cast<Eigen::Index>(N)) - sim_dn_mat;
-                d_ds.diagonal().setZero();
-                d_dn.diagonal().setZero();
-
-                Scalar sum_d = 0.0, sum_ds = 0.0, sum_dn = 0.0;
-                size_t cnt_d = 0, cnt_ds = 0, cnt_dn = 0;
-                for (size_t i = 0; i < N; ++i) {
-                    for (size_t j = i + 1; j < N; ++j) {
-                        Eigen::Index ii = static_cast<Eigen::Index>(i), jj = static_cast<Eigen::Index>(j);
-                        if (net.D_tn93(ii, jj) > 0.0) { sum_d += net.D_tn93(ii, jj); cnt_d++; }
-                        if (d_ds(ii, jj) > 0.0) { sum_ds += d_ds(ii, jj); cnt_ds++; }
-                        if (d_dn(ii, jj) > 0.0) { sum_dn += d_dn(ii, jj); cnt_dn++; }
-                    }
-                }
-                Scalar mean_d = (cnt_d > 0) ? (sum_d / cnt_d) : 0.1;
-                Scalar mean_ds = (cnt_ds > 0) ? (sum_ds / cnt_ds) : 1.0;
-                Scalar mean_dn = (cnt_dn > 0) ? (sum_dn / cnt_dn) : 1.0;
-                d_ds *= (mean_d / std::max<Scalar>(1e-6, mean_ds));
-                d_dn *= (mean_d / std::max<Scalar>(1e-6, mean_dn));
-
-                net.D_tn93 = 0.50 * net.D_tn93 + 0.25 * d_ds + 0.25 * d_dn;
             }
 
             // Compute median of upper-triangular distances
@@ -668,7 +701,7 @@ struct OhmicNetwork {
                     Scalar d = net.D_tn93(ii, jj);
                     Scalar w = std::exp(-d / sigma) / (d + eps0);
                     if (net.used_hyphaeon_embeddings) {
-                        w *= (0.50 + 0.25 * sim_ds_mat(ii, jj) + 0.25 * sim_dn_mat(ii, jj));
+                        w *= (0.50 + 0.35 * sim_ds_mat(ii, jj) + 0.15 * sim_dn_mat(ii, jj));
                     }
                     W(ii, jj) = w;
                     W(jj, ii) = w;
@@ -712,24 +745,9 @@ struct OhmicNetwork {
             net.foster_sum = foster_acc;
             assert(std::abs(net.foster_sum - static_cast<Scalar>(N - 1)) < 1e-4);
 
-            // Normalize D and Omega for hybrid multi-scale combinations
-            Scalar mean_D = 0.0, mean_Omega = 0.0;
-            size_t num_pairs = N * (N - 1) / 2;
-            for (size_t i = 0; i < N; ++i) {
-                for (size_t j = i + 1; j < N; ++j) {
-                    mean_D += net.D_tn93(static_cast<Eigen::Index>(i), static_cast<Eigen::Index>(j));
-                    mean_Omega += net.Omega(static_cast<Eigen::Index>(i), static_cast<Eigen::Index>(j));
-                }
-            }
-            mean_D = std::max<Scalar>(1e-12, mean_D / std::max<size_t>(1, num_pairs));
-            mean_Omega = std::max<Scalar>(1e-12, mean_Omega / std::max<size_t>(1, num_pairs));
-
-            Matrix D_hat = net.D_tn93 / mean_D;
-            Matrix Omega_hat = net.Omega / mean_Omega;
-            Matrix Omega_tilde = 0.5 * Omega_hat + 0.5 * D_hat;
-
-            // Primary backbone tree from NJ on D_tn93 (with branch lengths measured in evolutionary distance D)
-            net.backbone_tree = NeighborJoining::infer_from_distances(net.D_tn93, aln.taxon_names);
+            // Primary backbone tree from NJ on synonymous-stabilized distances (with branch lengths scaled to D_tn93)
+            Matrix D_backbone = compute_synonymous_backbone_distances(aln, net.D_tn93);
+            net.backbone_tree = NeighborJoining::infer_from_distances(D_backbone, aln.taxon_names);
 
             // Build collapsed_tree and extract node-disjoint Wheatstone bridges
             build_bridges_and_collapsed_tree(net, aln, settings, eps_L, true);
@@ -1363,14 +1381,27 @@ private:
         std::vector<int> all_taxa(N);
         std::iota(all_taxa.begin(), all_taxa.end(), 0);
 
-        // Helper to compute mean pairwise distance between two taxon subsets C1, C2
+        Scalar omega_scale = 1.0;
+        if (is_dense_mode && net.Omega.rows() == static_cast<Eigen::Index>(N)) {
+            Scalar sum_d = net.D_tn93.sum();
+            Scalar sum_om = net.Omega.sum();
+            if (sum_om > 1e-12 && sum_d > 1e-12) {
+                omega_scale = sum_d / sum_om;
+            }
+        }
+
+        // Helper to compute mean pairwise distance/resistance between two taxon subsets C1, C2
         auto mean_inter_dist = [&](const std::vector<int>& C1, const std::vector<int>& C2) -> Scalar {
             if (C1.empty() || C2.empty()) return 0.0;
             if (is_dense_mode) {
                 Scalar sum = 0.0;
                 for (int i : C1) {
                     for (int j : C2) {
-                        sum += net.D_tn93(i, j);
+                        if (net.used_hyphaeon_embeddings) {
+                            sum += 0.85 * net.D_tn93(i, j) + 0.15 * omega_scale * net.Omega(i, j);
+                        } else {
+                            sum += net.D_tn93(i, j);
+                        }
                     }
                 }
                 return sum / static_cast<Scalar>(C1.size() * C2.size());
@@ -1477,12 +1508,11 @@ private:
                 }
 
                 Scalar q_max = std::max({q1, q2, q3});
-                Scalar delta1 = std::max<Scalar>(0.0, q_max - q1);
-                Scalar delta2 = std::max<Scalar>(0.0, q_max - q2);
-                Scalar delta3 = settings.include_tertiary ? std::max<Scalar>(0.0, q_max - q3) : 0.0;
+                Scalar raw_d1 = std::max<Scalar>(0.0, q_max - q1);
+                Scalar raw_d2 = std::max<Scalar>(0.0, q3 - q2);
 
                 // Stage D check for unresolved equipotential noise
-                if (v_node.branch_length <= eps_L && delta1 <= 2.0 * eps_L && delta2 <= 2.0 * eps_L) {
+                if (v_node.branch_length <= eps_L && raw_d1 <= 2.0 * eps_L && raw_d2 <= 2.0 * eps_L) {
                     CandidateBridge poly_cand;
                     poly_cand.u_id = u_id;
                     poly_cand.v_id = v_id;
@@ -1492,13 +1522,21 @@ private:
                     break;
                 }
 
+                Scalar base_len = std::max<Scalar>(v_node.branch_length, eps_L);
+                Scalar scale_eps = std::max<Scalar>(eps_L, 1e-5);
+                Scalar delta1 = std::max<Scalar>(2.0 * base_len, raw_d1);
+                Scalar delta2 = raw_d2 + base_len * std::exp(-std::max<Scalar>(0.0, q2 - q1) / scale_eps);
+                Scalar delta3 = settings.include_tertiary
+                    ? (base_len * std::exp(-std::max<Scalar>(0.0, q3 - q1) / scale_eps))
+                    : 0.0;
+
                 Scalar G1 = delta1;
                 Scalar G2 = delta2;
                 Scalar G3 = delta3;
                 Scalar G_sum = G1 + G2 + G3;
                 if (G_sum <= 1e-12) continue;
 
-                Scalar tau = G2 / (G1 + 1e-12);
+                Scalar tau = G2 / G1;
                 if (tau > best_stress) {
                     best_stress = tau;
                     best_C = cand_C;

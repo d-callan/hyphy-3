@@ -119,8 +119,13 @@ int run_prime(int argc, char* argv[]) {
             pvalue_threshold = std::stod(argv[++i]);
         } else if (arg == "--pvalue2" && i + 1 < argc) {
             stage2_pvalue = std::stod(argv[++i]);
-        } else if (arg == "--format" && i + 1 < argc) {
-            output_format = argv[++i];
+        } else if ((arg == "--format" || arg == "--json-format") && i + 1 < argc) {
+            std::string fmt = argv[++i];
+            output_format = (fmt == "datamonkey") ? "legacy" : fmt;
+        } else if (arg == "--legacy-json" || arg == "--legacy") {
+            output_format = "legacy";
+        } else if (arg == "--modern-json" || arg == "--modern") {
+            output_format = "modern";
         } else if (arg == "--all-sites") {
             all_sites = true;
         } else if (arg == "--progress") {
@@ -131,6 +136,10 @@ int run_prime(int argc, char* argv[]) {
         } else if (arg == "--help" || arg == "-h") {
             print_prime_usage(argv[0]);
             return 0;
+        } else {
+            std::cerr << Console::danger("Unknown argument: ") << arg << "\n";
+            print_prime_usage(argv[0]);
+            return 1;
         }
     }
 
