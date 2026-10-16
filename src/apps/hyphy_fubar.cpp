@@ -40,8 +40,8 @@ static void print_usage(const char* prog) {
               << "  " << Console::brand("--alignment, -a") << " <file>   Path to codon alignment (FASTA or NEXUS)\n\n"
               << Console::bold("Optional arguments:") << "\n"
               << "  " << Console::brand("--tree, -t") << " <file>        Path to Newick tree file (optional; auto-inferred via Ohmic if omitted)\n"
-              << "  " << Console::brand("--ohmic, --omhic") << "         Infer Ohmic network & Wheatstone bridges via HyphAeon 384D transformer\n"
-              << "  " << Console::brand("--no-hyphaeon") << "            Use empirical codon conductances instead of HyphAeon 384D transformer\n"
+              << "  " << Console::brand("--ohmic, --omhic") << "         Infer Ohmic network & Wheatstone bridges (empirical conductances)\n"
+              << "  " << Console::brand("--hyphaeon") << "               Opt-in: HyphAeon 384D transformer conductances (needs Python aeon-core)\n"
               << "  " << Console::brand("--embeddings") << " <file>      Path to precomputed [N x D] taxon embeddings TSV/CSV for Ohmic\n"
               << "  " << Console::brand("--code") << " <name>            Genetic code (default: Universal; e.g. Vertebrate-mtDNA)\n"
               << "  " << Console::brand("--grid, -g") << " <N>           Number of grid points per dimension (default: 20; total D^2 = 400)\n"
@@ -81,7 +81,7 @@ int run_fubar(int argc, char* argv[]) {
     bool show_progress = ProgressBar::is_terminal();
     bool all_sites = false;
     bool use_ohmic = false;
-    bool use_hyphaeon = true;
+    bool use_hyphaeon = false;
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];

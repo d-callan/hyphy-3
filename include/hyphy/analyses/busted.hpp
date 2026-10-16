@@ -191,6 +191,8 @@ struct BUSTEDResult {
     std::vector<Scalar> site_error_bfs;  // Max error sink Bayes factor across branches per site
     std::vector<BUSTEDErrorEvent> flagged_error_events; // Branch-site pairs with BF_sink >= threshold
     double runtime_seconds = 0.0;
+    bool is_failed = false;
+    std::string error_message = "";
 };
 
 class BUSTEDAnalyzer {
@@ -450,9 +452,8 @@ public:
             #pragma omp for reduction(+:total_log_l) schedule(dynamic)
             for (size_t p = 0; p < num_patterns; ++p) {
                 const auto& pattern = aln.patterns[p];
-                Scalar pat_L = 0.0;
-
-                for (size_t m = 0; m < M; ++m) {
+                Scalar pll = -1e20;
+                if (M == 1) {
                     for (int32_t node_id : tree.post_order) {
                         const auto& node = tree.nodes[node_id];
                         if (node.is_leaf) {
@@ -471,18 +472,61 @@ public:
                             node_log_scale[node_id] = 0.0;
                         } else {
                             double child_scale_sum = 0.0;
-                            tree.eval_internal_node(node_id, P_mix[m], node_L, node_log_scale, node_L[node_id], child_scale_sum);
+                            tree.eval_internal_node(node_id, P_mix[0], node_L, node_log_scale, node_L[node_id], child_scale_sum);
                             node_log_scale[node_id] = child_scale_sum;
                         }
                     }
                     Scalar cond_L = aln.codon_frequencies_f3x4.dot(node_L[tree.root_id]);
-                    if (cond_L > 0.0 && node_log_scale[tree.root_id] != 0.0) {
-                        cond_L *= std::exp(node_log_scale[tree.root_id]);
+                    if (cond_L > 0.0) {
+                        pll = std::log(cond_L) + node_log_scale[tree.root_id];
                     }
-                    pat_L += syn_weights[m] * cond_L;
-                }
+                } else {
+                    Scalar max_term = -std::numeric_limits<Scalar>::infinity();
+                    std::vector<Scalar> terms(M);
+                    std::vector<bool> valid(M, false);
 
-                Scalar pll = (pat_L > 0.0) ? std::log(pat_L) : -1e20;
+                    for (size_t m = 0; m < M; ++m) {
+                        for (int32_t node_id : tree.post_order) {
+                            const auto& node = tree.nodes[node_id];
+                            if (node.is_leaf) {
+                                size_t t_idx = leaf_to_taxon[node_id];
+                                if (t_idx != static_cast<size_t>(-1)) {
+                                    int8_t state = pattern.states[t_idx];
+                                    if (state >= 0 && state < S) {
+                                        node_L[node_id].setZero();
+                                        node_L[node_id](state) = 1.0;
+                                    } else {
+                                        node_L[node_id].setOnes();
+                                    }
+                                } else {
+                                    node_L[node_id].setOnes();
+                                }
+                                node_log_scale[node_id] = 0.0;
+                            } else {
+                                double child_scale_sum = 0.0;
+                                tree.eval_internal_node(node_id, P_mix[m], node_L, node_log_scale, node_L[node_id], child_scale_sum);
+                                node_log_scale[node_id] = child_scale_sum;
+                            }
+                        }
+                        Scalar cond_L = aln.codon_frequencies_f3x4.dot(node_L[tree.root_id]);
+                        if (cond_L > 0.0) {
+                            Scalar term = std::log(syn_weights[m]) + std::log(cond_L) + node_log_scale[tree.root_id];
+                            terms[m] = term;
+                            valid[m] = true;
+                            if (term > max_term) max_term = term;
+                        }
+                    }
+
+                    if (max_term > -1e19) {
+                        Scalar sum_exp = 0.0;
+                        for (size_t m = 0; m < M; ++m) {
+                            if (valid[m]) sum_exp += std::exp(terms[m] - max_term);
+                        }
+                        if (sum_exp > 0.0) {
+                            pll = max_term + std::log(sum_exp);
+                        }
+                    }
+                }
                 total_log_l += pattern.weight * pll;
                 if (out_pattern_ll) {
                     (*out_pattern_ll)[p] = pll;
@@ -835,27 +879,63 @@ public:
             #pragma omp for schedule(dynamic)
             for (size_t p = 0; p < num_patterns; ++p) {
                 const auto& pattern = aln.patterns[p];
-                Scalar pat_L = 0.0;
-                std::vector<LikelihoodEngine::InsideOutsideResult> io_m(M);
-
-                for (size_t m = 0; m < M; ++m) {
-                    io_m[m] = LikelihoodEngine::compute_inside_outside(
-                        tree, pattern, leaf_to_taxon, P_mix[m], aln.codon_frequencies_f3x4, S
+                if (M == 1) {
+                    auto io = LikelihoodEngine::compute_inside_outside(
+                        tree, pattern, leaf_to_taxon, P_mix[0], aln.codon_frequencies_f3x4, S
                     );
-                    pat_L += syn_weights[m] * io_m[m].likelihood;
-                }
-
-                if (pat_L > 0.0) {
-                    local_ll += pattern.weight * std::log(pat_L);
-                    Scalar inv_L = pattern.weight / pat_L;
-                    for (const auto& node : tree.nodes) {
-                        if (node.id != tree.root_id) {
-                            int32_t vid = node.id;
-                            Scalar dL_dt = 0.0;
-                            for (size_t m = 0; m < M; ++m) {
-                                dL_dt += syn_weights[m] * io_m[m].V[vid].dot(dP_mix[m][vid] * io_m[m].D[vid]);
+                    if (io.likelihood > 0.0) {
+                        local_ll += pattern.weight * io.log_likelihood;
+                        Scalar inv_L = pattern.weight / io.likelihood;
+                        for (const auto& node : tree.nodes) {
+                            if (node.id != tree.root_id) {
+                                int32_t vid = node.id;
+                                Scalar dL_dt = io.V[vid].dot(dP_mix[0][vid] * io.D[vid]);
+                                local_grad[vid] += inv_L * dL_dt;
                             }
-                            local_grad[vid] += inv_L * dL_dt;
+                        }
+                    }
+                } else {
+                    std::vector<LikelihoodEngine::InsideOutsideResult> io_m(M);
+                    Scalar max_ll = -std::numeric_limits<Scalar>::infinity();
+                    for (size_t m = 0; m < M; ++m) {
+                        if (syn_weights[m] <= 1e-12) continue;
+                        io_m[m] = LikelihoodEngine::compute_inside_outside(
+                            tree, pattern, leaf_to_taxon, P_mix[m], aln.codon_frequencies_f3x4, S
+                        );
+                        if (io_m[m].likelihood > 0.0) {
+                            Scalar term = std::log(syn_weights[m]) + io_m[m].log_likelihood;
+                            if (term > max_ll) max_ll = term;
+                        }
+                    }
+
+                    if (max_ll > -1e19) {
+                        Scalar sum_exp = 0.0;
+                        std::vector<Scalar> post_w(M, 0.0);
+                        for (size_t m = 0; m < M; ++m) {
+                            if (syn_weights[m] > 1e-12 && io_m[m].likelihood > 0.0) {
+                                Scalar e = std::exp(std::log(syn_weights[m]) + io_m[m].log_likelihood - max_ll);
+                                post_w[m] = e;
+                                sum_exp += e;
+                            }
+                        }
+                        if (sum_exp > 0.0) {
+                            Scalar pat_ll = max_ll + std::log(sum_exp);
+                            local_ll += pattern.weight * pat_ll;
+                            Scalar inv_sum = 1.0 / sum_exp;
+                            for (size_t m = 0; m < M; ++m) post_w[m] *= inv_sum;
+
+                            for (const auto& node : tree.nodes) {
+                                if (node.id != tree.root_id) {
+                                    int32_t vid = node.id;
+                                    Scalar d_lnL_dt = 0.0;
+                                    for (size_t m = 0; m < M; ++m) {
+                                        if (post_w[m] > 1e-12 && io_m[m].likelihood > 0.0) {
+                                            d_lnL_dt += post_w[m] * (io_m[m].V[vid].dot(dP_mix[m][vid] * io_m[m].D[vid]) / io_m[m].likelihood);
+                                        }
+                                    }
+                                    local_grad[vid] += pattern.weight * d_lnL_dt;
+                                }
+                            }
                         }
                     }
                 }
@@ -1980,9 +2060,8 @@ public:
             #pragma omp for reduction(+:total_log_l) schedule(dynamic)
             for (size_t p = 0; p < num_patterns; ++p) {
                 const auto& pattern = aln.patterns[p];
-                Scalar pat_L = 0.0;
-
-                for (size_t m = 0; m < M; ++m) {
+                Scalar pll = -1e20;
+                if (M == 1) {
                     for (int32_t node_id : tree.post_order) {
                         const auto& node = tree.nodes[node_id];
                         if (node.is_leaf) {
@@ -2001,18 +2080,61 @@ public:
                             node_log_scale[node_id] = 0.0;
                         } else {
                             double child_scale_sum = 0.0;
-                            tree.eval_internal_node(node_id, P_mix[m], node_L, node_log_scale, node_L[node_id], child_scale_sum);
+                            tree.eval_internal_node(node_id, P_mix[0], node_L, node_log_scale, node_L[node_id], child_scale_sum);
                             node_log_scale[node_id] = child_scale_sum;
                         }
                     }
                     Scalar cond_L = aln.codon_frequencies_f3x4.dot(node_L[tree.root_id]);
-                    if (cond_L > 0.0 && node_log_scale[tree.root_id] != 0.0) {
-                        cond_L *= std::exp(node_log_scale[tree.root_id]);
+                    if (cond_L > 0.0) {
+                        pll = std::log(cond_L) + node_log_scale[tree.root_id];
                     }
-                    pat_L += syn_weights[m] * cond_L;
-                }
+                } else {
+                    Scalar max_term = -std::numeric_limits<Scalar>::infinity();
+                    std::vector<Scalar> terms(M);
+                    std::vector<bool> valid(M, false);
 
-                Scalar pll = (pat_L > 0.0) ? std::log(pat_L) : -1e20;
+                    for (size_t m = 0; m < M; ++m) {
+                        for (int32_t node_id : tree.post_order) {
+                            const auto& node = tree.nodes[node_id];
+                            if (node.is_leaf) {
+                                size_t t_idx = leaf_to_taxon[node_id];
+                                if (t_idx != static_cast<size_t>(-1)) {
+                                    int8_t state = pattern.states[t_idx];
+                                    if (state >= 0 && state < S) {
+                                        node_L[node_id].setZero();
+                                        node_L[node_id](state) = 1.0;
+                                    } else {
+                                        node_L[node_id].setOnes();
+                                    }
+                                } else {
+                                    node_L[node_id].setOnes();
+                                }
+                                node_log_scale[node_id] = 0.0;
+                            } else {
+                                double child_scale_sum = 0.0;
+                                tree.eval_internal_node(node_id, P_mix[m], node_L, node_log_scale, node_L[node_id], child_scale_sum);
+                                node_log_scale[node_id] = child_scale_sum;
+                            }
+                        }
+                        Scalar cond_L = aln.codon_frequencies_f3x4.dot(node_L[tree.root_id]);
+                        if (cond_L > 0.0) {
+                            Scalar term = std::log(syn_weights[m]) + std::log(cond_L) + node_log_scale[tree.root_id];
+                            terms[m] = term;
+                            valid[m] = true;
+                            if (term > max_term) max_term = term;
+                        }
+                    }
+
+                    if (max_term > -1e19) {
+                        Scalar sum_exp = 0.0;
+                        for (size_t m = 0; m < M; ++m) {
+                            if (valid[m]) sum_exp += std::exp(terms[m] - max_term);
+                        }
+                        if (sum_exp > 0.0) {
+                            pll = max_term + std::log(sum_exp);
+                        }
+                    }
+                }
                 total_log_l += pattern.weight * pll;
                 if (out_pattern_ll) {
                     (*out_pattern_ll)[p] = pll;
@@ -2475,27 +2597,63 @@ public:
             #pragma omp for schedule(dynamic)
             for (size_t p = 0; p < num_patterns; ++p) {
                 const auto& pattern = aln.patterns[p];
-                Scalar pat_L = 0.0;
-                std::vector<LikelihoodEngine::InsideOutsideResult> io_m(M);
-
-                for (size_t m = 0; m < M; ++m) {
-                    io_m[m] = LikelihoodEngine::compute_inside_outside(
-                        tree, pattern, leaf_to_taxon, P_mix[m], aln.codon_frequencies_f3x4, S
+                if (M == 1) {
+                    auto io = LikelihoodEngine::compute_inside_outside(
+                        tree, pattern, leaf_to_taxon, P_mix[0], aln.codon_frequencies_f3x4, S
                     );
-                    pat_L += syn_weights[m] * io_m[m].likelihood;
-                }
-
-                if (pat_L > 0.0) {
-                    local_ll += pattern.weight * std::log(pat_L);
-                    Scalar inv_L = pattern.weight / pat_L;
-                    for (const auto& node : tree.nodes) {
-                        if (node.id != tree.root_id) {
-                            int32_t vid = node.id;
-                            Scalar dL_dt = 0.0;
-                            for (size_t m = 0; m < M; ++m) {
-                                dL_dt += syn_weights[m] * io_m[m].V[vid].dot(dP_mix[m][vid] * io_m[m].D[vid]);
+                    if (io.likelihood > 0.0) {
+                        local_ll += pattern.weight * io.log_likelihood;
+                        Scalar inv_L = pattern.weight / io.likelihood;
+                        for (const auto& node : tree.nodes) {
+                            if (node.id != tree.root_id) {
+                                int32_t vid = node.id;
+                                Scalar dL_dt = io.V[vid].dot(dP_mix[0][vid] * io.D[vid]);
+                                local_grad[vid] += inv_L * dL_dt;
                             }
-                            local_grad[vid] += inv_L * dL_dt;
+                        }
+                    }
+                } else {
+                    std::vector<LikelihoodEngine::InsideOutsideResult> io_m(M);
+                    Scalar max_ll = -std::numeric_limits<Scalar>::infinity();
+                    for (size_t m = 0; m < M; ++m) {
+                        if (syn_weights[m] <= 1e-12) continue;
+                        io_m[m] = LikelihoodEngine::compute_inside_outside(
+                            tree, pattern, leaf_to_taxon, P_mix[m], aln.codon_frequencies_f3x4, S
+                        );
+                        if (io_m[m].likelihood > 0.0) {
+                            Scalar term = std::log(syn_weights[m]) + io_m[m].log_likelihood;
+                            if (term > max_ll) max_ll = term;
+                        }
+                    }
+
+                    if (max_ll > -1e19) {
+                        Scalar sum_exp = 0.0;
+                        std::vector<Scalar> post_w(M, 0.0);
+                        for (size_t m = 0; m < M; ++m) {
+                            if (syn_weights[m] > 1e-12 && io_m[m].likelihood > 0.0) {
+                                Scalar e = std::exp(std::log(syn_weights[m]) + io_m[m].log_likelihood - max_ll);
+                                post_w[m] = e;
+                                sum_exp += e;
+                            }
+                        }
+                        if (sum_exp > 0.0) {
+                            Scalar pat_ll = max_ll + std::log(sum_exp);
+                            local_ll += pattern.weight * pat_ll;
+                            Scalar inv_sum = 1.0 / sum_exp;
+                            for (size_t m = 0; m < M; ++m) post_w[m] *= inv_sum;
+
+                            for (const auto& node : tree.nodes) {
+                                if (node.id != tree.root_id) {
+                                    int32_t vid = node.id;
+                                    Scalar d_lnL_dt = 0.0;
+                                    for (size_t m = 0; m < M; ++m) {
+                                        if (post_w[m] > 1e-12 && io_m[m].likelihood > 0.0) {
+                                            d_lnL_dt += post_w[m] * (io_m[m].V[vid].dot(dP_mix[m][vid] * io_m[m].D[vid]) / io_m[m].likelihood);
+                                        }
+                                    }
+                                    local_grad[vid] += pattern.weight * d_lnL_dt;
+                                }
+                            }
                         }
                     }
                 }
@@ -3419,17 +3577,36 @@ public:
                 res.unconstrained.log_likelihood = max_nested_ll;
             }
 
-            // Test 1: Foreground / Test selection (LRT_T)
-            res.lrt = std::max(0.0, 2.0 * (res.unconstrained.log_likelihood - res.constrained.log_likelihood));
-            res.p_value = (res.lrt > 0.0) ? (0.5 * std::exp(-res.lrt / 2.0)) : 0.5;
+            bool unc_failed = (res.unconstrained.log_likelihood <= -1e19 || !std::isfinite(res.unconstrained.log_likelihood));
+            bool con_failed = (res.constrained.log_likelihood <= -1e19 || !std::isfinite(res.constrained.log_likelihood));
+            bool bg_failed = (res.constrained_background.log_likelihood <= -1e19 || !std::isfinite(res.constrained_background.log_likelihood));
+            bool shared_failed = (res.shared_distributions.log_likelihood <= -1e19 || !std::isfinite(res.shared_distributions.log_likelihood));
 
-            // Test 2: Background / Comparison selection (LRT_B)
-            res.background_lrt = std::max(0.0, 2.0 * (res.unconstrained.log_likelihood - res.constrained_background.log_likelihood));
-            res.background_p_value = (res.background_lrt > 0.0) ? (0.5 * std::exp(-res.background_lrt / 2.0)) : 0.5;
+            if (unc_failed || con_failed || bg_failed || shared_failed) {
+                res.is_failed = true;
+                res.error_message = "Optimization failed: model log-likelihood collapsed to penalty threshold (-1e20). The fit did not converge.";
+                res.lrt = 0.0;
+                res.p_value = 1.0;
+                res.background_lrt = 0.0;
+                res.background_p_value = 1.0;
+                res.shared_lrt = 0.0;
+                res.shared_p_value = 1.0;
+                res.union_intersection_p_value = 1.0;
+                res.phenotype_associated = false;
+                res.phenotype_verdict = "Analysis failed: likelihood collapsed or did not converge.";
+            } else {
+                // Test 1: Foreground / Test selection (LRT_T)
+                res.lrt = std::max(0.0, 2.0 * (res.unconstrained.log_likelihood - res.constrained.log_likelihood));
+                res.p_value = (res.lrt > 0.0) ? (0.5 * std::exp(-res.lrt / 2.0)) : 0.5;
 
-            // Test 3: Shared vs Separate Distributions (LRT_shared ~ chi^2_{2K-1})
-            res.shared_lrt = std::max(0.0, 2.0 * (res.unconstrained.log_likelihood - res.shared_distributions.log_likelihood));
-            res.shared_p_value = busted_chi2_p_value(res.shared_lrt, static_cast<Scalar>(res.shared_df));
+                // Test 2: Background / Comparison selection (LRT_B)
+                res.background_lrt = std::max(0.0, 2.0 * (res.unconstrained.log_likelihood - res.constrained_background.log_likelihood));
+                res.background_p_value = (res.background_lrt > 0.0) ? (0.5 * std::exp(-res.background_lrt / 2.0)) : 0.5;
+
+                // Test 3: Shared vs Separate Distributions (LRT_shared ~ chi^2_{2K-1})
+                res.shared_lrt = std::max(0.0, 2.0 * (res.unconstrained.log_likelihood - res.shared_distributions.log_likelihood));
+                res.shared_p_value = busted_chi2_p_value(res.shared_lrt, static_cast<Scalar>(res.shared_df));
+            }
 
             // Canonical BUSTED-PH Testing Procedure:
             // Step 1: Union-Intersection Test (UIT) on (p_FG, p_diff) -> p_UIT = max(p_FG, p_diff) <= alpha
@@ -3519,8 +3696,14 @@ public:
         }
 
         if (!settings.phenotype_mode) {
-            // Compute LRT and p-value
-            if (res.unconstrained.log_likelihood < res.constrained.log_likelihood) {
+            bool unc_failed = (res.unconstrained.log_likelihood <= -1e19 || !std::isfinite(res.unconstrained.log_likelihood));
+            bool con_failed = (res.constrained.log_likelihood <= -1e19 || !std::isfinite(res.constrained.log_likelihood));
+            if (unc_failed || con_failed) {
+                res.is_failed = true;
+                res.error_message = "Optimization failed: model log-likelihood collapsed to penalty threshold (-1e20). The fit did not converge.";
+                res.lrt = 0.0;
+                res.p_value = 1.0;
+            } else if (res.unconstrained.log_likelihood < res.constrained.log_likelihood) {
                 res.unconstrained.log_likelihood = res.constrained.log_likelihood;
                 res.lrt = 0.0;
                 res.p_value = 0.5;
@@ -3531,7 +3714,7 @@ public:
             }
 
             // If --relax was requested on standard BUSTED, fit Shared (k=1) and RELAX (k free)
-            if (settings.relax_mode) {
+            if (settings.relax_mode && !res.is_failed) {
                 size_t K = res.optimal_k;
                 res.has_relax_test = true;
                 {
@@ -3635,6 +3818,13 @@ public:
 
     nlohmann::json to_legacy_json(const BUSTEDResult& res) const {
         nlohmann::json j;
+
+        if (res.is_failed) {
+            j["status"] = "failed";
+            j["error"] = res.error_message;
+        } else {
+            j["status"] = "completed";
+        }
 
         j["analysis"] = {
             {"authors", "Sergei L Kosakovsky Pond"},
@@ -3926,6 +4116,10 @@ public:
         };
 
         nlohmann::json j = new_analysis_json(meta, prov);
+        j["status"] = res.is_failed ? "failed" : "completed";
+        if (res.is_failed) {
+            j["error"] = res.error_message;
+        }
         // Preserve measured runtime when the caller supplied no real provenance:
         // the auto block reports the actual wall clock of the analysis.
         if (prov.invocation.cli_command.empty() && prov.inputs.empty() &&
@@ -4089,7 +4283,7 @@ public:
             {"null_hypothesis", "omega_k <= 1 for all k on test branches (Constrained model)"},
             {"alternative_hypothesis", "omega_k > 1 for at least one k on test branches (Unconstrained model)"},
             {"p_value", finite_or_null(res.p_value)},
-            {"decision", (res.p_value <= res.settings.p_value_threshold) ? "Episodic diversifying selection detected" : "No evidence of episodic diversifying selection"},
+            {"decision", res.is_failed ? ("Analysis failed: " + res.error_message) : ((res.p_value <= res.settings.p_value_threshold) ? "Episodic diversifying selection detected" : "No evidence of episodic diversifying selection")},
             {"optimal_k", static_cast<int>(res.optimal_k)}
         };
         if (res.has_background_test) {

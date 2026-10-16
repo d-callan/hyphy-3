@@ -1204,12 +1204,19 @@ private:
         }
 
         // Omnibus LRT & p-value vs FEL (df = K)
-        Scalar omnibus_lrt = 2.0 * (res.log_l_alt - res.log_l_fel);
-        if (omnibus_lrt < 0.0) omnibus_lrt = 0.0;
+        bool valid_omnibus = (res.log_l_alt > -1e10 && res.log_l_fel > -1e10 &&
+                              std::isfinite(res.log_l_alt) && std::isfinite(res.log_l_fel));
+        Scalar omnibus_lrt = 0.0;
+        if (valid_omnibus) {
+            omnibus_lrt = 2.0 * (res.log_l_alt - res.log_l_fel);
+            if (omnibus_lrt < 0.0) omnibus_lrt = 0.0;
+        }
         res.omnibus_lrt = omnibus_lrt;
 
         // Chi-squared p-value for df = K
-        if (K == 1) {
+        if (!valid_omnibus) {
+            res.omnibus_p_value = 1.0;
+        } else if (K == 1) {
             res.omnibus_p_value = std::erfc(std::sqrt(omnibus_lrt / 2.0));
         } else if (K == 2) {
             res.omnibus_p_value = std::exp(-0.5 * omnibus_lrt);
@@ -1290,10 +1297,15 @@ private:
                 res.properties[k].lambda = 0.0;
             }
 
-            Scalar prop_lrt = 2.0 * (res.log_l_alt - res.properties[k].log_l_null);
-            if (prop_lrt < 0.0) prop_lrt = 0.0;
+            bool valid_prop = (res.log_l_alt > -1e10 && res.properties[k].log_l_null > -1e10 &&
+                               std::isfinite(res.log_l_alt) && std::isfinite(res.properties[k].log_l_null));
+            Scalar prop_lrt = 0.0;
+            if (valid_prop) {
+                prop_lrt = 2.0 * (res.log_l_alt - res.properties[k].log_l_null);
+                if (prop_lrt < 0.0) prop_lrt = 0.0;
+            }
             res.properties[k].lrt = prop_lrt;
-            res.properties[k].p_value = std::erfc(std::sqrt(prop_lrt / 2.0));
+            res.properties[k].p_value = valid_prop ? std::erfc(std::sqrt(prop_lrt / 2.0)) : 1.0;
         }
 
         res.total_branch_length = res.alpha * baseline_tested_tree_length;

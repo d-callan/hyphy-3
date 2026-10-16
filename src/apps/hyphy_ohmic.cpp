@@ -40,8 +40,8 @@ static void print_ohmic_usage(const char* prog) {
               << "  " << Console::brand("--datatype, --model, -d") << " <type>   Model datatype: 'nucleotide' (GTR, default) or 'codon' (MG94xREV)\n"
               << "  " << Console::brand("--codon") << "                        Shorthand for --datatype codon\n"
               << "  " << Console::brand("--nucleotide") << "                   Shorthand for --datatype nucleotide\n"
-              << "  " << Console::brand("--hyphaeon") << "                     Use HyphAeon 384D multi-scale transformer embeddings (default)\n"
-              << "  " << Console::brand("--no-hyphaeon") << "                  Disable HyphAeon transformer (use empirical conductances only)\n"
+              << "  " << Console::brand("--hyphaeon") << "                     Opt-in: HyphAeon 384D transformer embeddings (needs Python aeon-core)\n"
+              << "  " << Console::brand("--no-hyphaeon") << "                  Use empirical conductances only (default)\n"
               << "  " << Console::brand("--embeddings") << " <file>            Path to precomputed [N x D] taxon embeddings TSV/CSV\n"
               << "  " << Console::brand("--scale-mode, -s") << " <mode>        Solver mode: 'auto' (default), 'dense', or 'woodbury'\n"
               << "  " << Console::brand("--min-stress") << " <tau>             Minimum shunt stress tau_Ohm to promote a bridge (default: 0.05)\n"
@@ -56,7 +56,7 @@ static void print_ohmic_usage(const char* prog) {
               << Console::bold("Examples:") << "\n"
               << "  " << prog << " --alignment tests/data/cd2.fna\n"
               << "  " << prog << " --alignment tests/data/bglobin.nex --datatype codon --threads 8\n"
-              << "  " << prog << " --alignment tests/data/cd2.fna --no-hyphaeon\n\n";
+              << "  " << prog << " --alignment tests/data/cd2.fna --hyphaeon\n\n";
 }
 
 int run_ohmic(int argc, char* argv[]) {
@@ -72,7 +72,7 @@ int run_ohmic(int argc, char* argv[]) {
     size_t woodbury_rank = 256;
     int num_threads = 0;
     bool quiet = false;
-    bool use_hyphaeon = true;
+    bool use_hyphaeon = false;
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -179,9 +179,9 @@ int run_ohmic(int argc, char* argv[]) {
     if (!embeddings_file.empty()) {
         hyphaeon_cfg_desc = "Precomputed Taxon Embeddings (" + embeddings_file + ")";
     } else if (use_hyphaeon) {
-        hyphaeon_cfg_desc = "HyphAeon 384D Transformer (192D dS + 192D dN) [Default]";
+        hyphaeon_cfg_desc = "HyphAeon 384D Transformer (192D dS + 192D dN) [--hyphaeon]";
     } else {
-        hyphaeon_cfg_desc = "Empirical TN93 Conductances (No Transformer / Disabled)";
+        hyphaeon_cfg_desc = "Empirical TN93 Conductances (Default)";
     }
 
     size_t num_sites_nuc = aln.num_nucleotides > 0 ? aln.num_nucleotides : (aln.sequences.empty() ? 0 : aln.sequences[0].raw_seq.size());

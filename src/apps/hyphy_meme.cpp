@@ -40,9 +40,9 @@ static void print_usage(const char* prog) {
               << "  " << Console::brand("--alignment") << " <file>   Path to codon alignment (FASTA or NEXUS)\n\n"
               << Console::bold("Optional arguments:") << "\n"
               << "  " << Console::brand("--tree") << " <file>        Path to Newick tree file (optional; auto-infers Ohmic Network if omitted)\n"
-              << "  " << Console::brand("--ohmic") << "              Build Ohmic Phylogenetic Network with Wheatstone bridges (+ 384D HyphAeon)\n"
-              << "  " << Console::brand("--hyphaeon") << "           Enable 384D HyphAeon (192D dS + 192D dN) transformer embeddings\n"
-              << "  " << Console::brand("--no-hyphaeon") << "        Disable live HyphAeon transformer (use empirical codon conductances)\n"
+              << "  " << Console::brand("--ohmic") << "              Build Ohmic Phylogenetic Network with Wheatstone bridges\n"
+              << "  " << Console::brand("--hyphaeon") << "           Opt-in: HyphAeon 384D transformer conductances (needs Python aeon-core)\n"
+              << "  " << Console::brand("--no-hyphaeon") << "        Use empirical codon conductances only (default)\n"
               << "  " << Console::brand("--embeddings") << " <file>  Path to precomputed [N x 384] HyphAeon embeddings (.bin/.csv/.tsv)\n"
               << "  " << Console::brand("--code") << " <name>        Genetic code (default: Universal; e.g. Vertebrate-mtDNA)\n"
               << "  " << Console::brand("--branches") << " <spec>    Branches to test: All (default), Internal, Leaves, Unlabeled, {TAG}, or names\n"
@@ -74,7 +74,7 @@ int run_meme(int argc, char* argv[]) {
     std::string branches_spec = "All";
     std::string embeddings_file = "";
     bool force_ohmic = false;
-    bool use_hyphaeon = true;
+    bool use_hyphaeon = false;
     int num_threads = 0;
     Scalar pvalue_threshold = 0.1;
     bool show_progress = ProgressBar::is_terminal();

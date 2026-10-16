@@ -182,7 +182,9 @@ This allows joint L-BFGS optimization across all branch lengths simultaneously i
 | **Full BUSTED-MH (Double+Triple)** | ADH (23 taxa, 254 codons) | 26.50 s | **6.47 s** | **4.10×** |
 | **Full MEME Analysis** | CD2 (10 taxa, 187 codons) | 4.82 s | **1.21 s** | **3.98×** |
 | **Full aBSREL Analysis** | β-globin (17 taxa, 144 codons) | 48.0 s (ln L = -3631.58) | **25.7 s** (ln L = -3633.51) | **1.87×** (|Δ ln L| ≤ 1.9) |
-| **Full RELAX Analysis** | Fig4E (33 taxa, 286 codons) | 48.5 s (ln L = -4982.69) | **7.21 s** (ln L = -4942.30) | **6.73×** |
+| **Full RELAX Analysis** | Fig4E (33 taxa, 286 codons) | 13.3 s (ln L = -4982.98) | **14.5 s** (ln L = -4957.65)¹ | **0.9×** (K = 0.000 in both; LRT 123.4 vs 119.6) |
+
+¹ Fig4E contains 49 partially-resolved codons (e.g. `AC-`) that hyphy-3 currently encodes as fully missing, whereas HyPhy 2.5 sums over the compatible codons; this raises hyphy-3's absolute codon ln L by ~25 on this alignment only. With those codons masked to `---`, the two agree (MG94 -4959.72 vs -4959.77, RELAX null -5017.29 vs -5017.42). Both timings: HyPhy 2.5.101 and hyphy-3, default threads, same machine.
 
 ---
 
@@ -204,7 +206,7 @@ This allows joint L-BFGS optimization across all branch lengths simultaneously i
 | **BUSTED-PH** | Is episodic positive selection specifically associated with a phenotype/trait? | Phenotype-associated (3-way branch partition) | 4-model workflow, Union-Intersection Test ($\max(p_{FG}, p_{\text{diff}}) \le \alpha$) + $\text{AIC}_c$ BG neutrality | Separate FG, BG & Unclassified $\omega$ | Optional | 100% Verified |
 | **BUSTED-Auto** | Principled automatic selection of Sink, MH, SRV, and K? | Gene-wide Full-Auto | 4-Gate Surprisal & Score Model Selector | Auto-selected | Auto-selected | 100% Verified |
 | **aBSREL** | Which specific lineages/branches evolved under selection? | Lineage-specific | Adaptive complexity selection (AICc Step-Up) | Branch-site ω | — | |Δ ln L| < 2.0 |
-| **RELAX** | Has selection relaxed (K < 1) or intensified (K > 1) on test branches? | Branch-set contrast | 3-rate mixture with exponent K, χ²₁ LRT | Site mixture | — | 100% Verified |
+| **RELAX** | Has selection relaxed (K < 1) or intensified (K > 1) on test branches? | Branch-set contrast | 3-rate mixture with exponent K, χ²₁ LRT | Branch-site mixture (BS-REL) | — | |Δ ln L| ≤ 2.6 (CD2, adh)¹ |
 | **GTR / MG94** | What are baseline nucleotide biases & global dN/dS? | Alignment-wide | Reversible CTMC with F3x4 equilibrium | Global ω | Supported | 100% Verified |
 | **GARD** | Where are recombination breakpoints located? | Recombination & Topology | Segmented GTR + Neighbor-Joining, AICc selection | Independent segment rates | — | 100% Verified |
 | **SLAC** | Are individual sites undergoing selection using counting methods? | Site-level (dN ≷ dS) | Joint ML Ancestral Reconstruction, exact Binomial test | None | — | 100% Verified |
@@ -295,14 +297,16 @@ Null ~ ½ χ²₀ + ½(0.4 χ²₁ + 0.6 χ²₂)
 #### 5. **RELAX (Detecting Relaxed or Intensified Selection Across Lineages)**
 - **Scope**: Tests whether natural selection has been relaxed (K < 1) or intensified (K > 1) on a designated set of **Test** branches relative to **Reference** branches.
 - **Workflow**:
-  1. **Phase 1 (Nucleotide GTR)**: Precomputes nucleotide exchangeabilities and initial branch lengths.
-  2. **Phase 2 (MG94 with Separate Rates)**: Evaluates distinct global ω_R and ω_T across branch sets to provide initial branch scaling and contrast estimates.
-  3. **Phase 3 (RELAX Alternative Model)**: Fits a 3-category discrete distribution of rates for Reference branches (ω_{R, 0} ≤ ω_{R, 1} ≤ 1 ≤ ω_{R, 2} with weights p₀, p₁, p₂). Test branches are parameterized as ω_{T, i} = (ω_{R, i})^K, where K ∈ [0, 50] is the selection exponent parameter.
-  4. **Phase 4 (RELAX Null Model)**: Constrains K = 1.0 so Test and Reference branches share the exact same ω distribution.
-  5. **Phase 5 (Hypothesis Testing)**: Compares alternative and null fits using the asymptotic χ²₁ LRT test statistic LRT = 2(ln L_alt - ln L_null).
+  1. **Phase 1 (Nucleotide GTR)**: Fits nucleotide exchangeabilities and branch lengths, alternating rates ↔ branch lengths to convergence.
+  2. **Phase 2 (MG94 with Separate Rates)**: Fits distinct global ω_R and ω_T across branch sets, alternating per-branch length refinement (L-BFGS, exact gradients), (ω_R, ω_T), and the nucleotide exchangeabilities (as in HyPhy 2.5's full MG94 refit).
+  3. **Phase 3 (RELAX Null Model)**: Constrains K = 1.0 so Test and Reference branches share the exact same ω distribution.
+  4. **Phase 4 (RELAX Alternative Model)**: Fits a 3-category discrete distribution of rates for Reference branches (ω_{R, 0} ≤ ω_{R, 1} ≤ 1 ≤ ω_{R, 2} with weights p₀, p₁, p₂). Test branches are parameterized as ω_{T, i} = (ω_{R, i})^K, where K ∈ [0, 50] is the selection exponent parameter. The alternative is started both from a grid and from the null MLE (K = 1), and the null is re-fit from the alternative MLE, so the fits are nested (ln L_alt ≥ ln L_null).
+  5. Both RELAX fits alternate (distribution, K) ↔ per-branch lengths until the cycle gain is < 10⁻³ (`--joint-cycles`, default 5).
+  6. **Phase 5 (Hypothesis Testing)**: Compares alternative and null fits using the asymptotic χ²₁ LRT test statistic LRT = 2(ln L_alt - ln L_null).
      - K < 1 with p ≤ 0.05: Significant **relaxation of selection** (rates contract toward neutrality ω = 1).
      - K > 1 with p ≤ 0.05: Significant **intensification of selection** (rates diverge from neutrality).
-- **Branch Set Specification**: Automatically detects `{T}` or `{Test}` annotations in Newick trees, or accepts user-specified branch names / regular expressions (`--test`).
+- **Model (HyPhy 2.5 BS-REL semantics)**: every branch-site combination draws its ω class independently, i.e. each branch uses P_b = Σ_c p_c exp(Q_c t_b), and all classes share one synonymous rate so that the branch length is the mixture-expected number of substitutions. The pre-2026 hyphy-3 model (site-level mixture, each class normalized separately) remains available for comparison via `--relax-mixture site --relax-normalization per-class`.
+- **Branch Set Specification**: Automatically detects `{T}`/`{TEST}`/`{FG}` (and `{R}`/`{REFERENCE}`/`{BG}`) annotations in Newick trees. `--test`/`--reference` resolve, in order, to: a tag present in the tree, a comma-separated list of exact branch names, or a regular expression (only when given as `regex:<pattern>` / `--test-regex`, or as a warned fallback when nothing else matches).
 
 #### 6. **Contrast-FEL (Comparing Selection Pressures Between Branch Sets)**
 - **Scope**: Tests whether selective pressures (non-synonymous rates β) differ between two or more designated sets of branches (e.g. Host 1 vs Host 2, Internal vs Leaves, or Phenotype A vs B) across individual codon sites.
@@ -450,6 +454,25 @@ pip install .
 
 HyPhy 3 provides both a unified driver (`hyphy3 <analysis>`) and dedicated standalone tools (`hyphy3-fel`, `hyphy3-meme`, `hyphy3-busted`, `hyphy3-absrel`, `hyphy3-ohmic`, etc.). Every standard selection analysis supports `--ohmic` (or `--omhic`), `--hyphaeon` / `--no-hyphaeon`, `--embeddings <file>`, and **automatic tree-free FASTA inference** when `--tree` is omitted:
 
+### Optional: HyphAeon transformer conductances (`--hyphaeon`)
+
+HyphAeon is **off by default**. It only affects runs where hyphy-3 infers the tree itself (no `--tree` and no tree in the input file, or `--ohmic`). Enabling it runs a small embedded Python helper that needs the public [`aeon-core`](https://github.com/veg/HyphAeon) package (with PyTorch):
+
+```bash
+pip install "aeon-core @ git+https://github.com/veg/HyphAeon#subdirectory=aeon-core"
+```
+
+Model weights (~8 MB) are fetched from [huggingface.co/datamonkey/hyphaeon](https://huggingface.co/datamonkey/hyphaeon) on first use. hyphy-3 asks before downloading in an interactive terminal. Non-interactive jobs must opt in with `HYPHY3_HYPHAEON_DOWNLOAD=1`. If HyphAeon is requested but unavailable, the run stops with an error rather than silently falling back.
+
+| Environment variable | Purpose |
+|:---|:---|
+| `HYPHY3_PYTHON` | Python interpreter to use (default: `python3` on `PATH`) |
+| `HYPHY3_HYPHAEON_DOWNLOAD` | `1` = allow weight download without prompting, `0` = never download |
+| `HYPHAEON_WEIGHTS` | Use a local weights file instead of the Hugging Face cache |
+| `HYPHAEON_VARIANT` | Model variant (default `general`; e.g. `viral`) |
+| `HYPHAEON_CACHE` | aeon-core cache location (weights go to its sibling `huggingface/` directory) |
+| `HYPHAEON_DEVICE` | `cpu` to force CPU inference (default: CUDA > MPS > CPU) |
+
 ### Available CLI Options by Analysis
 
 | Analysis | Command | Key Options | Description |
@@ -467,7 +490,7 @@ HyPhy 3 provides both a unified driver (`hyphy3 <analysis>`) and dedicated stand
 | **BUSTED-Auto**| `hyphy3 busted` | `--auto` (`--full-auto`) | 4-Gate Surprisal & Score Automatic Model Selector (Sink, MH, SRV, K) |
 | **BUSTED Auto-K**| `hyphy3 busted` | `--auto-k` | Automatic selection of rate categories via AICc step-up |
 | **aBSREL** | `hyphy3 absrel`| `--alignment`, `--tree`, `--ohmic`, `--rates 3`, `--threads N`, `--output` | Lineage-specific adaptive selection |
-| **RELAX** | `hyphy3 relax` | `--alignment`, `--tree`, `--ohmic`, `--test <regex|names>`, `--pvalue 0.05`, `--output` | Test for selection relaxation/intensification across branch sets |
+| **RELAX** | `hyphy3 relax` | `--alignment`, `--tree`, `--ohmic`, `--test <tag|names|regex:pattern>`, `--reference`, `--joint-cycles 5`, `--pvalue 0.05`, `--output` | Test for selection relaxation/intensification across branch sets |
 | **GARD** | `hyphy3 gard` | `--alignment`, `--max-breakpoints N`, `--rate-classes 1`, `--threads N`, `--output` | Recombination breakpoint detection via Genetic Algorithm and AICc |
 | **SLAC** | `hyphy3 slac` | `--alignment`, `--tree`, `--ohmic`, `--samples N`, `--pvalue 0.1`, `--output` | Counting-based site-by-site selection via Joint ML ancestors |
 | **Directional-FEL** | `hyphy3 dfel` | `--alignment`, `--tree`, `--ohmic`, `--root [auto\|keep\|<name>]`, `--regimes [0=auto\|1\|3]`, `--pvalue 0.1`, `--output` | Non-stationary selection inference with upfront compositional tests & ML auto-rooting |
@@ -482,8 +505,11 @@ hyphy3 --help
 # 1. Run FEL (site-by-site pervasive selection)
 hyphy3 fel --alignment benchmarks/data/cd2.fna --tree benchmarks/data/cd2.nwk --pvalue 0.1 --threads 8
 
-# 1b. Run FEL directly on a tree-free FASTA alignment with Ohmic + HyphAeon 384D Wheatstone bridges
+# 1b. Run FEL directly on a tree-free FASTA alignment with Ohmic Wheatstone bridges
 hyphy3 fel --alignment benchmarks/data/cd2.fna --ohmic --quick --threads 8
+
+# 1c. Same, adding optional HyphAeon 384D transformer conductances (requires aeon-core; see above)
+hyphy3 fel --alignment benchmarks/data/cd2.fna --ohmic --hyphaeon --quick --threads 8
 
 # 2. Run Contrast-FEL (test for differential selection between branch sets)
 hyphy3 contrast-fel --alignment benchmarks/data/cd2.fna --tree benchmarks/data/cd2.nwk --branches "Internal,Leaves" --shrinkage 1.0 --threads 8
