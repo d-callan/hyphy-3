@@ -8,6 +8,33 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 # Optimization flags
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -Wall -Wextra")
 
+# Build-speed knobs -------------------------------------------------------------
+# Every executable here is a single translation unit that re-parses the same
+# multi-MB header stack (nlohmann/json, Eigen, core + analysis headers) at -O3.
+# These options exist because full rebuilds otherwise take many minutes and can
+# exhaust memory alongside an IDE's language server.
+#
+# - ccache: when present on PATH, identical TUs are served from cache, which
+#   makes rebuilds after header-touching merges nearly free. Install via
+#   `conda install -c conda-forge ccache` or the system package manager.
+find_program(HYPHY3_CCACHE_PROGRAM ccache)
+if(HYPHY3_CCACHE_PROGRAM)
+    set(CMAKE_CXX_COMPILER_LAUNCHER "${HYPHY3_CCACHE_PROGRAM}")
+endif()
+#
+# - HYPHY3_FAST_COMPILE: optimizer passes dominate TU compile time on this code.
+#   -DHYPHY3_FAST_COMPILE=ON drops to -O1 for dev iteration. Release artifacts
+#   must still be built without it.
+option(HYPHY3_FAST_COMPILE "Trade optimization for compile speed (dev builds)" OFF)
+if(HYPHY3_FAST_COMPILE)
+    string(REGEX REPLACE "-O3" "-O1" CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
+endif()
+#
+# - HYPHY3_PCH (default ON): all executable targets reuse one shared
+#   precompiled header (see bottom of this file) so the stable header stack is
+#   parsed once instead of once per target. Set -DHYPHY3_PCH=OFF to disable.
+option(HYPHY3_PCH "Shared precompiled header for all executable targets" ON)
+
 # Header-only Eigen 3.4.0
 include(FetchContent)
 FetchContent_Declare(
@@ -293,3 +320,27 @@ if(Python_FOUND)
     endif()
 endif()
 
+
+# Shared precompiled header -----------------------------------------------------
+# hyphy3_pch compiles src/pch.hpp once; every executable then reuses that
+# artifact instead of re-parsing nlohmann/json + Eigen + the ubiquitous core
+# headers. Per-analysis emitters are intentionally excluded (see src/pch.hpp).
+# Disable with -DHYPHY3_PCH=OFF if it causes toolchain issues.
+if(HYPHY3_PCH)
+    add_library(hyphy3_pch STATIC src/pch.cpp)
+    target_link_libraries(hyphy3_pch PUBLIC hyphy3_core)
+    target_precompile_headers(hyphy3_pch PUBLIC "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/pch.hpp>")
+
+    get_property(_hyphy3_all_targets DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+                 PROPERTY BUILDSYSTEM_TARGETS)
+    foreach(_tgt IN LISTS _hyphy3_all_targets)
+        if(_tgt STREQUAL "hyphy3_pch")
+            continue()
+        endif()
+        get_target_property(_tgt_type ${_tgt} TYPE)
+        if(_tgt_type STREQUAL "EXECUTABLE")
+            target_link_libraries(${_tgt} PRIVATE hyphy3_pch)
+            target_precompile_headers(${_tgt} REUSE_FROM hyphy3_pch)
+        endif()
+    endforeach()
+endif()
