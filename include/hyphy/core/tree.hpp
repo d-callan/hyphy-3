@@ -133,6 +133,19 @@ public:
                 out_child_scale_sum += node_log_scale[cid];
             }
         }
+
+        const double SCALER_THRESH = 1e-150;
+        const double SCALER_UP = 1e150;
+        const double LOG_SCALER = 345.38776394910684;
+
+        double max_val = out_L.maxCoeff();
+        int boost_count = 0;
+        while (max_val < SCALER_THRESH && max_val > 0.0) {
+            out_L *= SCALER_UP;
+            max_val *= SCALER_UP;
+            boost_count++;
+        }
+        out_child_scale_sum -= boost_count * LOG_SCALER;
     }
 
     template <typename VecType, typename MatType, typename ModelType>
@@ -185,6 +198,19 @@ public:
                 out_child_scale_sum += node_log_scale[cid];
             }
         }
+
+        const double SCALER_THRESH = 1e-150;
+        const double SCALER_UP = 1e150;
+        const double LOG_SCALER = 345.38776394910684;
+
+        double max_val = out_L.maxCoeff();
+        int boost_count = 0;
+        while (max_val < SCALER_THRESH && max_val > 0.0) {
+            out_L *= SCALER_UP;
+            max_val *= SCALER_UP;
+            boost_count++;
+        }
+        out_child_scale_sum -= boost_count * LOG_SCALER;
     }
 
     static Tree from_newick_file(const std::string& filepath) {

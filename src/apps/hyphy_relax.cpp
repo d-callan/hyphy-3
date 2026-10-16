@@ -294,7 +294,9 @@ int run_relax(int argc, char* argv[]) {
     time_ss << std::fixed << std::setprecision(2) << res.runtime_seconds << " s";
 
     std::string conclusion;
-    if (res.is_significant) {
+    if (res.is_failed) {
+        conclusion = "FAILED: " + res.error_message;
+    } else if (res.is_significant) {
         if (res.is_relaxed) {
             conclusion = "SIGNIFICANT RELAXATION of selection on Test branches (K = " + k_ss.str() + " < 1, p = " + p_ss.str() + ")";
         } else {
@@ -364,6 +366,11 @@ int run_relax(int argc, char* argv[]) {
                   << Console::brand(output_file) << "\n\n";
     } catch (const std::exception& e) {
         std::cerr << Console::danger("Warning: Failed to write JSON output: ") << e.what() << "\n";
+    }
+
+    if (res.is_failed) {
+        std::cerr << Console::danger("Error: RELAX analysis failed to converge or likelihood underflowed.\n");
+        return 1;
     }
 
     return 0;

@@ -449,9 +449,8 @@ public:
             #pragma omp for reduction(+:total_log_l) schedule(dynamic)
             for (size_t p = 0; p < num_patterns; ++p) {
                 const auto& pattern = aln.patterns[p];
-                Scalar pat_L = 0.0;
-
-                for (size_t m = 0; m < M; ++m) {
+                Scalar pll = -1e20;
+                if (M == 1) {
                     for (int32_t node_id : tree.post_order) {
                         const auto& node = tree.nodes[node_id];
                         if (node.is_leaf) {
@@ -470,18 +469,61 @@ public:
                             node_log_scale[node_id] = 0.0;
                         } else {
                             double child_scale_sum = 0.0;
-                            tree.eval_internal_node(node_id, P_mix[m], node_L, node_log_scale, node_L[node_id], child_scale_sum);
+                            tree.eval_internal_node(node_id, P_mix[0], node_L, node_log_scale, node_L[node_id], child_scale_sum);
                             node_log_scale[node_id] = child_scale_sum;
                         }
                     }
                     Scalar cond_L = aln.codon_frequencies_f3x4.dot(node_L[tree.root_id]);
-                    if (cond_L > 0.0 && node_log_scale[tree.root_id] != 0.0) {
-                        cond_L *= std::exp(node_log_scale[tree.root_id]);
+                    if (cond_L > 0.0) {
+                        pll = std::log(cond_L) + node_log_scale[tree.root_id];
                     }
-                    pat_L += syn_weights[m] * cond_L;
-                }
+                } else {
+                    Scalar max_term = -std::numeric_limits<Scalar>::infinity();
+                    std::vector<Scalar> terms(M);
+                    std::vector<bool> valid(M, false);
 
-                Scalar pll = (pat_L > 0.0) ? std::log(pat_L) : -1e20;
+                    for (size_t m = 0; m < M; ++m) {
+                        for (int32_t node_id : tree.post_order) {
+                            const auto& node = tree.nodes[node_id];
+                            if (node.is_leaf) {
+                                size_t t_idx = leaf_to_taxon[node_id];
+                                if (t_idx != static_cast<size_t>(-1)) {
+                                    int8_t state = pattern.states[t_idx];
+                                    if (state >= 0 && state < S) {
+                                        node_L[node_id].setZero();
+                                        node_L[node_id](state) = 1.0;
+                                    } else {
+                                        node_L[node_id].setOnes();
+                                    }
+                                } else {
+                                    node_L[node_id].setOnes();
+                                }
+                                node_log_scale[node_id] = 0.0;
+                            } else {
+                                double child_scale_sum = 0.0;
+                                tree.eval_internal_node(node_id, P_mix[m], node_L, node_log_scale, node_L[node_id], child_scale_sum);
+                                node_log_scale[node_id] = child_scale_sum;
+                            }
+                        }
+                        Scalar cond_L = aln.codon_frequencies_f3x4.dot(node_L[tree.root_id]);
+                        if (cond_L > 0.0) {
+                            Scalar term = std::log(syn_weights[m]) + std::log(cond_L) + node_log_scale[tree.root_id];
+                            terms[m] = term;
+                            valid[m] = true;
+                            if (term > max_term) max_term = term;
+                        }
+                    }
+
+                    if (max_term > -1e19) {
+                        Scalar sum_exp = 0.0;
+                        for (size_t m = 0; m < M; ++m) {
+                            if (valid[m]) sum_exp += std::exp(terms[m] - max_term);
+                        }
+                        if (sum_exp > 0.0) {
+                            pll = max_term + std::log(sum_exp);
+                        }
+                    }
+                }
                 total_log_l += pattern.weight * pll;
                 if (out_pattern_ll) {
                     (*out_pattern_ll)[p] = pll;
@@ -1976,9 +2018,8 @@ public:
             #pragma omp for reduction(+:total_log_l) schedule(dynamic)
             for (size_t p = 0; p < num_patterns; ++p) {
                 const auto& pattern = aln.patterns[p];
-                Scalar pat_L = 0.0;
-
-                for (size_t m = 0; m < M; ++m) {
+                Scalar pll = -1e20;
+                if (M == 1) {
                     for (int32_t node_id : tree.post_order) {
                         const auto& node = tree.nodes[node_id];
                         if (node.is_leaf) {
@@ -1997,18 +2038,61 @@ public:
                             node_log_scale[node_id] = 0.0;
                         } else {
                             double child_scale_sum = 0.0;
-                            tree.eval_internal_node(node_id, P_mix[m], node_L, node_log_scale, node_L[node_id], child_scale_sum);
+                            tree.eval_internal_node(node_id, P_mix[0], node_L, node_log_scale, node_L[node_id], child_scale_sum);
                             node_log_scale[node_id] = child_scale_sum;
                         }
                     }
                     Scalar cond_L = aln.codon_frequencies_f3x4.dot(node_L[tree.root_id]);
-                    if (cond_L > 0.0 && node_log_scale[tree.root_id] != 0.0) {
-                        cond_L *= std::exp(node_log_scale[tree.root_id]);
+                    if (cond_L > 0.0) {
+                        pll = std::log(cond_L) + node_log_scale[tree.root_id];
                     }
-                    pat_L += syn_weights[m] * cond_L;
-                }
+                } else {
+                    Scalar max_term = -std::numeric_limits<Scalar>::infinity();
+                    std::vector<Scalar> terms(M);
+                    std::vector<bool> valid(M, false);
 
-                Scalar pll = (pat_L > 0.0) ? std::log(pat_L) : -1e20;
+                    for (size_t m = 0; m < M; ++m) {
+                        for (int32_t node_id : tree.post_order) {
+                            const auto& node = tree.nodes[node_id];
+                            if (node.is_leaf) {
+                                size_t t_idx = leaf_to_taxon[node_id];
+                                if (t_idx != static_cast<size_t>(-1)) {
+                                    int8_t state = pattern.states[t_idx];
+                                    if (state >= 0 && state < S) {
+                                        node_L[node_id].setZero();
+                                        node_L[node_id](state) = 1.0;
+                                    } else {
+                                        node_L[node_id].setOnes();
+                                    }
+                                } else {
+                                    node_L[node_id].setOnes();
+                                }
+                                node_log_scale[node_id] = 0.0;
+                            } else {
+                                double child_scale_sum = 0.0;
+                                tree.eval_internal_node(node_id, P_mix[m], node_L, node_log_scale, node_L[node_id], child_scale_sum);
+                                node_log_scale[node_id] = child_scale_sum;
+                            }
+                        }
+                        Scalar cond_L = aln.codon_frequencies_f3x4.dot(node_L[tree.root_id]);
+                        if (cond_L > 0.0) {
+                            Scalar term = std::log(syn_weights[m]) + std::log(cond_L) + node_log_scale[tree.root_id];
+                            terms[m] = term;
+                            valid[m] = true;
+                            if (term > max_term) max_term = term;
+                        }
+                    }
+
+                    if (max_term > -1e19) {
+                        Scalar sum_exp = 0.0;
+                        for (size_t m = 0; m < M; ++m) {
+                            if (valid[m]) sum_exp += std::exp(terms[m] - max_term);
+                        }
+                        if (sum_exp > 0.0) {
+                            pll = max_term + std::log(sum_exp);
+                        }
+                    }
+                }
                 total_log_l += pattern.weight * pll;
                 if (out_pattern_ll) {
                     (*out_pattern_ll)[p] = pll;
