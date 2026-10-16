@@ -39,18 +39,27 @@ static void print_relax_usage(const char* prog) {
               << "  " << Console::brand("--hyphaeon") << "           Opt-in: HyphAeon 384D transformer conductances (needs Python aeon-core)\n"
               << "  " << Console::brand("--embeddings") << " <file>  Path to precomputed [N x D] taxon embeddings TSV/CSV for Ohmic\n"
               << "  " << Console::brand("--code") << " <name>        Genetic code (default: Universal)\n"
-              << "  " << Console::brand("--test, --branches") << " <spec> Branch tag, names, or regex to mark as Test set (default: {TEST}/{T}/{FG})\n"
-              << "  " << Console::brand("--reference") << " <spec>   Branch tag, names, or regex to mark as Reference set (default: {REFERENCE}/{R}/{BG} or complement)\n"
+              << "  " << Console::brand("--test, --branches") << " <spec> Test set: tag present in tree (e.g. T, TEST, FG), or comma-separated exact\n"
+              << "                       branch names, or 'regex:<pattern>' (default: {TEST}/{T}/{FG} tags)\n"
+              << "  " << Console::brand("--reference") << " <spec>   Reference set, same syntax (default: {REFERENCE}/{R}/{BG} tags or complement)\n"
+              << "  " << Console::brand("--test-regex") << " <re>    Test set by case-insensitive regex on branch names/tags\n"
+              << "  " << Console::brand("--reference-regex") << " <re> Reference set by case-insensitive regex on branch names/tags\n"
               << "  " << Console::brand("--pvalue") << " <threshold> Significance threshold for LRT (default: 0.05)\n"
               << "  " << Console::brand("--threads") << " <N>        Number of OpenMP worker threads\n"
               << "  " << Console::brand("--output") << " <file>      Path to output JSON file (default: <alignment>.RELAX.json)\n"
               << "  " << Console::brand("--no-branch-opt") << "      Disable individual branch length refinement (use proportional scaling)\n"
+              << "  " << Console::brand("--joint-cycles") << " <N>   Max alternating (distribution <-> branch length) cycles (default: 5)\n"
+              << "  " << Console::brand("--relax-normalization") << " <shared|per-class>  Omega-class rate normalization (default: shared =\n"
+              << "                       one synonymous rate per branch, branch length = mixture expectation, as in HyPhy 2.5;\n"
+              << "                       per-class = legacy hyphy-3 behavior, for comparison)\n"
+              << "  " << Console::brand("--relax-mixture") << " <branch-site|site>  Omega mixture level (default: branch-site =\n"
+              << "                       P_b = sum_c w_c exp(Q_c t_b) per branch, as in HyPhy 2.5 BS-REL; site = legacy hyphy-3)\n"
               << "  " << Console::brand("--progress") << "           Force interactive progress bar\n"
               << "  " << Console::brand("--no-progress") << "        Disable progress bar\n"
               << "  " << Console::brand("--help, -h") << "           Show this help message\n\n"
               << Console::bold("Examples:") << "\n"
               << "  " << prog << " --alignment data/Fig4E.nex\n"
-              << "  " << prog << " --alignment data/gene.fna --tree data/gene.nwk --test \".*PSEUDOGENE.*\" --threads 8\n\n";
+              << "  " << prog << " --alignment data/gene.fna --tree data/gene.nwk --test-regex \"PSEUDOGENE\" --threads 8\n\n";
 }
 
 int run_relax(int argc, char* argv[]) {
@@ -107,6 +116,34 @@ int run_relax(int argc, char* argv[]) {
             output_file = argv[++i];
         } else if (arg == "--no-branch-opt" || arg == "--no-refine-branches") {
             settings.refine_branch_lengths = false;
+        } else if (arg == "--joint-cycles" && i + 1 < argc) {
+            settings.max_joint_cycles = std::max(1, std::stoi(argv[++i]));
+        } else if (arg == "--test-regex" && i + 1 < argc) {
+            settings.test_branch_regex = argv[++i];
+            settings.test_is_regex = true;
+        } else if (arg == "--reference-regex" && i + 1 < argc) {
+            settings.reference_branch_regex = argv[++i];
+            settings.reference_is_regex = true;
+        } else if (arg == "--relax-normalization" && i + 1 < argc) {
+            std::string norm = argv[++i];
+            if (norm == "per-class" || norm == "perclass") {
+                settings.normalization = RELAXNormalization::PerClass;
+            } else if (norm == "shared" || norm == "shared-mixture" || norm == "mixture") {
+                settings.normalization = RELAXNormalization::SharedMixture;
+            } else {
+                std::cerr << "Error: --relax-normalization must be 'per-class' or 'shared' (got '" << norm << "').\n";
+                return 1;
+            }
+        } else if (arg == "--relax-mixture" && i + 1 < argc) {
+            std::string lvl = argv[++i];
+            if (lvl == "site") {
+                settings.mixture_level = RELAXMixtureLevel::Site;
+            } else if (lvl == "branch-site" || lvl == "branchsite") {
+                settings.mixture_level = RELAXMixtureLevel::BranchSite;
+            } else {
+                std::cerr << "Error: --relax-mixture must be 'site' or 'branch-site' (got '" << lvl << "').\n";
+                return 1;
+            }
         } else if (arg == "--progress") {
             show_progress = true;
             force_progress = true;
@@ -198,6 +235,9 @@ int run_relax(int argc, char* argv[]) {
         card_items.push_back({"Unclassified Branches", std::to_string(relax.unclassified_branch_names.size()) + " branches"});
     }
     card_items.push_back({"Genetic Code", code->name});
+    card_items.push_back({"Omega Mixture",
+        std::string(settings.mixture_level == RELAXMixtureLevel::BranchSite ? "branch-site" : "site (legacy)") + ", " +
+        (settings.normalization == RELAXNormalization::SharedMixture ? "shared synonymous rate" : "per-class normalization (legacy)")});
     Panel::print_card("Dataset & Phylogeny", card_items);
 
     Panel::print_step(1, 3, "Fitting Baseline & Separate-Rates Codon Models", "GTR & MG94xREV");
