@@ -140,11 +140,13 @@ nlohmann::json ContrastFELAnalyzer::to_modern_json(
             if (has_background) col_beta_bg.push_back(r.beta_background);
             if (testable_groups.size() > 2 && num_pairs > 0) {
                 for (size_t pw_idx = 0; pw_idx < num_pairs; ++pw_idx) {
-                    if (pw_idx < r.pairwise.size()) {
-                        col_pw_lrt[pw_idx].push_back(r.pairwise[pw_idx].lrt);
-                        col_pw_pval[pw_idx].push_back(r.pairwise[pw_idx].p_value);
-                        col_pw_padj[pw_idx].push_back(r.pairwise[pw_idx].p_value_adjusted);
-                    }
+                    // Regularized/invariant sites carry no pairwise inference;
+                    // keep columns aligned with neutral placeholders (0 LRT, 1.0 p),
+                    // matching the legacy emitter's convention.
+                    bool has_pw = pw_idx < r.pairwise.size();
+                    col_pw_lrt[pw_idx].push_back(has_pw ? r.pairwise[pw_idx].lrt : 0.0);
+                    col_pw_pval[pw_idx].push_back(has_pw ? r.pairwise[pw_idx].p_value : 1.0);
+                    col_pw_padj[pw_idx].push_back(has_pw ? r.pairwise[pw_idx].p_value_adjusted : 1.0);
                 }
             }
         }
