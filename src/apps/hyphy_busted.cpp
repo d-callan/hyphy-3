@@ -452,8 +452,11 @@ int run_busted(int argc, char* argv[]) {
         Panel::print_summary_card("BUSTED-PH Phenotype Association Summary", sum_items, res.phenotype_verdict, res.phenotype_associated);
     } else {
         std::string conclusion;
-        bool is_sig = (res.p_value < 0.05);
-        if (is_sig) {
+        bool is_sig = false;
+        if (res.is_failed) {
+            conclusion = "FAILED: " + res.error_message;
+        } else if (res.p_value < 0.05) {
+            is_sig = true;
             conclusion = "STATISTICALLY SIGNIFICANT evidence of episodic diversifying selection (LRT = " + lrt_ss.str() + ", p = " + p_ss.str() + " < 0.05)!";
         } else {
             conclusion = "No statistically significant evidence of episodic diversifying selection (p = " + p_ss.str() + " >= 0.05).";
@@ -530,6 +533,11 @@ int run_busted(int argc, char* argv[]) {
                   << Console::brand(output_file) << "\n\n";
     } catch (const std::exception& e) {
         std::cerr << Console::danger("Warning: Failed to write JSON output: ") << e.what() << "\n";
+    }
+
+    if (res.is_failed) {
+        std::cerr << Console::danger("Error: BUSTED analysis failed to converge or likelihood underflowed.\n");
+        return 1;
     }
 
     return 0;

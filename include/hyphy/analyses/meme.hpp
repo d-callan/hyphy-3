@@ -311,7 +311,11 @@ public:
             auto opt_null = NelderMeadND<3>::minimize(obj_null, null_grid[0], lb_null, ub_null, 1e-4, 400, null_grid);
 
             Scalar log_l_null = -opt_null.f;
-            if (log_l_null > res.log_l_meme) {
+            if (log_l_null <= -1e10 || res.log_l_meme <= -1e10 || !std::isfinite(log_l_null) || !std::isfinite(res.log_l_meme)) {
+                res.lrt = 0.0;
+                res.p_value = 1.0;
+                res.branches_under_selection = 0;
+            } else if (log_l_null > res.log_l_meme) {
                 res.log_l_meme = log_l_null;
                 res.lrt = 0.0;
                 res.p_value = 2.0 / 3.0;

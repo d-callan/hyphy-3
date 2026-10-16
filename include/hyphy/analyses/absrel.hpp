@@ -1500,10 +1500,17 @@ public:
                 }
             }
 
-            Scalar lrt = 2.0 * (full_ll - null_ll);
-            if (lrt < 0.0) lrt = 0.0;
-            bres.lrt = lrt;
-            bres.uncorrected_p_value = compute_mixture_p_value(lrt);
+            Scalar lrt = 0.0;
+            if (null_ll <= -1e19 || full_ll <= -1e19 || !std::isfinite(null_ll) || !std::isfinite(full_ll)) {
+                lrt = 0.0;
+                bres.lrt = 0.0;
+                bres.uncorrected_p_value = 1.0;
+            } else {
+                lrt = 2.0 * (full_ll - null_ll);
+                if (lrt < 0.0) lrt = 0.0;
+                bres.lrt = lrt;
+                bres.uncorrected_p_value = compute_mixture_p_value(lrt);
+            }
 
             // Compute Empirical Bayes Factors per site
             size_t K = bres.rate_classes;

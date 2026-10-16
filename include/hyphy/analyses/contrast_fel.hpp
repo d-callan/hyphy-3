@@ -727,17 +727,24 @@ public:
         res.log_l_null = -pt_null.f;
 
         // Likelihood Ratio Test Calculations
-        Scalar raw_lrt = 2.0 * (res.log_l_alt - res.log_l_null);
-        if (raw_lrt < 0.0) raw_lrt = 0.0;
+        bool valid_fits = (res.log_l_alt > -1e10 && res.log_l_null > -1e10 && res.penalized_log_l_alt > -1e10 &&
+                           std::isfinite(res.log_l_alt) && std::isfinite(res.log_l_null) && std::isfinite(res.penalized_log_l_alt));
+        Scalar raw_lrt = 0.0;
+        Scalar penalized_lrt = 0.0;
+        if (valid_fits) {
+            raw_lrt = 2.0 * (res.log_l_alt - res.log_l_null);
+            if (raw_lrt < 0.0) raw_lrt = 0.0;
+            penalized_lrt = 2.0 * (res.penalized_log_l_alt - res.log_l_null);
+            if (penalized_lrt < 0.0) penalized_lrt = 0.0;
+        }
         res.raw_lrt = raw_lrt;
-
-        Scalar penalized_lrt = 2.0 * (res.penalized_log_l_alt - res.log_l_null);
-        if (penalized_lrt < 0.0) penalized_lrt = 0.0;
         res.penalized_lrt = penalized_lrt;
 
         // Asymptotic p-value from chi^2_{K-1}
         int df = static_cast<int>(K - 1);
-        if (df == 1) {
+        if (!valid_fits) {
+            res.p_value = 1.0;
+        } else if (df == 1) {
             res.p_value = std::erfc(std::sqrt(penalized_lrt / 2.0));
         } else {
             // Incomplete gamma chi^2 survival for df >= 2
@@ -821,10 +828,17 @@ public:
                     if (has_background) init_pw.back() = res.beta_background;
 
                     auto pt_pw = NelderMeadDynamic::minimize(obj_pw, init_pw, lb_pw, ub_pw, 1e-4, 80);
-                    Scalar pw_lrt = 2.0 * (res.penalized_log_l_alt - (-pt_pw.f));
-                    if (pw_lrt < 0.0) pw_lrt = 0.0;
-                    pw.lrt = pw_lrt;
-                    pw.p_value = std::erfc(std::sqrt(pw_lrt / 2.0));
+                    Scalar pw_fit_ll = -pt_pw.f;
+                    Scalar pw_lrt = 0.0;
+                    if (valid_fits && pw_fit_ll > -1e10 && std::isfinite(pw_fit_ll)) {
+                        pw_lrt = 2.0 * (res.penalized_log_l_alt - pw_fit_ll);
+                        if (pw_lrt < 0.0) pw_lrt = 0.0;
+                        pw.lrt = pw_lrt;
+                        pw.p_value = std::erfc(std::sqrt(pw_lrt / 2.0));
+                    } else {
+                        pw.lrt = 0.0;
+                        pw.p_value = 1.0;
+                    }
 
                     if (pw.beta_a < pw.beta_b) {
                         pw.direction = pw.name_a + " < " + pw.name_b;
