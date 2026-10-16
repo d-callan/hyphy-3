@@ -326,6 +326,26 @@ inline bool download_permitted() {
 
 }  // namespace detail
 
+// Cheap probe: true only when aeon-core imports AND the model weights are
+// already cached under HYPHY3_PYTHON (default python3), i.e. extract_embeddings
+// would succeed without a download prompt. Lets callers request HyphAeon only
+// when it can actually run (e.g. tests degrading gracefully in CI).
+inline bool is_available() {
+    try {
+        detail::TempDir tmp;
+        const auto script = tmp.path / "hyphaeon_check.py";
+        const auto log = tmp.path / "hyphaeon_check.log";
+        {
+            std::ofstream s(script);
+            s << helper_script();
+        }
+        const std::string python = detail::env_or("HYPHY3_PYTHON", "python3");
+        return detail::run_python(python, {script.string(), "--check"}, log) == kExitOk;
+    } catch (...) {
+        return false;
+    }
+}
+
 // Compute [N x 384] HyphAeon taxon embeddings for `aln`. Throws std::runtime_error with an
 // actionable message on any failure (missing interpreter, package, weights, or runtime error).
 inline Matrix extract_embeddings(const Alignment& aln) {
