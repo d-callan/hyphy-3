@@ -8,31 +8,27 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 # Optimization flags
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -Wall -Wextra")
 
-# Build-speed knobs -------------------------------------------------------------
-# Every executable here is a single translation unit that re-parses the same
-# multi-MB header stack (nlohmann/json, Eigen, core + analysis headers) at -O3.
-# These options exist because full rebuilds otherwise take many minutes and can
-# exhaust memory alongside an IDE's language server.
+# Build-speed options -----------------------------------------------------------
+# All targets share the same large header stack (nlohmann/json, Eigen, core and
+# analysis headers), so full builds parse it once per translation unit.
 #
-# - ccache: when present on PATH, identical TUs are served from cache, which
-#   makes rebuilds after header-touching merges nearly free. Install via
-#   `conda install -c conda-forge ccache` or the system package manager.
+# - ccache: if found on PATH, identical translation units are served from
+#   cache. Harmless when absent.
 find_program(HYPHY3_CCACHE_PROGRAM ccache)
 if(HYPHY3_CCACHE_PROGRAM)
     set(CMAKE_CXX_COMPILER_LAUNCHER "${HYPHY3_CCACHE_PROGRAM}")
 endif()
 #
-# - HYPHY3_FAST_COMPILE: optimizer passes dominate TU compile time on this code.
-#   -DHYPHY3_FAST_COMPILE=ON drops to -O1 for dev iteration. Release artifacts
-#   must still be built without it.
+# - HYPHY3_FAST_COMPILE=ON: compiles at -O1 for faster iteration builds.
+#   Release artifacts must be built without it.
 option(HYPHY3_FAST_COMPILE "Trade optimization for compile speed (dev builds)" OFF)
 if(HYPHY3_FAST_COMPILE)
     string(REGEX REPLACE "-O3" "-O1" CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
 endif()
 #
-# - HYPHY3_PCH (default ON): all executable targets reuse one shared
-#   precompiled header (see bottom of this file) so the stable header stack is
-#   parsed once instead of once per target. Set -DHYPHY3_PCH=OFF to disable.
+# - HYPHY3_PCH (default ON): precompile the stable part of the shared header
+#   stack once (src/pch.hpp) and reuse it for every target. Set
+#   -DHYPHY3_PCH=OFF to disable.
 option(HYPHY3_PCH "Shared precompiled header for all executable targets" ON)
 
 # Header-only Eigen 3.4.0
