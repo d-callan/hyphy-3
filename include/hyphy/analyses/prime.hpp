@@ -314,21 +314,13 @@ public:
 // PRIMEMatrix: Numerically Stabilized Property-Informed Codon Substitution Matrix
 // ============================================================================
 
-class PRIMEMatrix {
+// PRIMEMatrix extends MG94Matrix with the property-informed rate model. It
+// inherits the whole eigensystem layout (Q, pi, eigen*, U_pi, V_pi,
+// scale_factor, transition_matrix) so it can be passed to likelihood routines
+// as a const MG94Matrix& — a plain upcast, not a layout-dependent
+// reinterpret_cast.
+class PRIMEMatrix : public MG94Matrix {
 public:
-    Matrix Q;
-    Vector pi;
-    Vector sqrt_pi;
-    Vector inv_sqrt_pi;
-
-    Vector eigenvalues;
-    Matrix eigenvectors;
-    Matrix inv_eigenvectors;
-    Matrix U_pi;
-    Matrix V_pi;
-
-    Scalar scale_factor = 1.0;
-
     // Updates Q and performs exact self-adjoint eigendecomposition
     void update(
         Scalar alpha,
@@ -415,11 +407,6 @@ public:
         inv_eigenvectors = eigenvectors.transpose();
         U_pi = inv_sqrt_pi.asDiagonal() * eigenvectors;
         V_pi = inv_eigenvectors * sqrt_pi.asDiagonal();
-    }
-
-    Matrix transition_matrix(Scalar branch_length) const {
-        Vector exp_lambda = (eigenvalues * branch_length).array().exp();
-        return (U_pi * exp_lambda.asDiagonal()) * V_pi;
     }
 };
 
@@ -753,7 +740,7 @@ public:
                     Scalar lnl = FELAnalyzer::compute_pattern_log_likelihood(
                         tree, aln.patterns[p], leaf_to_taxon,
                         // Passing dummy MG94 with same pi
-                        reinterpret_cast<const MG94Matrix&>(pm),
+                        static_cast<const MG94Matrix&>(pm),
                         P_branches, thread_node_L, thread_node_scale
                     );
                     total_lnl += aln.patterns[p].weight * lnl;
@@ -1097,7 +1084,7 @@ private:
 
             return FELAnalyzer::compute_pattern_log_likelihood(
                 tree, pattern, leaf_to_taxon,
-                reinterpret_cast<const MG94Matrix&>(pm),
+                static_cast<const MG94Matrix&>(pm),
                 P_branches, thread_node_L, thread_node_scale
             );
         };

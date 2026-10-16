@@ -374,7 +374,7 @@ public:
     struct ColumnMeta {
         std::string type;         // "integer" | "number" | "string"
         std::string description;
-        std::string unit;         // optional
+        std::string unit = "";    // optional
 
         nlohmann::json to_json() const {
             nlohmann::json m{{"type", type}, {"description", description}};
