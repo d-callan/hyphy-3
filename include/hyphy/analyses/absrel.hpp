@@ -11,6 +11,7 @@
 #include "nlohmann/json.hpp"
 #include "hyphy/core/provenance.hpp"
 #include "hyphy/core/json_output.hpp"
+#include "hyphy/core/stats.hpp"
 
 #include <vector>
 #include <string>
@@ -288,21 +289,12 @@ public:
 
     // AICc helper: N = num_sequences * num_codons
     Scalar compute_aicc(Scalar log_l, size_t num_params) const {
-        Scalar N = static_cast<Scalar>(aln.num_taxa * aln.num_codons);
-        Scalar P = static_cast<Scalar>(num_params);
-        if (N - P - 1.0 > 0.0) {
-            return -2.0 * log_l + 2.0 * P + (2.0 * P * (P + 1.0)) / (N - P - 1.0);
-        }
-        return -2.0 * log_l + 2.0 * P;
+        return hyphy::core::stats::compute_aicc(log_l, num_params, aln.num_taxa * aln.num_codons);
     }
 
     // Asymptotic p-value for mixture distribution: 0.5 * [0.4 * chi2_1 + 0.6 * chi2_2]
     static Scalar compute_mixture_p_value(Scalar lrt) {
-        if (lrt <= 0.0) return 1.0;
-        Scalar p_chi1 = std::erfc(std::sqrt(lrt / 2.0));
-        Scalar p_chi2 = std::exp(-lrt / 2.0);
-        Scalar p = 0.5 * (0.4 * p_chi1 + 0.6 * p_chi2);
-        return std::clamp(p, 0.0, 1.0);
+        return hyphy::core::stats::mixture_chi2_p_value(lrt, 0.20, 0.30);
     }
 
     // Phase 1: Fit GTR
@@ -1290,21 +1282,14 @@ public:
         // Phase 6: Holm-Bonferroni correction
         if (progress_cb) progress_cb("Phase 6: Multiple Testing Correction", 0.95);
         size_t m = to_test.size();
-        std::vector<size_t> p_indices(m);
-        std::iota(p_indices.begin(), p_indices.end(), 0);
-        std::sort(p_indices.begin(), p_indices.end(), [&](size_t i, size_t j) {
-            return result.branches[to_test[i]].uncorrected_p_value <
-                   result.branches[to_test[j]].uncorrected_p_value;
-        });
-
-        Scalar running_max = 0.0;
-        for (size_t rank = 0; rank < m; ++rank) {
-            size_t idx = p_indices[rank];
-            const std::string& bname = to_test[idx];
-            Scalar raw_p = result.branches[bname].uncorrected_p_value;
-            Scalar adj_p = (m - rank) * raw_p;
-            running_max = std::max(running_max, adj_p);
-            Scalar final_p = std::min(1.0, running_max);
+        std::vector<Scalar> raw_p_vals(m);
+        for (size_t i = 0; i < m; ++i) {
+            raw_p_vals[i] = result.branches[to_test[i]].uncorrected_p_value;
+        }
+        std::vector<Scalar> corr_p_vals = hyphy::core::stats::holm_bonferroni(raw_p_vals);
+        for (size_t i = 0; i < m; ++i) {
+            const std::string& bname = to_test[i];
+            Scalar final_p = corr_p_vals[i];
             result.branches[bname].corrected_p_value = final_p;
             if (final_p <= settings.p_threshold) {
                 result.branches[bname].is_positive = true;

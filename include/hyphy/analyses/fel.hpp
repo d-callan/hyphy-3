@@ -8,6 +8,7 @@
 #include "hyphy/core/progress_bar.hpp"
 #include "hyphy/core/provenance.hpp"
 #include "hyphy/core/json_output.hpp"
+#include "hyphy/core/ancestral.hpp"
 #include "hyphy/analyses/site_visualizer.hpp"
 #include "LBFGSB.h"
 #include "hyphy/opt/nelder_mead.hpp"
@@ -671,121 +672,17 @@ public:
         int S = code.num_sense_codons;
         size_t num_nodes = tree.num_nodes();
 
-        // 1. Check if pattern is constant across all observed taxa
-        int8_t const_codon = -1;
-        bool is_constant = true;
-        for (size_t node_id = 0; node_id < num_nodes; ++node_id) {
-            if (tree.nodes[node_id].is_leaf) {
-                size_t t_idx = leaf_to_taxon[node_id];
-                if (t_idx != static_cast<size_t>(-1)) {
-                    int8_t st = pattern.states[t_idx];
-                    if (st >= 0 && st < S) {
-                        if (const_codon == -1) {
-                            const_codon = st;
-                        } else if (const_codon != st) {
-                            is_constant = false;
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-
-        if (is_constant && const_codon >= 0) {
-            subs.root_codon = code.sense_codons[const_codon];
-            subs.root_aa = code.sense_codon_aa[const_codon];
+        auto vit = hyphy::core::ancestral::reconstruct_viterbi_states(
+            tree, pattern, leaf_to_taxon, branch_transition_matrices, base_mg94_matrix.pi, S
+        );
+        subs.root_codon = code.sense_codons[vit.root_state];
+        subs.root_aa = code.sense_codon_aa[vit.root_state];
+        if (vit.is_constant) {
             subs.summary_string = "Conserved";
             subs.summary_string_partitioned = "Conserved";
             return subs;
         }
-
-        // 2. Upward max-product pass
-        std::vector<std::vector<Scalar>> M_node(num_nodes, std::vector<Scalar>(S, 1.0));
-        std::vector<std::vector<int8_t>> backpointer(num_nodes, std::vector<int8_t>(S, 0));
-        std::vector<std::vector<Scalar>> val_node(num_nodes, std::vector<Scalar>(S, 1.0));
-
-        for (int32_t node_id : tree.post_order) {
-            const auto& node = tree.nodes[node_id];
-            if (node.is_leaf) {
-                size_t t_idx = leaf_to_taxon[node_id];
-                int8_t st = (t_idx != static_cast<size_t>(-1)) ? pattern.states[t_idx] : -1;
-                if (st >= 0 && st < S) {
-                    for (int c = 0; c < S; ++c) {
-                        M_node[node_id][c] = (c == st) ? 1.0 : 0.0;
-                    }
-                } else {
-                    for (int c = 0; c < S; ++c) {
-                        M_node[node_id][c] = 1.0;
-                    }
-                }
-            }
-
-            if (node_id != tree.root_id) {
-                const Matrix& P = branch_transition_matrices[node_id];
-                Scalar max_val = 0.0;
-                for (int p_state = 0; p_state < S; ++p_state) {
-                    Scalar best_score = -1.0;
-                    int8_t best_c = 0;
-                    for (int c = 0; c < S; ++c) {
-                        Scalar score = P(p_state, c) * M_node[node_id][c];
-                        if (score > best_score) {
-                            best_score = score;
-                            best_c = static_cast<int8_t>(c);
-                        }
-                    }
-                    backpointer[node_id][p_state] = best_c;
-                    val_node[node_id][p_state] = std::max(best_score, 0.0);
-                    if (val_node[node_id][p_state] > max_val) {
-                        max_val = val_node[node_id][p_state];
-                    }
-                }
-
-                // Underflow scaling
-                if (max_val > 0.0) {
-                    Scalar scale = 1.0 / max_val;
-                    for (int p_state = 0; p_state < S; ++p_state) {
-                        val_node[node_id][p_state] *= scale;
-                    }
-                }
-
-                // Multiply into parent's M_node
-                int32_t parent_id = node.parent_id;
-                for (int p_state = 0; p_state < S; ++p_state) {
-                    M_node[parent_id][p_state] *= val_node[node_id][p_state];
-                }
-            }
-        }
-
-        // 3. Optimal root state
-        int8_t root_state = 0;
-        Scalar best_root_score = -1.0;
-        for (int c = 0; c < S; ++c) {
-            Scalar score = base_mg94_matrix.pi(c) * M_node[tree.root_id][c];
-            if (score > best_root_score) {
-                best_root_score = score;
-                root_state = static_cast<int8_t>(c);
-            }
-        }
-
-        // 4. Downward traceback
-        std::vector<int8_t> reconstructed_states(num_nodes, -1);
-        reconstructed_states[tree.root_id] = root_state;
-
-        subs.root_codon = code.sense_codons[root_state];
-        subs.root_aa = code.sense_codon_aa[root_state];
-
-        std::vector<int32_t> stack;
-        stack.push_back(tree.root_id);
-        while (!stack.empty()) {
-            int32_t curr = stack.back();
-            stack.pop_back();
-
-            for (int32_t child_id : tree.nodes[curr].children) {
-                int8_t parent_st = reconstructed_states[curr];
-                reconstructed_states[child_id] = backpointer[child_id][parent_st];
-                stack.push_back(child_id);
-            }
-        }
+        const auto& reconstructed_states = vit.node_states;
 
         // 5. Collect substitution events
         Scalar total_surprise = 0.0;

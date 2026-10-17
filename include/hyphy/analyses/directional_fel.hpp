@@ -8,6 +8,8 @@
 #include "hyphy/core/progress_bar.hpp"
 #include "hyphy/core/provenance.hpp"
 #include "hyphy/core/json_output.hpp"
+#include "hyphy/core/stats.hpp"
+#include "hyphy/core/ancestral.hpp"
 #include "hyphy/analyses/site_visualizer.hpp"
 #include "hyphy/opt/nelder_mead.hpp"
 #include "hyphy/opt/optimizer.hpp"
@@ -38,75 +40,9 @@ using namespace hyphy::opt;
 // Mathematical Statistical Utilities (Regularized Incomplete Gamma & Chi2)
 // ============================================================================
 
-inline double regularized_gamma_p(double a, double z) {
-    if (z <= 0.0) return 0.0;
-    if (a <= 0.0) return 1.0;
-    if (z < a + 1.0) {
-        double sum = 1.0 / a;
-        double term = sum;
-        for (int n = 1; n < 200; ++n) {
-            term *= z / (a + n);
-            sum += term;
-            if (std::abs(term) < std::abs(sum) * 1e-15) break;
-        }
-        return sum * std::exp(-z + a * std::log(z) - std::lgamma(a));
-    }
-    double tiny = 1e-30;
-    double b = z + 1.0 - a;
-    double c = 1.0 / tiny;
-    double d = 1.0 / b;
-    double h = d;
-    for (int i = 1; i < 200; ++i) {
-        double an = -i * (i - a);
-        b += 2.0;
-        d = an * d + b;
-        if (std::abs(d) < tiny) d = tiny;
-        c = b + an / c;
-        if (std::abs(c) < tiny) c = tiny;
-        d = 1.0 / d;
-        double del = d * c;
-        h *= del;
-        if (std::abs(del - 1.0) < 1e-15) break;
-    }
-    double q = std::exp(-z + a * std::log(z) - std::lgamma(a)) * h;
-    return std::max(0.0, std::min(1.0, 1.0 - q));
-}
-
-inline double regularized_gamma_q(double a, double z) {
-    if (z <= 0.0) return 1.0;
-    if (a <= 0.0) return 0.0;
-    if (z < a + 1.0) {
-        return std::max(0.0, std::min(1.0, 1.0 - regularized_gamma_p(a, z)));
-    }
-    double tiny = 1e-30;
-    double b = z + 1.0 - a;
-    double c = 1.0 / tiny;
-    double d = 1.0 / b;
-    double h = d;
-    for (int i = 1; i < 200; ++i) {
-        double an = -i * (i - a);
-        b += 2.0;
-        d = an * d + b;
-        if (std::abs(d) < tiny) d = tiny;
-        c = b + an / c;
-        if (std::abs(c) < tiny) c = tiny;
-        d = 1.0 / d;
-        double del = d * c;
-        h *= del;
-        if (std::abs(del - 1.0) < 1e-15) break;
-    }
-    double q = std::exp(-z + a * std::log(z) - std::lgamma(a)) * h;
-    return std::max(0.0, std::min(1.0, q));
-}
-
-inline double chi2_p_value(double chi2, double df) {
-    if (chi2 <= 0.0) return 1.0;
-    if (df <= 0.0) return 1.0;
-    if (df == 1.0) {
-        return std::erfc(std::sqrt(chi2 / 2.0));
-    }
-    return regularized_gamma_q(df / 2.0, chi2 / 2.0);
-}
+using hyphy::core::stats::regularized_gamma_p;
+using hyphy::core::stats::regularized_gamma_q;
+using hyphy::core::stats::chi2_p_value;
 
 // ============================================================================
 // Data Structures for Directional FEL
@@ -1304,101 +1240,16 @@ public:
         int S = gcode.num_sense_codons;
         size_t num_nodes = tree.num_nodes();
 
-        // 1. Check if constant
-        int8_t const_codon = -1;
-        bool is_constant = true;
-        for (size_t nid = 0; nid < num_nodes; ++nid) {
-            if (tree.nodes[nid].is_leaf) {
-                size_t t_idx = leaf_to_taxon[nid];
-                if (t_idx != static_cast<size_t>(-1)) {
-                    int8_t st = pattern.states[t_idx];
-                    if (st >= 0 && st < S) {
-                        if (const_codon == -1) const_codon = st;
-                        else if (const_codon != st) { is_constant = false; break; }
-                    }
-                }
-            }
-        }
-
-        if (is_constant && const_codon >= 0) {
-            subs.root_codon = gcode.sense_codons[const_codon];
-            subs.root_aa = gcode.sense_codon_aa[const_codon];
+        auto vit = hyphy::core::ancestral::reconstruct_viterbi_states(
+            tree, pattern, leaf_to_taxon, branch_transition_matrices, root_frequencies, S
+        );
+        subs.root_codon = gcode.sense_codons[vit.root_state];
+        subs.root_aa = gcode.sense_codon_aa[vit.root_state];
+        if (vit.is_constant) {
             subs.summary_string = "Conserved";
             return subs;
         }
-
-        // 2. Upward max-product pass
-        std::vector<std::vector<Scalar>> M_node(num_nodes, std::vector<Scalar>(S, 1.0));
-        std::vector<std::vector<int8_t>> backpointer(num_nodes, std::vector<int8_t>(S, 0));
-        std::vector<std::vector<Scalar>> val_node(num_nodes, std::vector<Scalar>(S, 1.0));
-
-        for (int32_t nid : tree.post_order) {
-            const auto& node = tree.nodes[nid];
-            if (node.is_leaf) {
-                size_t t_idx = leaf_to_taxon[nid];
-                int8_t st = (t_idx != static_cast<size_t>(-1)) ? pattern.states[t_idx] : -1;
-                for (int c = 0; c < S; ++c) {
-                    M_node[nid][c] = (st < 0 || c == st) ? 1.0 : 0.0;
-                }
-            }
-
-            if (nid != tree.root_id) {
-                const Matrix& P = branch_transition_matrices[nid];
-                Scalar max_val = 0.0;
-                for (int p_st = 0; p_st < S; ++p_st) {
-                    Scalar best_score = -1.0;
-                    int8_t best_c = 0;
-                    for (int c = 0; c < S; ++c) {
-                        Scalar score = P(p_st, c) * M_node[nid][c];
-                        if (score > best_score) {
-                            best_score = score;
-                            best_c = static_cast<int8_t>(c);
-                        }
-                    }
-                    backpointer[nid][p_st] = best_c;
-                    val_node[nid][p_st] = std::max(best_score, 0.0);
-                    if (val_node[nid][p_st] > max_val) max_val = val_node[nid][p_st];
-                }
-
-                if (max_val > 0.0) {
-                    Scalar scale = 1.0 / max_val;
-                    for (int p_st = 0; p_st < S; ++p_st) val_node[nid][p_st] *= scale;
-                }
-
-                int32_t p_id = node.parent_id;
-                for (int p_st = 0; p_st < S; ++p_st) {
-                    M_node[p_id][p_st] *= val_node[nid][p_st];
-                }
-            }
-        }
-
-        // 3. Optimal root state
-        int8_t root_state = 0;
-        Scalar best_root_score = -1.0;
-        for (int c = 0; c < S; ++c) {
-            Scalar score = root_frequencies(c) * M_node[tree.root_id][c];
-            if (score > best_root_score) {
-                best_root_score = score;
-                root_state = static_cast<int8_t>(c);
-            }
-        }
-
-        // 4. Downward traceback
-        std::vector<int8_t> reconstructed(num_nodes, -1);
-        reconstructed[tree.root_id] = root_state;
-        subs.root_codon = gcode.sense_codons[root_state];
-        subs.root_aa = gcode.sense_codon_aa[root_state];
-
-        std::vector<int32_t> stack = {tree.root_id};
-        while (!stack.empty()) {
-            int32_t curr = stack.back();
-            stack.pop_back();
-            for (int32_t ch : tree.nodes[curr].children) {
-                int8_t p_st = reconstructed[curr];
-                reconstructed[ch] = backpointer[ch][p_st];
-                stack.push_back(ch);
-            }
-        }
+        const auto& reconstructed = vit.node_states;
 
         // 5. Collect substitution events
         auto count_gc = [](const std::string& codon) -> int {

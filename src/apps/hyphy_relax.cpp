@@ -1,11 +1,6 @@
 #include "hyphy/core/types.hpp"
-#include "hyphy/core/genetic_code.hpp"
-#include "hyphy/core/alignment.hpp"
-#include "hyphy/core/tree.hpp"
-#include "hyphy/core/ohmic_network.hpp"
-#include "hyphy/core/console.hpp"
+#include "hyphy/core/cli_common.hpp"
 #include "hyphy/analyses/relax.hpp"
-#include "hyphy/analyses/tree_engine.hpp"
 
 #include <iostream>
 #include <fstream>
@@ -13,9 +8,6 @@
 #include <vector>
 #include <chrono>
 #include <iomanip>
-#ifdef _OPENMP
-#include <omp.h>
-#endif
 
 using namespace hyphy::core;
 using namespace hyphy::analyses;
@@ -48,6 +40,7 @@ static void print_relax_usage(const char* prog) {
               << "  " << Console::brand("--pvalue") << " <threshold> Significance threshold for LRT (default: 0.05)\n"
               << "  " << Console::brand("--threads") << " <N>        Number of OpenMP worker threads\n"
               << "  " << Console::brand("--output") << " <file>      Path to output JSON file (default: <alignment>.RELAX.json)\n"
+              << "  " << Console::brand("--html") << " <file>        Also write a self-contained interactive HTML report\n"
               << "  " << Console::brand("--no-branch-opt") << "      Disable individual branch length refinement (use proportional scaling)\n"
               << "  " << Console::brand("--joint-cycles") << " <N>   Max alternating (distribution <-> branch length) cycles (default: 5)\n"
               << "  " << Console::brand("--relax-normalization") << " <shared|per-class>  Omega-class rate normalization (default: shared =\n"
@@ -65,57 +58,21 @@ static void print_relax_usage(const char* prog) {
 }
 
 int run_relax(int argc, char* argv[]) {
-    std::string alignment_file;
-    std::string tree_file;
-    std::string output_file;
-    std::string code_name = "Universal";
-    std::string embeddings_file;
-    int num_threads = 0;
-    JSONFormat json_format = JSONFormat::ModernV3;
+    CommonCLIOptions cli;
     RELAXSettings settings;
-    bool show_progress = ProgressBar::is_terminal();
-    bool force_progress = false;
-    bool use_ohmic = false;
-    bool use_hyphaeon = false;
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
-        if (arg == "--alignment" && i + 1 < argc) {
-            alignment_file = argv[++i];
-        } else if (arg == "--tree" && i + 1 < argc) {
-            tree_file = argv[++i];
-        } else if (arg == "--ohmic" || arg == "--omhic") {
-            use_ohmic = true;
-        } else if (arg == "--hyphaeon") {
-            use_hyphaeon = true;
-        } else if (arg == "--no-hyphaeon") {
-            use_hyphaeon = false;
-        } else if (arg == "--embeddings" && i + 1 < argc) {
-            embeddings_file = argv[++i];
-            use_ohmic = true;
-        } else if (arg == "--code" && i + 1 < argc) {
-            code_name = argv[++i];
-        } else if ((arg == "--test" || arg == "--branches") && i + 1 < argc) {
+        auto status = parse_common_cli_arg(i, argc, argv, cli);
+        if (status == CommonArgParseStatus::Handled) continue;
+        if (status == CommonArgParseStatus::Error) return 1;
+
+        if ((arg == "--test" || arg == "--branches") && i + 1 < argc) {
             settings.test_branch_regex = argv[++i];
         } else if (arg == "--reference" && i + 1 < argc) {
             settings.reference_branch_regex = argv[++i];
-        } else if (arg == "--pvalue" && i + 1 < argc) {
+        } else if ((arg == "--pvalue" || arg == "-p") && i + 1 < argc) {
             settings.p_value_threshold = std::stod(argv[++i]);
-        } else if (arg == "--threads" && i + 1 < argc) {
-            num_threads = std::stoi(argv[++i]);
-        } else if (arg == "--json-format" && i + 1 < argc) {
-            std::string fmt = argv[++i];
-            if (!parse_json_format(fmt, json_format)) {
-                std::cerr << Console::danger("Error: unknown --json-format '") << fmt
-                          << "'. Expected 'modern' or 'legacy'.\n";
-                return 1;
-            }
-        } else if (arg == "--legacy-json") {
-            json_format = JSONFormat::Legacy;
-        } else if (arg == "--modern-json") {
-            json_format = JSONFormat::ModernV3;
-        } else if (arg == "--output" && i + 1 < argc) {
-            output_file = argv[++i];
         } else if (arg == "--no-branch-opt" || arg == "--no-refine-branches") {
             settings.refine_branch_lengths = false;
         } else if (arg == "--joint-cycles" && i + 1 < argc) {
@@ -146,12 +103,6 @@ int run_relax(int argc, char* argv[]) {
                 std::cerr << "Error: --relax-mixture must be 'site' or 'branch-site' (got '" << lvl << "').\n";
                 return 1;
             }
-        } else if (arg == "--progress") {
-            show_progress = true;
-            force_progress = true;
-        } else if (arg == "--no-progress") {
-            show_progress = false;
-            force_progress = false;
         } else if (arg == "--help" || arg == "-h") {
             print_relax_usage(argv[0]);
             return 0;
@@ -162,61 +113,29 @@ int run_relax(int argc, char* argv[]) {
         }
     }
 
-    if (alignment_file.empty()) {
+    if (cli.alignment_file.empty()) {
         std::cerr << "Error: --alignment is required.\n\n";
         print_relax_usage(argv[0]);
         return 1;
     }
 
-#ifdef _OPENMP
-    if (num_threads > 0) {
-        omp_set_num_threads(num_threads);
-    }
-#endif
-
-    if (output_file.empty()) {
-        output_file = alignment_file + ".RELAX.json";
-    }
-
+    finalize_common_cli_options(cli, ".RELAX.json");
     print_relax_banner();
 
     auto start_time = std::chrono::high_resolution_clock::now();
     std::string start_iso = Provenance::current_iso8601();
-    std::string cli_cmd = argv[0];
-    for (int i = 1; i < argc; ++i) {
-        cli_cmd += " ";
-        cli_cmd += argv[i];
-    }
+    std::string cli_cmd = join_cli_command(argc, argv);
 
-    // 1. Load Genetic Code
-    std::shared_ptr<const GeneticCode> code;
-    try {
-        code = GeneticCode::from_name(code_name);
-    } catch (const std::exception& e) {
-        std::cerr << Console::danger("Error: Unknown genetic code '") << code_name << "'.\n";
+    LoadedCodonDataset ds;
+    if (!load_codon_dataset(cli, ds, false)) {
         return 1;
     }
+    auto& code = ds.gcode;
+    auto& aln = ds.aln;
+    auto& tree = ds.tree;
+    const auto& tree_source = ds.tree_source;
 
-    // 2. Load Alignment
-    Alignment aln;
-    try {
-        aln = Alignment::load(alignment_file, code);
-    } catch (const std::exception& e) {
-        std::cerr << Console::danger("Error loading alignment: ") << e.what() << "\n";
-        return 1;
-    }
-
-    // 3. Load or Infer Tree (supports --tree auto / --ohmic and tree-free FASTA alignments)
-    Tree tree;
-    std::string tree_source;
-    try {
-        tree = TreeEngine::resolve_tree(aln, tree_file, use_ohmic, use_hyphaeon, embeddings_file, &tree_source);
-    } catch (const std::exception& e) {
-        std::cerr << Console::danger("Error resolving phylogeny: ") << e.what() << "\n";
-        return 1;
-    }
-
-    // 4. Initialize and Run RELAX
+    // Initialize and Run RELAX
     auto relax = RELAXAnalyzer::create(tree, aln, settings);
 
     if (relax.test_branch_names.empty()) {
@@ -225,7 +144,7 @@ int run_relax(int argc, char* argv[]) {
     }
 
     std::vector<std::pair<std::string, std::string>> card_items = {
-        {"Alignment File", alignment_file},
+        {"Alignment File", cli.alignment_file},
         {"Sequences / Taxa", std::to_string(aln.num_taxa)},
         {"Codon Sites", std::to_string(aln.num_codons) + " (" + std::to_string(aln.num_codons * 3) + " nt)"},
         {"Unique Patterns", std::to_string(aln.patterns.size())},
@@ -245,7 +164,7 @@ int run_relax(int argc, char* argv[]) {
     Panel::print_step(1, 3, "Fitting Baseline & Separate-Rates Codon Models", "GTR & MG94xREV");
 
     std::function<void(const std::string&, double)> progress_cb = nullptr;
-    if (!show_progress && !force_progress) {
+    if (!cli.show_progress && !cli.force_progress) {
         progress_cb = [](const std::string& stage, double frac) {
             std::cout << "  " << Console::muted("↳ [") << std::setw(3) << static_cast<int>(frac * 100) 
                       << Console::muted("%] ") << stage << std::endl;
@@ -255,7 +174,7 @@ int run_relax(int argc, char* argv[]) {
     Panel::print_step(2, 3, "Running RELAX Inference Pipeline", 
                       settings.refine_branch_lengths ? "Two-loop L-BFGS branch refinement enabled" : "Proportional branch scaling");
 
-    auto res = relax.run(progress_cb, show_progress, force_progress);
+    auto res = relax.run(progress_cb, cli.show_progress, cli.force_progress);
 
     // Rate distributions
     Table rate_table;
@@ -308,7 +227,7 @@ int run_relax(int argc, char* argv[]) {
         conclusion = "No significant evidence of relaxation or intensification (p = " + p_ss.str() + " > " + std::to_string(settings.p_value_threshold) + ")";
     }
 
-    std::string json_desc = (json_format == JSONFormat::Legacy) ? " [Legacy]" : " [Modern v3.0]";
+    std::string json_desc = (cli.json_format == JSONFormat::Legacy) ? " [Legacy]" : " [Modern v3.0]";
     std::vector<std::pair<std::string, std::string>> sum_items = {
         {"Relaxation Parameter (K)", k_ss.str()},
         {"Likelihood Ratio Test (LRT)", lrt_ss.str()},
@@ -317,57 +236,34 @@ int run_relax(int argc, char* argv[]) {
         {"RELAX Null (K=1) Log-L", null_ss.str()},
         {"Nucleotide GTR Log-L", gtr_ss.str()},
         {"Separate Rates MG94xREV", mg_ss.str()},
-        {"JSON Output File", output_file + json_desc},
+        {"JSON Output File", cli.output_file + json_desc},
         {"Total Execution Time", time_ss.str()}
     };
 
     Panel::print_summary_card("RELAX Selection Relaxation Analysis Summary", sum_items, conclusion, res.is_significant);
 
-    // Build Provenance
-    Provenance prov;
-    prov.invocation.cli_command = cli_cmd;
-    prov.invocation.working_directory = Provenance::get_cwd();
-    prov.invocation.arguments["alignment"] = alignment_file;
-    if (!tree_file.empty()) prov.invocation.arguments["tree"] = tree_file;
-    prov.invocation.arguments["code"] = code_name;
-    prov.invocation.arguments["test"] = settings.test_branch_regex;
-    prov.invocation.arguments["pvalue"] = std::to_string(settings.p_value_threshold);
-    prov.invocation.arguments["refine_branch_lengths"] = settings.refine_branch_lengths ? "true" : "false";
-    prov.invocation.arguments["json_format"] = (json_format == JSONFormat::Legacy) ? "legacy" : "modern_v3";
-
-    size_t aln_sz = 0;
-    std::string aln_hash = crypto::SHA256::hash_file(alignment_file, &aln_sz);
-    prov.inputs["alignment"] = {alignment_file, "FASTA/NEXUS", aln_hash, aln_sz};
-
-    if (!tree_file.empty() && !TreeEngine::is_auto_tree_spec(tree_file) && !TreeEngine::is_ohmic_tree_spec(tree_file)) {
-        size_t tree_sz = 0;
-        std::string tree_hash = crypto::SHA256::hash_file(tree_file, &tree_sz);
-        prov.inputs["tree"] = {tree_file, "Newick", tree_hash, tree_sz};
-    }
-
     auto end_time = std::chrono::high_resolution_clock::now();
     double total_runtime = std::chrono::duration<double>(end_time - start_time).count();
 
-    prov.execution.start_time = start_iso;
-    prov.execution.end_time = Provenance::current_iso8601();
-    prov.execution.wall_time_seconds = total_runtime;
-#ifdef _OPENMP
-    prov.execution.cpu_threads = (num_threads > 0) ? num_threads : omp_get_max_threads();
-#else
-    prov.execution.cpu_threads = 1;
-#endif
-    prov.execution.hostname = Provenance::get_hostname();
-    prov.execution.os = Provenance::detect_os();
-    prov.execution.compiler = Provenance::detect_compiler();
+    Provenance prov = build_cli_provenance(cli, cli_cmd, start_iso, total_runtime, {
+        {"test", settings.test_branch_regex},
+        {"pvalue", std::to_string(settings.p_value_threshold)},
+        {"refine_branch_lengths", settings.refine_branch_lengths ? "true" : "false"}
+    });
 
-    // Save JSON
+    // Save JSON (and optional HTML)
     try {
-        res.save_json(output_file, tree, aln, json_format, prov);
-        std::string fmt_desc = (json_format == JSONFormat::Legacy) ? "Legacy Datamonkey JSON" : "Modern HyPhy v3.0 JSON";
+        res.save_json(cli.output_file, tree, aln, cli.json_format, prov);
+        std::string fmt_desc = (cli.json_format == JSONFormat::Legacy) ? "Legacy Datamonkey JSON" : "Modern HyPhy v3.0 JSON";
         std::cout << Console::success("✔") << " " << Console::bold("Saved " + fmt_desc + " report to: ")
-                  << Console::brand(output_file) << "\n\n";
+                  << Console::brand(cli.output_file) << "\n\n";
+        if (!cli.html_file.empty()) {
+            hyphy::report::write_html_report(cli.output_file, cli.html_file);
+            std::cout << Console::success("✔") << " " << Console::bold("Saved HTML report to: ")
+                      << Console::brand(cli.html_file) << "\n\n";
+        }
     } catch (const std::exception& e) {
-        std::cerr << Console::danger("Warning: Failed to write JSON output: ") << e.what() << "\n";
+        std::cerr << Console::danger("Warning: Failed to write output: ") << e.what() << "\n";
     }
 
     if (res.is_failed) {

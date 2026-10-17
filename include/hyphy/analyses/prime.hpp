@@ -8,6 +8,7 @@
 #include "hyphy/core/progress_bar.hpp"
 #include "hyphy/core/provenance.hpp"
 #include "hyphy/core/json_output.hpp"
+#include "hyphy/core/stats.hpp"
 #include "hyphy/opt/nelder_mead.hpp"
 #include "hyphy/opt/optimizer.hpp"
 #include "hyphy/analyses/fel.hpp"
@@ -909,20 +910,13 @@ public:
 
         // Hierarchical False Discovery Rate (HRFDR) Corrections
         // Stage 1: Benjamini-Hochberg FDR on Omnibus p-values
-        std::vector<std::pair<Scalar, size_t>> p_val_order;
-        p_val_order.reserve(num_codons);
+        std::vector<Scalar> omnibus_p_vals(num_codons);
         for (size_t site = 0; site < num_codons; ++site) {
-            p_val_order.emplace_back(site_results[site].omnibus_p_value, site);
+            omnibus_p_vals[site] = site_results[site].omnibus_p_value;
         }
-        std::sort(p_val_order.begin(), p_val_order.end());
-
-        Scalar min_q = 1.0;
-        for (int i = static_cast<int>(num_codons) - 1; i >= 0; --i) {
-            Scalar rank = static_cast<Scalar>(i + 1);
-            Scalar q = (p_val_order[i].first * static_cast<Scalar>(num_codons)) / rank;
-            min_q = std::min(min_q, q);
-            min_q = std::clamp(min_q, 0.0, 1.0);
-            site_results[p_val_order[i].second].omnibus_q_value = min_q;
+        std::vector<Scalar> omnibus_q_vals = hyphy::core::stats::benjamini_hochberg_fdr(omnibus_p_vals);
+        for (size_t site = 0; site < num_codons; ++site) {
+            site_results[site].omnibus_q_value = omnibus_q_vals[site];
         }
 
         // Stage 2: Holm-Bonferroni correction on individual property p-values
@@ -941,19 +935,13 @@ public:
 
         for (size_t site = 0; site < num_codons; ++site) {
             auto& sr = site_results[site];
-            std::vector<std::pair<Scalar, size_t>> prop_p_order;
+            std::vector<Scalar> prop_p_vals(K);
             for (size_t k = 0; k < K; ++k) {
-                prop_p_order.emplace_back(sr.properties[k].p_value, k);
+                prop_p_vals[k] = sr.properties[k].p_value;
             }
-            std::sort(prop_p_order.begin(), prop_p_order.end());
-
-            Scalar running_max = 0.0;
-            for (size_t rank = 0; rank < K; ++rank) {
-                Scalar multiplier = static_cast<Scalar>(K - rank);
-                Scalar adj_p = prop_p_order[rank].first * multiplier;
-                running_max = std::max(running_max, adj_p);
-                running_max = std::clamp(running_max, 0.0, 1.0);
-                sr.properties[prop_p_order[rank].second].adjusted_p_value = running_max;
+            std::vector<Scalar> prop_adj_p = hyphy::core::stats::holm_bonferroni(prop_p_vals);
+            for (size_t k = 0; k < K; ++k) {
+                sr.properties[k].adjusted_p_value = prop_adj_p[k];
             }
 
             // Classify each property

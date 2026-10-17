@@ -31,17 +31,17 @@ endif()
 #   -DHYPHY3_PCH=OFF to disable.
 option(HYPHY3_PCH "Shared precompiled header for all executable targets" ON)
 
-# Header-only Eigen 3.4.0
+# Header-only Eigen 3.4.0 (SOURCE_SUBDIR points to a non-existent subdir so
+# FetchContent_MakeAvailable populates the headers without running Eigen's
+# legacy CMakeLists.txt or triggering CMP0169 warnings).
 include(FetchContent)
 FetchContent_Declare(
     Eigen3
     URL https://gitlab.com/libeigen/eigen/-/archive/3.4.0/eigen-3.4.0.tar.gz
     DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+    SOURCE_SUBDIR _cmake_header_only_noop
 )
-FetchContent_GetProperties(Eigen3)
-if(NOT eigen3_POPULATED)
-    FetchContent_Populate(Eigen3)
-endif()
+FetchContent_MakeAvailable(Eigen3)
 
 # Core interface library
 add_library(hyphy3_core INTERFACE)
@@ -136,6 +136,7 @@ add_library(hyphy3_emitters STATIC
     src/analyses/prime.cpp
     src/analyses/relax.cpp
     src/analyses/slac.cpp
+    src/analyses/tree_engine.cpp
 )
 target_link_libraries(hyphy3_emitters PUBLIC hyphy3_core)
 # The nanobind module links this static lib into a MODULE: it needs PIC.

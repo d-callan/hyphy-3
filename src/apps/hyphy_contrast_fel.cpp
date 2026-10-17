@@ -1,14 +1,9 @@
 #include "hyphy/core/types.hpp"
-#include "hyphy/core/genetic_code.hpp"
-#include "hyphy/core/alignment.hpp"
-#include "hyphy/core/tree.hpp"
-#include "hyphy/core/ohmic_network.hpp"
+#include "hyphy/core/cli_common.hpp"
 #include "hyphy/core/rate_matrix.hpp"
 #include "hyphy/core/likelihood.hpp"
-#include "hyphy/core/console.hpp"
 #include "hyphy/opt/optimizer.hpp"
 #include "hyphy/analyses/contrast_fel.hpp"
-#include "hyphy/analyses/tree_engine.hpp"
 
 #include <iostream>
 #include <string>
@@ -16,10 +11,6 @@
 #include <chrono>
 #include <iomanip>
 #include <numeric>
-
-#ifdef _OPENMP
-#include <omp.h>
-#endif
 
 using namespace hyphy::core;
 using namespace hyphy::analyses;
@@ -49,6 +40,7 @@ static void print_usage(const char* prog) {
               << "  " << Console::brand("--shrinkage") << " <val>    Empirical Bayes Ridge shrinkage lambda (default: 1.0; 0 to disable)\n"
               << "  " << Console::brand("--threads") << " <N>        Number of OpenMP worker threads\n"
               << "  " << Console::brand("--output") << " <file>      Path to output JSON file (default: <alignment>.CONTRAST-FEL.json)\n"
+              << "  " << Console::brand("--html") << " <file>        Also write a self-contained interactive HTML report\n"
               << "  " << Console::brand("--json-format") << " <fmt>  JSON schema format: modern (default) or legacy (HyPhy 2.5)\n"
               << "  " << Console::brand("--legacy-json") << "        Output legacy HyPhy 2.5 JSON schema\n"
               << "  " << Console::brand("--pvalue") << " <float>     Nominal p-value threshold for site display (default: 0.05)\n"
@@ -65,73 +57,28 @@ static void print_usage(const char* prog) {
 }
 
 int run_contrast_fel(int argc, char* argv[]) {
-    std::string alignment_file;
-    std::string tree_file;
-    std::string output_file;
-    std::string code_name = "Universal";
+    CommonCLIOptions cli;
     std::string branch_specs = "auto";
-    std::string embeddings_file;
-    int num_threads = 0;
     Scalar pvalue_threshold = 0.05;
     Scalar qvalue_threshold = 0.20;
     Scalar shrinkage_lambda = 1.0;
-    JSONFormat json_format = JSONFormat::ModernV3;
-    bool show_progress = ProgressBar::is_terminal();
-    bool force_progress = false;
-    bool all_sites = false;
-    bool use_ohmic = false;
-    bool use_hyphaeon = false;
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
-        if (arg == "--alignment" && i + 1 < argc) {
-            alignment_file = argv[++i];
-        } else if (arg == "--tree" && i + 1 < argc) {
-            tree_file = argv[++i];
-        } else if (arg == "--ohmic" || arg == "--omhic") {
-            use_ohmic = true;
-        } else if (arg == "--hyphaeon") {
-            use_hyphaeon = true;
-        } else if (arg == "--no-hyphaeon") {
-            use_hyphaeon = false;
-        } else if (arg == "--embeddings" && i + 1 < argc) {
-            embeddings_file = argv[++i];
-            use_ohmic = true;
-        } else if (arg == "--code" && i + 1 < argc) {
-            code_name = argv[++i];
-        } else if ((arg == "--branches" || arg == "--branch-sets") && i + 1 < argc) {
+        auto status = parse_common_cli_arg(i, argc, argv, cli);
+        if (status == CommonArgParseStatus::Handled) continue;
+        if (status == CommonArgParseStatus::Error) return 1;
+
+        if ((arg == "--branches" || arg == "--branch-sets") && i + 1 < argc) {
             branch_specs = argv[++i];
         } else if (arg == "--shrinkage" && i + 1 < argc) {
             shrinkage_lambda = std::stod(argv[++i]);
         } else if (arg == "--no-shrinkage") {
             shrinkage_lambda = 0.0;
-        } else if (arg == "--threads" && i + 1 < argc) {
-            num_threads = std::stoi(argv[++i]);
-        } else if (arg == "--json-format" && i + 1 < argc) {
-            std::string fmt = argv[++i];
-            if (!parse_json_format(fmt, json_format)) {
-                std::cerr << Console::danger("Error: unknown --json-format '") << fmt
-                          << "'. Expected 'modern' or 'legacy'.\n";
-                return 1;
-            }
-        } else if (arg == "--legacy-json" || arg == "--legacy") {
-            json_format = JSONFormat::Legacy;
-        } else if (arg == "--modern-json" || arg == "--modern") {
-            json_format = JSONFormat::ModernV3;
-        } else if (arg == "--output" && i + 1 < argc) {
-            output_file = argv[++i];
-        } else if (arg == "--pvalue" && i + 1 < argc) {
+        } else if ((arg == "--pvalue" || arg == "-p") && i + 1 < argc) {
             pvalue_threshold = std::stod(argv[++i]);
-        } else if (arg == "--qvalue" && i + 1 < argc) {
+        } else if ((arg == "--qvalue" || arg == "-q") && i + 1 < argc) {
             qvalue_threshold = std::stod(argv[++i]);
-        } else if (arg == "--all-sites") {
-            all_sites = true;
-        } else if (arg == "--progress") {
-            show_progress = true;
-            force_progress = true;
-        } else if (arg == "--no-progress") {
-            show_progress = false;
-            force_progress = false;
         } else if (arg == "--help" || arg == "-h") {
             print_usage(argv[0]);
             return 0;
@@ -142,73 +89,39 @@ int run_contrast_fel(int argc, char* argv[]) {
         }
     }
 
-    if (alignment_file.empty()) {
+    if (cli.alignment_file.empty()) {
         std::cerr << Console::danger("Error: --alignment is required.\n\n");
         print_usage(argv[0]);
         return 1;
     }
 
-#ifdef _OPENMP
-    if (num_threads > 0) {
-        omp_set_num_threads(num_threads);
-    }
-#endif
-
-    if (output_file.empty()) {
-        output_file = alignment_file + ".CONTRAST-FEL.json";
-    }
-
+    finalize_common_cli_options(cli, ".CONTRAST-FEL.json");
     print_banner();
 
     auto start_time = std::chrono::high_resolution_clock::now();
     std::string start_iso = Provenance::current_iso8601();
-    std::string cli_cmd = argv[0];
-    for (int i = 1; i < argc; ++i) {
-        cli_cmd += " ";
-        cli_cmd += argv[i];
-    }
+    std::string cli_cmd = join_cli_command(argc, argv);
 
-    std::shared_ptr<const GeneticCode> gcode;
-    try {
-        gcode = GeneticCode::from_name(code_name);
-    } catch (const std::exception&) {
-        std::cerr << Console::warning("Warning: Unknown genetic code '" + code_name + "', using Universal.\n");
-        gcode = GeneticCode::universal();
+    LoadedCodonDataset ds;
+    if (!load_codon_dataset(cli, ds, false, /*allow_fallback_code=*/true)) {
+        return 1;
     }
+    auto& gcode = ds.gcode;
+    auto& aln = ds.aln;
+    auto& tree = ds.tree;
+    const auto& tree_source = ds.tree_source;
+    size_t num_codons = aln.num_codons;
 
     std::cout << Console::bold("Input Data:\n")
-              << "  " << Console::muted("Alignment file : ") << Console::bold(alignment_file) << "\n";
-    if (!tree_file.empty()) {
-        std::cout << "  " << Console::muted("Tree file      : ") << Console::bold(tree_file) << "\n";
+              << "  " << Console::muted("Alignment file : ") << Console::bold(cli.alignment_file) << "\n";
+    if (!cli.tree_file.empty()) {
+        std::cout << "  " << Console::muted("Tree file      : ") << Console::bold(cli.tree_file) << "\n";
     }
-    std::cout << "  " << Console::muted("Genetic code   : ") << Console::bold(gcode->name) << "\n";
-    std::cout << "  " << Console::muted("Shrinkage λ    : ") << Console::bold(std::to_string(shrinkage_lambda)) 
-              << (shrinkage_lambda > 0.0 ? Console::success(" [Empirical Bayes Ridge Enabled]") : Console::warning(" [Unpenalized MLE]")) << "\n\n";
-
-    Alignment aln;
-    try {
-        if (alignment_file.ends_with(".nex") || alignment_file.ends_with(".nexus") ||
-            alignment_file.ends_with(".NEX") || alignment_file.ends_with(".NEXUS")) {
-            aln = Alignment::from_nexus(alignment_file, gcode);
-        } else {
-            aln = Alignment::from_fasta(alignment_file, gcode);
-        }
-    } catch (const std::exception& e) {
-        std::cerr << Console::danger("Error reading alignment: ") << e.what() << "\n";
-        return 1;
-    }
-
-    Tree tree;
-    std::string tree_source;
-    try {
-        tree = TreeEngine::resolve_tree(aln, tree_file, use_ohmic, use_hyphaeon, embeddings_file, &tree_source);
-        std::cout << "  " << Console::muted("Tree source    : ") << Console::bold(tree_source) << "\n";
-    } catch (const std::exception& e) {
-        std::cerr << Console::danger("Error resolving phylogeny: ") << e.what() << "\n";
-        return 1;
-    }
-
-    std::cout << "  " << Console::muted("Sequences      : ") << Console::bold(std::to_string(aln.num_taxa)) << "\n"
+    std::cout << "  " << Console::muted("Genetic code   : ") << Console::bold(gcode->name) << "\n"
+              << "  " << Console::muted("Shrinkage λ    : ") << Console::bold(std::to_string(shrinkage_lambda)) 
+              << (shrinkage_lambda > 0.0 ? Console::success(" [Empirical Bayes Ridge Enabled]") : Console::warning(" [Unpenalized MLE]")) << "\n"
+              << "  " << Console::muted("Tree source    : ") << Console::bold(tree_source) << "\n"
+              << "  " << Console::muted("Sequences      : ") << Console::bold(std::to_string(aln.num_taxa)) << "\n"
               << "  " << Console::muted("Codon sites    : ") << Console::bold(std::to_string(aln.num_codons)) << "\n"
               << "  " << Console::muted("Unique patterns: ") << Console::bold(std::to_string(aln.patterns.size())) << "\n\n";
 
@@ -239,7 +152,7 @@ int run_contrast_fel(int argc, char* argv[]) {
     }
     std::cout << "\n";
 
-    auto site_results = contrast_fel.run(show_progress, force_progress);
+    auto site_results = contrast_fel.run(cli.show_progress, cli.force_progress);
 
     // Sparkline renderer for 2 groups
     auto render_contrast_spark = [](double alpha, double b0, double b1) -> std::string {
@@ -300,7 +213,7 @@ int run_contrast_fel(int argc, char* argv[]) {
     }
 
     std::vector<size_t> sites_to_display;
-    if (all_sites) {
+    if (cli.all_sites) {
         sites_to_display.resize(site_results.size());
         std::iota(sites_to_display.begin(), sites_to_display.end(), 0);
     } else if (!sig_indices.empty()) {
@@ -379,11 +292,11 @@ int run_contrast_fel(int argc, char* argv[]) {
     std::cout << "\n";
     table.print();
 
-    if (!all_sites) {
+    if (!cli.all_sites) {
         if (!sig_indices.empty()) {
             std::cout << Console::muted("  Showing " + std::to_string(sig_indices.size()) + 
                                        " site(s) with differential selection at p <= " + std::to_string(pvalue_threshold) + 
-                                       " out of " + std::to_string(aln.num_codons) + 
+                                       " out of " + std::to_string(num_codons) + 
                                        ". (Use --all-sites to display all)\n\n");
         } else {
             std::cout << Console::muted("  No sites reached nominal significance (p <= " + 
@@ -467,27 +380,24 @@ int run_contrast_fel(int argc, char* argv[]) {
     auto end_time = std::chrono::high_resolution_clock::now();
     double total_sec = std::chrono::duration<double>(end_time - start_time).count();
 
-    Provenance prov;
-    prov.invocation.cli_command = cli_cmd;
-    prov.invocation.working_directory = Provenance::get_cwd();
-    prov.execution.start_time = start_iso;
-    prov.execution.end_time = Provenance::current_iso8601();
-    prov.execution.wall_time_seconds = total_sec;
-#ifdef _OPENMP
-    prov.execution.cpu_threads = (num_threads > 0) ? num_threads : omp_get_max_threads();
-#else
-    prov.execution.cpu_threads = 1;
-#endif
-    prov.execution.hostname = Provenance::get_hostname();
-    prov.execution.os = Provenance::detect_os();
-    prov.execution.compiler = Provenance::detect_compiler();
+    Provenance prov = build_cli_provenance(cli, cli_cmd, start_iso, total_sec, {
+        {"branches", branch_specs},
+        {"shrinkage", std::to_string(shrinkage_lambda)},
+        {"pvalue", std::to_string(pvalue_threshold)},
+        {"qvalue", std::to_string(qvalue_threshold)}
+    });
 
     try {
-        contrast_fel.save_json(output_file, alignment_file, tree.to_newick(), prov, json_format);
+        contrast_fel.save_json(cli.output_file, cli.alignment_file, contrast_fel.tree.to_newick(), prov, cli.json_format);
         std::cout << Console::bold("Output:\n")
-                  << "  " << Console::muted("Analysis results saved to: ") << Console::brand(output_file) << "\n\n";
+                  << "  " << Console::muted("Analysis results saved to: ") << Console::brand(cli.output_file) << "\n\n";
+        if (!cli.html_file.empty()) {
+            hyphy::report::write_html_report(cli.output_file, cli.html_file);
+            std::cout << Console::success("✔") << " " << Console::bold("Saved HTML report to: ")
+                      << Console::brand(cli.html_file) << "\n\n";
+        }
     } catch (const std::exception& e) {
-        std::cerr << Console::danger("Error writing JSON output: ") << e.what() << "\n";
+        std::cerr << Console::danger("Error writing output: ") << e.what() << "\n";
         return 1;
     }
 

@@ -8,6 +8,8 @@
 #include "hyphy/core/progress_bar.hpp"
 #include "hyphy/core/provenance.hpp"
 #include "hyphy/core/json_output.hpp"
+#include "hyphy/core/stats.hpp"
+#include "hyphy/core/ancestral.hpp"
 #include "hyphy/analyses/site_visualizer.hpp"
 #include "hyphy/opt/nelder_mead.hpp"
 #include "hyphy/opt/optimizer.hpp"
@@ -926,116 +928,22 @@ public:
         const auto& pattern = aln.patterns[p];
         const auto& code = *(aln.code ? aln.code : GeneticCode::universal());
         int S = code.num_sense_codons;
-        size_t num_nodes = tree.num_nodes();
         size_t K = testable_groups.size();
 
         subs.syn_counts.assign(K + (has_background ? 1 : 0), 0);
         subs.nonsyn_counts.assign(K + (has_background ? 1 : 0), 0);
 
-        // 1. Check if constant across leaves
-        int8_t const_codon = -1;
-        bool is_constant = true;
-        for (size_t node_id = 0; node_id < num_nodes; ++node_id) {
-            if (tree.nodes[node_id].is_leaf) {
-                size_t t_idx = leaf_to_taxon[node_id];
-                if (t_idx != static_cast<size_t>(-1)) {
-                    int8_t st = pattern.states[t_idx];
-                    if (st >= 0 && st < S) {
-                        if (const_codon == -1) {
-                            const_codon = st;
-                        } else if (const_codon != st) {
-                            is_constant = false;
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-
-        if (is_constant && const_codon >= 0) {
-            subs.root_codon = code.sense_codons[const_codon];
-            subs.root_aa = code.sense_codon_aa[const_codon];
+        auto vit = hyphy::core::ancestral::reconstruct_viterbi_states(
+            tree, pattern, leaf_to_taxon, branch_transition_matrices, base_mg94_matrix.pi, S
+        );
+        subs.root_codon = code.sense_codons[vit.root_state];
+        subs.root_aa = code.sense_codon_aa[vit.root_state];
+        if (vit.is_constant) {
             subs.summary_string = "Conserved";
             subs.summary_string_partitioned = "Conserved";
             return subs;
         }
-
-        // 2. Max-product Viterbi pass
-        std::vector<std::vector<Scalar>> M_node(num_nodes, std::vector<Scalar>(S, 1.0));
-        std::vector<std::vector<int8_t>> backpointer(num_nodes, std::vector<int8_t>(S, 0));
-        std::vector<std::vector<Scalar>> val_node(num_nodes, std::vector<Scalar>(S, 1.0));
-
-        for (int32_t node_id : tree.post_order) {
-            const auto& node = tree.nodes[node_id];
-            if (node.is_leaf) {
-                size_t t_idx = leaf_to_taxon[node_id];
-                int8_t st = (t_idx != static_cast<size_t>(-1)) ? pattern.states[t_idx] : -1;
-                if (st >= 0 && st < S) {
-                    for (int c = 0; c < S; ++c) M_node[node_id][c] = (c == st) ? 1.0 : 0.0;
-                } else {
-                    for (int c = 0; c < S; ++c) M_node[node_id][c] = 1.0;
-                }
-            }
-
-            if (node_id != tree.root_id) {
-                const Matrix& P = branch_transition_matrices[node_id];
-                Scalar max_val = 0.0;
-                for (int p_state = 0; p_state < S; ++p_state) {
-                    Scalar best_score = -1.0;
-                    int8_t best_c = 0;
-                    for (int c = 0; c < S; ++c) {
-                        Scalar score = P(p_state, c) * M_node[node_id][c];
-                        if (score > best_score) {
-                            best_score = score;
-                            best_c = static_cast<int8_t>(c);
-                        }
-                    }
-                    backpointer[node_id][p_state] = best_c;
-                    val_node[node_id][p_state] = std::max(best_score, 0.0);
-                    if (val_node[node_id][p_state] > max_val) max_val = val_node[node_id][p_state];
-                }
-
-                if (max_val > 0.0) {
-                    Scalar scale = 1.0 / max_val;
-                    for (int p_state = 0; p_state < S; ++p_state) {
-                        val_node[node_id][p_state] *= scale;
-                    }
-                }
-
-                int32_t parent_id = node.parent_id;
-                for (int p_state = 0; p_state < S; ++p_state) {
-                    M_node[parent_id][p_state] *= val_node[node_id][p_state];
-                }
-            }
-        }
-
-        // 3. Optimal root state
-        int8_t root_state = 0;
-        Scalar best_root_score = -1.0;
-        for (int c = 0; c < S; ++c) {
-            Scalar score = base_mg94_matrix.pi(c) * M_node[tree.root_id][c];
-            if (score > best_root_score) {
-                best_root_score = score;
-                root_state = static_cast<int8_t>(c);
-            }
-        }
-
-        std::vector<int8_t> reconstructed_states(num_nodes, -1);
-        reconstructed_states[tree.root_id] = root_state;
-        subs.root_codon = code.sense_codons[root_state];
-        subs.root_aa = code.sense_codon_aa[root_state];
-
-        std::vector<int32_t> stack;
-        stack.push_back(tree.root_id);
-        while (!stack.empty()) {
-            int32_t curr = stack.back();
-            stack.pop_back();
-            for (int32_t child_id : tree.nodes[curr].children) {
-                int8_t parent_st = reconstructed_states[curr];
-                reconstructed_states[child_id] = backpointer[child_id][parent_st];
-                stack.push_back(child_id);
-            }
-        }
+        const auto& reconstructed_states = vit.node_states;
 
         // 4. Collect substitution events
         Scalar total_surprise = 0.0;
@@ -1197,20 +1105,13 @@ public:
 
         // Benjamini-Hochberg FDR correction on penalized p-values across all sites
         size_t M = site_results.size();
-        std::vector<size_t> pval_order(M);
-        std::iota(pval_order.begin(), pval_order.end(), 0);
-        std::sort(pval_order.begin(), pval_order.end(), [&](size_t a, size_t b) {
-            return site_results[a].p_value < site_results[b].p_value;
-        });
-
-        Scalar running_min_q = 1.0;
-        for (int rank = static_cast<int>(M) - 1; rank >= 0; --rank) {
-            size_t orig_idx = pval_order[rank];
-            Scalar unadj_p = site_results[orig_idx].p_value;
-            Scalar q = unadj_p * static_cast<Scalar>(M) / static_cast<Scalar>(rank + 1);
-            q = std::min(1.0, std::min(running_min_q, q));
-            running_min_q = q;
-            site_results[orig_idx].q_value = q;
+        std::vector<Scalar> raw_p(M);
+        for (size_t i = 0; i < M; ++i) {
+            raw_p[i] = site_results[i].p_value;
+        }
+        std::vector<Scalar> q_vals = hyphy::core::stats::benjamini_hochberg_fdr(raw_p);
+        for (size_t i = 0; i < M; ++i) {
+            site_results[i].q_value = q_vals[i];
         }
 
         return site_results;

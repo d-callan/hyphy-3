@@ -9,6 +9,7 @@
 #include "hyphy/core/progress_bar.hpp"
 #include "hyphy/core/provenance.hpp"
 #include "hyphy/core/json_output.hpp"
+#include "hyphy/core/stats.hpp"
 #include "hyphy/core/console.hpp"
 #include "hyphy/opt/optimizer.hpp"
 #include "hyphy/analyses/tree_engine.hpp"
@@ -100,37 +101,7 @@ struct TopologyTestResult {
 
 struct GARDMath {
     static inline double regularized_gamma_p(double a, double z) {
-        if (z <= 0.0) return 0.0;
-        if (a <= 0.0) return 1.0;
-        if (z < a + 1.0) {
-            double sum = 1.0 / a;
-            double term = sum;
-            for (int n = 1; n < 200; ++n) {
-                term *= z / (a + n);
-                sum += term;
-                if (std::abs(term) < std::abs(sum) * 1e-15) break;
-            }
-            return sum * std::exp(-z + a * std::log(z) - std::lgamma(a));
-        }
-        double tiny = 1e-30;
-        double b = z + 1.0 - a;
-        double c = 1.0 / tiny;
-        double d = 1.0 / b;
-        double h = d;
-        for (int i = 1; i < 200; ++i) {
-            double an = -i * (i - a);
-            b += 2.0;
-            d = an * d + b;
-            if (std::abs(d) < tiny) d = tiny;
-            c = b + an / c;
-            if (std::abs(c) < tiny) c = tiny;
-            d = 1.0 / d;
-            double del = d * c;
-            h *= del;
-            if (std::abs(del - 1.0) < 1e-15) break;
-        }
-        double q = std::exp(-z + a * std::log(z) - std::lgamma(a)) * h;
-        return std::max(0.0, std::min(1.0, 1.0 - q));
+        return hyphy::core::stats::regularized_gamma_p(a, z);
     }
 };
 

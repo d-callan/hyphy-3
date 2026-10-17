@@ -7,6 +7,7 @@
 #include "hyphy/core/likelihood.hpp"
 #include "hyphy/core/neighbor_joining.hpp"
 #include "hyphy/core/ohmic_network.hpp"
+#include "hyphy/core/provenance.hpp"
 #include "hyphy/core/console.hpp"
 #include "hyphy/opt/nelder_mead.hpp"
 #include "hyphy/opt/optimizer.hpp"
@@ -983,25 +984,30 @@ public:
         for (size_t round = 0; round < max_rounds; ++round) {
             bool improved_in_round = false;
 
-            // Single linear pass over post_order to compute descendant leaves for every node
-            std::vector<std::vector<size_t>> node_leaves(tree.nodes.size());
-            for (int32_t nid : tree.post_order) {
-                if (nid == INVALID_INDEX || static_cast<size_t>(nid) >= tree.nodes.size()) continue;
-                if (tree.nodes[nid].is_leaf) {
-                    size_t tid = LikelihoodEngine::find_taxon_index(aln, tree.nodes[nid].name);
-                    if (tid != static_cast<size_t>(-1) && tid < N) {
-                        node_leaves[nid].push_back(tid);
-                    }
-                } else {
-                    for (int32_t c : tree.nodes[nid].children) {
-                        if (c != INVALID_INDEX && static_cast<size_t>(c) < node_leaves.size()) {
-                            node_leaves[nid].insert(node_leaves[nid].end(),
-                                                   node_leaves[c].begin(),
-                                                   node_leaves[c].end());
+            auto compute_node_leaves = [&]() {
+                std::vector<std::vector<size_t>> leaves(tree.nodes.size());
+                for (int32_t nid : tree.post_order) {
+                    if (nid == INVALID_INDEX || static_cast<size_t>(nid) >= tree.nodes.size()) continue;
+                    if (tree.nodes[nid].is_leaf) {
+                        size_t tid = LikelihoodEngine::find_taxon_index(aln, tree.nodes[nid].name);
+                        if (tid != static_cast<size_t>(-1) && tid < N) {
+                            leaves[nid].push_back(tid);
+                        }
+                    } else {
+                        for (int32_t c : tree.nodes[nid].children) {
+                            if (c != INVALID_INDEX && static_cast<size_t>(c) < leaves.size()) {
+                                leaves[nid].insert(leaves[nid].end(),
+                                                   leaves[c].begin(),
+                                                   leaves[c].end());
+                            }
                         }
                     }
                 }
-            }
+                return leaves;
+            };
+
+            // Single linear pass over post_order to compute descendant leaves for every node
+            std::vector<std::vector<size_t>> node_leaves = compute_node_leaves();
 
             // Snapshot candidate nodes to avoid iterator invalidation during structural SPR updates
             std::vector<int32_t> candidate_nodes;
@@ -1013,7 +1019,7 @@ public:
             }
 
             for (int32_t u : candidate_nodes) {
-                if (u >= static_cast<int32_t>(tree.nodes.size())) continue;
+                if (u < 0 || static_cast<size_t>(u) >= tree.nodes.size() || static_cast<size_t>(u) >= node_leaves.size()) continue;
                 if (tree.nodes[u].parent_id == INVALID_INDEX || node_leaves[u].empty()) continue;
 
                 const auto& leaves_u = node_leaves[u];
@@ -1028,6 +1034,7 @@ public:
                 for (const auto& v_node : tree.nodes) {
                     int32_t v = v_node.id;
                     if (v == tree.root_id || v == INVALID_INDEX || v == u) continue;
+                    if (v < 0 || static_cast<size_t>(v) >= node_leaves.size()) continue;
                     if (is_in_subtree(tree, v, u)) continue;
                     if (node_leaves[v].empty()) continue;
 
@@ -1101,6 +1108,7 @@ public:
                     if (cand_ll > current_best_ll + 0.05) {
                         current_best_ll = cand_ll;
                         tree = std::move(cand_tree);
+                        node_leaves = compute_node_leaves();
                         accepted_moves++;
                         improved_in_round = true;
                         break; // Move accepted for node u; advance to next u
@@ -1624,49 +1632,7 @@ public:
         return res;
     }
 
-    nlohmann::json to_json(const TreeEngineResult& res) const {
-        nlohmann::json j;
-        j["analysis"] = {
-            {"name", "HyPhy-3 ML/Ohmic Tree Engine"},
-            {"version", "3.0.0"},
-            {"model", res.active_model},
-            {"taxa", res.num_taxa},
-            {"patterns", res.num_patterns},
-            {"runtime_seconds", res.runtime_seconds}
-        };
-        j["likelihoods"] = {
-            {"initial_gtr", res.initial_gtr_log_l},
-            {"optimized_gtr", res.optimized_gtr_log_l},
-            {"final", res.final_log_l}
-        };
-        j["topology"] = {
-            {"initial_nodes", res.num_initial_nodes},
-            {"final_nodes", res.num_final_nodes},
-            {"polytomies_retained", res.num_polytomies_retained},
-            {"branches_collapsed", res.num_branches_collapsed},
-            {"polytomies_resolved", res.num_polytomies_resolved},
-            {"newick", res.optimized_tree.to_newick(true)}
-        };
-        j["divide_and_conquer"] = {
-            {"enabled", res.dnc_used},
-            {"num_islands", res.num_islands},
-            {"island_sizes", res.island_sizes},
-            {"island_spr_moves", res.dnc_spr_moves}
-        };
-        j["parameters"] = {
-            {"gtr_rates", {
-                {"AC", res.gtr_rates[0]},
-                {"AT", res.gtr_rates[1]},
-                {"CG", res.gtr_rates[2]},
-                {"CT", res.gtr_rates[3]},
-                {"GT", res.gtr_rates[4]}
-            }}
-        };
-        if (res.active_model == "MG94") {
-            j["parameters"]["mg94_omega"] = res.mg94_omega;
-        }
-        return j;
-    }
+    nlohmann::json to_json(const TreeEngineResult& res, const Provenance& prov = {}) const;
 
     // -------------------------------------------------------------
     // Unified CLI Tree Resolution Helper

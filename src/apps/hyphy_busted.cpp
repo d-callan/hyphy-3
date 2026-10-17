@@ -1,14 +1,9 @@
 #include "hyphy/core/types.hpp"
-#include "hyphy/core/genetic_code.hpp"
-#include "hyphy/core/alignment.hpp"
-#include "hyphy/core/tree.hpp"
-#include "hyphy/core/ohmic_network.hpp"
+#include "hyphy/core/cli_common.hpp"
 #include "hyphy/core/rate_matrix.hpp"
 #include "hyphy/core/likelihood.hpp"
-#include "hyphy/core/console.hpp"
 #include "hyphy/opt/optimizer.hpp"
 #include "hyphy/analyses/busted.hpp"
-#include "hyphy/analyses/tree_engine.hpp"
 
 #include <iostream>
 #include <fstream>
@@ -16,9 +11,6 @@
 #include <vector>
 #include <chrono>
 #include <iomanip>
-#ifdef _OPENMP
-#include <omp.h>
-#endif
 
 using namespace hyphy::core;
 using namespace hyphy::analyses;
@@ -71,6 +63,7 @@ static void print_usage(const char* prog, bool ph_mode = false) {
               << "  " << Console::brand("--no-branch-opt") << "      Disable individual branch length refinement (use proportional scaling)\n"
               << "  " << Console::brand("--threads") << " <N>        Number of OpenMP worker threads\n"
               << "  " << Console::brand("--output") << " <file>      Path to output JSON file (default: <alignment>.BUSTED[-PH].json)\n"
+              << "  " << Console::brand("--html") << " <file>        Also write a self-contained interactive HTML report\n"
               << "  " << Console::brand("--progress") << "           Force interactive progress bar\n"
               << "  " << Console::brand("--no-progress") << "        Disable progress bar\n"
               << "  " << Console::brand("--help, -h") << "           Show this help message\n\n"
@@ -81,18 +74,8 @@ static void print_usage(const char* prog, bool ph_mode = false) {
 }
 
 int run_busted(int argc, char* argv[]) {
-    std::string alignment_file;
-    std::string tree_file;
-    std::string output_file;
-    std::string code_name = "Universal";
-    std::string embeddings_file = "";
-    bool force_ohmic = false;
-    bool use_hyphaeon = false;
-    int num_threads = 0;
-    JSONFormat json_format = JSONFormat::ModernV3;
+    CommonCLIOptions cli;
     BUSTEDSettings settings;
-    bool show_progress = ProgressBar::is_terminal();
-    bool force_progress = false;
 
     std::string prog_str = (argc > 0 && argv[0]) ? argv[0] : "hyphy3 busted";
     if (prog_str.find("busted-ph") != std::string::npos || prog_str.find("busted_ph") != std::string::npos) {
@@ -101,23 +84,11 @@ int run_busted(int argc, char* argv[]) {
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
-        if (arg == "--alignment" && i + 1 < argc) {
-            alignment_file = argv[++i];
-        } else if (arg == "--tree" && i + 1 < argc) {
-            tree_file = argv[++i];
-        } else if (arg == "--ohmic" || arg == "--omhic") {
-            force_ohmic = true;
-        } else if (arg == "--hyphaeon") {
-            force_ohmic = true;
-            use_hyphaeon = true;
-        } else if (arg == "--no-hyphaeon") {
-            use_hyphaeon = false;
-        } else if (arg == "--embeddings" && i + 1 < argc) {
-            force_ohmic = true;
-            embeddings_file = argv[++i];
-        } else if (arg == "--code" && i + 1 < argc) {
-            code_name = argv[++i];
-        } else if ((arg == "--branches" || arg == "--test" || arg == "--foreground") && i + 1 < argc) {
+        auto status = parse_common_cli_arg(i, argc, argv, cli);
+        if (status == CommonArgParseStatus::Handled) continue;
+        if (status == CommonArgParseStatus::Error) return 1;
+
+        if ((arg == "--branches" || arg == "--test" || arg == "--foreground") && i + 1 < argc) {
             settings.test_branches = argv[++i];
         } else if (arg == "--phenotype" || arg == "--busted-ph") {
             settings.phenotype_mode = true;
@@ -152,27 +123,6 @@ int run_busted(int argc, char* argv[]) {
             settings.error_sink_bf_threshold = std::stod(argv[++i]);
         } else if (arg == "--no-branch-opt") {
             settings.refine_branch_lengths = false;
-        } else if (arg == "--threads" && i + 1 < argc) {
-            num_threads = std::stoi(argv[++i]);
-        } else if (arg == "--json-format" && i + 1 < argc) {
-            std::string fmt = argv[++i];
-            if (!parse_json_format(fmt, json_format)) {
-                std::cerr << Console::danger("Error: unknown --json-format '") << fmt
-                          << "'. Expected 'modern' or 'legacy'.\n";
-                return 1;
-            }
-        } else if (arg == "--legacy-json") {
-            json_format = JSONFormat::Legacy;
-        } else if (arg == "--modern-json") {
-            json_format = JSONFormat::ModernV3;
-        } else if (arg == "--output" && i + 1 < argc) {
-            output_file = argv[++i];
-        } else if (arg == "--progress") {
-            show_progress = true;
-            force_progress = true;
-        } else if (arg == "--no-progress") {
-            show_progress = false;
-            force_progress = false;
         } else if (arg == "--help" || arg == "-h") {
             print_usage(argv[0], settings.phenotype_mode);
             return 0;
@@ -183,60 +133,27 @@ int run_busted(int argc, char* argv[]) {
         }
     }
 
-    if (alignment_file.empty()) {
+    if (cli.alignment_file.empty()) {
         std::cerr << "Error: --alignment is required.\n\n";
         print_usage(argv[0], settings.phenotype_mode);
         return 1;
     }
 
-#ifdef _OPENMP
-    if (num_threads > 0) {
-        omp_set_num_threads(num_threads);
-    }
-#endif
-
-    if (output_file.empty()) {
-        output_file = alignment_file + (settings.phenotype_mode ? ".BUSTED-PH.json" : ".BUSTED.json");
-    }
-
+    finalize_common_cli_options(cli, settings.phenotype_mode ? ".BUSTED-PH.json" : ".BUSTED.json");
     print_banner(settings.phenotype_mode);
 
     auto start_time = std::chrono::high_resolution_clock::now();
     std::string start_iso = Provenance::current_iso8601();
-    std::string cli_cmd = argv[0];
-    for (int i = 1; i < argc; ++i) {
-        cli_cmd += " ";
-        cli_cmd += argv[i];
-    }
+    std::string cli_cmd = join_cli_command(argc, argv);
 
-    // 1. Load Genetic Code
-    std::shared_ptr<const GeneticCode> code;
-    try {
-        code = GeneticCode::from_name(code_name);
-    } catch (const std::exception& e) {
-        std::cerr << Console::danger("Error loading genetic code '") << code_name << "': " << e.what() << "\n";
+    LoadedCodonDataset ds;
+    if (!load_codon_dataset(cli, ds, true)) {
         return 1;
     }
-
-    // 2. Load Alignment
-    Alignment aln;
-    try {
-        aln = Alignment::load(alignment_file, code);
-    } catch (const std::exception& e) {
-        std::cerr << Console::danger("Error loading alignment: ") << e.what() << "\n";
-        return 1;
-    }
-
-    // 3. Resolve Tree or Ohmic Phylogenetic Network
-    Tree tree;
-    OhmicNetwork ohmic_net;
-    std::string tree_source;
-    try {
-        tree = TreeEngine::resolve_tree(aln, tree_file, force_ohmic, use_hyphaeon, embeddings_file, &ohmic_net, &tree_source);
-    } catch (const std::exception& e) {
-        std::cerr << Console::danger("Error resolving tree/network: ") << e.what() << "\n";
-        return 1;
-    }
+    auto& code = ds.gcode;
+    auto& aln = ds.aln;
+    auto& tree = ds.tree;
+    const auto& tree_source = ds.tree_source;
 
     // Validate branch selection upfront before fitting GTR/MG94
     Tree::BranchSelection branch_sel;
@@ -254,7 +171,7 @@ int run_busted(int argc, char* argv[]) {
     }
 
     Panel::print_card("Dataset & Model Settings", {
-        {"Alignment File", alignment_file},
+        {"Alignment File", cli.alignment_file},
         {"Sequences / Taxa", std::to_string(aln.num_taxa)},
         {"Codon Sites", std::to_string(aln.num_codons) + " (" + std::to_string(aln.num_codons * 3) + " nt)"},
         {"Unique Patterns", std::to_string(aln.patterns.size())},
@@ -268,7 +185,7 @@ int run_busted(int argc, char* argv[]) {
         {"Genetic Code", code->name}
     });
 
-    // 4. Initialize and run BUSTED / BUSTED-PH
+    // Initialize and run BUSTED / BUSTED-PH
     Panel::print_step(1, 2, "Fitting Baseline GTR & Global MG94 Models", "Exchangeability rates & branch lengths");
     BUSTEDAnalyzer analyzer = BUSTEDAnalyzer::create_and_fit(tree, aln);
     analyzer.select_branch_partitions(settings.test_branches, settings.comparison_branches, settings.phenotype_mode || settings.relax_mode);
@@ -283,7 +200,7 @@ int run_busted(int argc, char* argv[]) {
     if (settings.auto_select_k && !settings.full_auto && !settings.phenotype_mode) {
         std::cout << "  " << Console::muted("↳ Automatic model selection enabled (testing K = 1.." + std::to_string(settings.max_k) + ")...\n");
     }
-    BUSTEDResult res = analyzer.run(settings, show_progress, force_progress);
+    BUSTEDResult res = analyzer.run(settings, cli.show_progress, cli.force_progress);
 
     if (res.auto_diagnostics.enabled) {
         const auto& d = res.auto_diagnostics;
@@ -417,7 +334,7 @@ int run_busted(int argc, char* argv[]) {
     c_ss << std::fixed << std::setprecision(2) << res.constrained.log_likelihood << " (AICc: " << res.constrained.aicc << ", omega_" << res.optimal_k << " = 1.0)";
     time_ss << std::fixed << std::setprecision(2) << total_runtime << " s";
 
-    std::string json_desc = (json_format == JSONFormat::Legacy) ? " [Legacy]" : " [Modern v3.0]";
+    std::string json_desc = (cli.json_format == JSONFormat::Legacy) ? " [Legacy]" : " [Modern v3.0]";
     if (res.has_background_test) {
         std::ostringstream uit_ss, t_test_ss, s_test_ss, b_test_ss;
         uit_ss << "p_UIT = max(p_FG, p_diff) = " << std::scientific << std::setprecision(4) << res.union_intersection_p_value
@@ -448,7 +365,7 @@ int run_busted(int argc, char* argv[]) {
             sum_items.push_back({"3. Coupled-k RELAX Test (df=1)", r_ss.str()});
         }
         sum_items.push_back({"Unconstrained Two-Set Fit", u_ss.str()});
-        sum_items.push_back({"JSON Output File", output_file + json_desc});
+        sum_items.push_back({"JSON Output File", cli.output_file + json_desc});
         sum_items.push_back({"Total Execution Time", time_ss.str()});
         Panel::print_summary_card("BUSTED-PH Phenotype Association Summary", sum_items, res.phenotype_verdict, res.phenotype_associated);
     } else {
@@ -480,60 +397,41 @@ int run_busted(int argc, char* argv[]) {
                      : "[No sig. k != 1 shift]");
             sum_items.push_back({"Coupled-k RELAX Test (df=1)", r_ss.str()});
         }
-        sum_items.push_back({"JSON Output File", output_file + json_desc});
+        sum_items.push_back({"JSON Output File", cli.output_file + json_desc});
         sum_items.push_back({"Total Execution Time", time_ss.str()});
 
         Panel::print_summary_card("BUSTED Episodic Selection Analysis Summary", sum_items, conclusion, is_sig);
     }
 
     // Build Provenance
-    Provenance prov;
-    prov.invocation.cli_command = cli_cmd;
-    prov.invocation.working_directory = Provenance::get_cwd();
-    prov.invocation.arguments["alignment"] = alignment_file;
-    if (!tree_file.empty()) prov.invocation.arguments["tree"] = tree_file;
-    prov.invocation.arguments["code"] = code_name;
-    prov.invocation.arguments["rates"] = std::to_string(settings.num_rate_classes);
-    prov.invocation.arguments["srv"] = settings.srv ? "true" : "false";
-    prov.invocation.arguments["syn_rates"] = std::to_string(settings.num_syn_rate_classes);
-    prov.invocation.arguments["auto_k"] = settings.auto_select_k ? "true" : "false";
-    prov.invocation.arguments["multiple_hits"] = settings.multiple_hits;
-    prov.invocation.arguments["error_sink"] = settings.error_sink ? "true" : "false";
-    prov.invocation.arguments["phenotype_mode"] = settings.phenotype_mode ? "true" : "false";
-    if (!settings.comparison_branches.empty()) prov.invocation.arguments["comparison"] = settings.comparison_branches;
-    prov.invocation.arguments["refine_branch_lengths"] = settings.refine_branch_lengths ? "true" : "false";
-    prov.invocation.arguments["json_format"] = (json_format == JSONFormat::Legacy) ? "legacy" : "modern_v3";
-
-    size_t aln_sz = 0;
-    std::string aln_hash = crypto::SHA256::hash_file(alignment_file, &aln_sz);
-    prov.inputs["alignment"] = {alignment_file, "FASTA/NEXUS", aln_hash, aln_sz};
-
-    if (!tree_file.empty() && !TreeEngine::is_auto_tree_spec(tree_file) && !TreeEngine::is_ohmic_tree_spec(tree_file)) {
-        size_t tree_sz = 0;
-        std::string tree_hash = crypto::SHA256::hash_file(tree_file, &tree_sz);
-        prov.inputs["tree"] = {tree_file, "Newick", tree_hash, tree_sz};
+    std::map<std::string, std::string> extra_args = {
+        {"rates", std::to_string(settings.num_rate_classes)},
+        {"srv", settings.srv ? "true" : "false"},
+        {"syn_rates", std::to_string(settings.num_syn_rate_classes)},
+        {"auto_k", settings.auto_select_k ? "true" : "false"},
+        {"multiple_hits", settings.multiple_hits},
+        {"error_sink", settings.error_sink ? "true" : "false"},
+        {"phenotype_mode", settings.phenotype_mode ? "true" : "false"},
+        {"refine_branch_lengths", settings.refine_branch_lengths ? "true" : "false"}
+    };
+    if (!settings.comparison_branches.empty()) {
+        extra_args["comparison"] = settings.comparison_branches;
     }
+    Provenance prov = build_cli_provenance(cli, cli_cmd, start_iso, total_runtime, extra_args);
 
-    prov.execution.start_time = start_iso;
-    prov.execution.end_time = Provenance::current_iso8601();
-    prov.execution.wall_time_seconds = total_runtime;
-#ifdef _OPENMP
-    prov.execution.cpu_threads = (num_threads > 0) ? num_threads : omp_get_max_threads();
-#else
-    prov.execution.cpu_threads = 1;
-#endif
-    prov.execution.hostname = Provenance::get_hostname();
-    prov.execution.os = Provenance::detect_os();
-    prov.execution.compiler = Provenance::detect_compiler();
-
-    // Save JSON output
+    // Save JSON output (and optional HTML)
     try {
-        analyzer.save_json(output_file, res, json_format, prov);
-        std::string fmt_desc = (json_format == JSONFormat::Legacy) ? "Legacy Datamonkey JSON" : "Modern HyPhy v3.0 JSON";
+        analyzer.save_json(cli.output_file, res, cli.json_format, prov);
+        std::string fmt_desc = (cli.json_format == JSONFormat::Legacy) ? "Legacy Datamonkey JSON" : "Modern HyPhy v3.0 JSON";
         std::cout << Console::success("✔") << " " << Console::bold("Saved " + fmt_desc + " report to: ")
-                  << Console::brand(output_file) << "\n\n";
+                  << Console::brand(cli.output_file) << "\n\n";
+        if (!cli.html_file.empty()) {
+            hyphy::report::write_html_report(cli.output_file, cli.html_file);
+            std::cout << Console::success("✔") << " " << Console::bold("Saved HTML report to: ")
+                      << Console::brand(cli.html_file) << "\n\n";
+        }
     } catch (const std::exception& e) {
-        std::cerr << Console::danger("Warning: Failed to write JSON output: ") << e.what() << "\n";
+        std::cerr << Console::danger("Warning: Failed to write output: ") << e.what() << "\n";
     }
 
     if (res.is_failed) {

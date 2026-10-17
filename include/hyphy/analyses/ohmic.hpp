@@ -9,6 +9,7 @@
 #include "hyphy/core/wheatstone_likelihood.hpp"
 #include "hyphy/core/provenance.hpp"
 #include "hyphy/core/json_output.hpp"
+#include "hyphy/core/stats.hpp"
 #include "hyphy/opt/optimizer.hpp"
 #include "LBFGSB.h"
 #include <nlohmann/json.hpp>
@@ -174,9 +175,8 @@ private:
     }
 
     static Scalar compute_aicc(Scalar log_l, size_t k_params, size_t n_obs) {
-        Scalar k = static_cast<Scalar>(k_params);
-        Scalar n = std::max<Scalar>(static_cast<Scalar>(n_obs), k + 2.0);
-        return -2.0 * log_l + 2.0 * k + (2.0 * k * (k + 1.0)) / (n - k - 1.0);
+        size_t n_clamped = std::max<size_t>(n_obs, k_params + 2);
+        return hyphy::core::stats::compute_aicc(log_l, k_params, n_clamped);
     }
 
     void fit_nucleotide_network(OhmicResult& result) {

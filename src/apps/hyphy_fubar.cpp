@@ -1,14 +1,9 @@
 #include "hyphy/core/types.hpp"
-#include "hyphy/core/genetic_code.hpp"
-#include "hyphy/core/alignment.hpp"
-#include "hyphy/core/tree.hpp"
-#include "hyphy/core/ohmic_network.hpp"
+#include "hyphy/core/cli_common.hpp"
 #include "hyphy/core/rate_matrix.hpp"
 #include "hyphy/core/likelihood.hpp"
-#include "hyphy/core/console.hpp"
 #include "hyphy/opt/optimizer.hpp"
 #include "hyphy/analyses/fubar.hpp"
-#include "hyphy/analyses/tree_engine.hpp"
 
 #include <iostream>
 #include <string>
@@ -16,10 +11,6 @@
 #include <chrono>
 #include <iomanip>
 #include <numeric>
-
-#ifdef _OPENMP
-#include <omp.h>
-#endif
 
 using namespace hyphy::core;
 using namespace hyphy::analyses;
@@ -57,6 +48,7 @@ static void print_usage(const char* prog) {
               << "  " << Console::brand("--samples") << " <N>            MCMC samples to draw (default: 100)\n"
               << "  " << Console::brand("--threads, -T") << " <N>        Number of OpenMP worker threads\n"
               << "  " << Console::brand("--output, -o") << " <file>      Path to output JSON file (default: <alignment>.FUBAR.json)\n"
+              << "  " << Console::brand("--html") << " <file>            Also write a self-contained interactive HTML report\n"
               << "  " << Console::brand("--json-format") << " <fmt>      JSON schema format: modern (default) or legacy (HyPhy 2.5)\n"
               << "  " << Console::brand("--legacy-json") << "            Output legacy HyPhy 2.5 JSON schema\n"
               << "  " << Console::brand("--all-sites") << "              Display all codon sites in console table (default: significant only)\n"
@@ -71,38 +63,16 @@ static void print_usage(const char* prog) {
 }
 
 int run_fubar(int argc, char* argv[]) {
-    std::string alignment_file;
-    std::string tree_file;
-    std::string output_file;
-    std::string code_name = "Universal";
-    std::string embeddings_file;
-    int num_threads = 0;
-    
+    CommonCLIOptions cli;
     FUBARSettings settings;
-    std::string json_format = "modern";
-    bool show_progress = ProgressBar::is_terminal();
-    bool all_sites = false;
-    bool use_ohmic = false;
-    bool use_hyphaeon = false;
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
-        if ((arg == "--alignment" || arg == "-a") && i + 1 < argc) {
-            alignment_file = argv[++i];
-        } else if ((arg == "--tree" || arg == "-t") && i + 1 < argc) {
-            tree_file = argv[++i];
-        } else if (arg == "--ohmic" || arg == "--omhic") {
-            use_ohmic = true;
-        } else if (arg == "--hyphaeon") {
-            use_hyphaeon = true;
-        } else if (arg == "--no-hyphaeon") {
-            use_hyphaeon = false;
-        } else if (arg == "--embeddings" && i + 1 < argc) {
-            embeddings_file = argv[++i];
-            use_ohmic = true;
-        } else if (arg == "--code" && i + 1 < argc) {
-            code_name = argv[++i];
-        } else if ((arg == "--grid" || arg == "-g") && i + 1 < argc) {
+        auto status = parse_common_cli_arg(i, argc, argv, cli);
+        if (status == CommonArgParseStatus::Handled) continue;
+        if (status == CommonArgParseStatus::Error) return 1;
+
+        if ((arg == "--grid" || arg == "-g") && i + 1 < argc) {
             settings.grid_points = std::stoi(argv[++i]);
         } else if ((arg == "--method" || arg == "-m") && i + 1 < argc) {
             settings.method = string_to_fubar_method(argv[++i]);
@@ -122,29 +92,6 @@ int run_fubar(int argc, char* argv[]) {
             settings.mcmc_burn_in = std::stoll(argv[++i]);
         } else if (arg == "--samples" && i + 1 < argc) {
             settings.mcmc_samples = std::stoll(argv[++i]);
-        } else if ((arg == "--threads" || arg == "-T") && i + 1 < argc) {
-            num_threads = std::stoi(argv[++i]);
-        } else if ((arg == "--output" || arg == "-o") && i + 1 < argc) {
-            output_file = argv[++i];
-        } else if (arg == "--all-sites") {
-            all_sites = true;
-        } else if (arg == "--json-format" && i + 1 < argc) {
-            std::string fmt = argv[++i];
-            JSONFormat jf;
-            if (!parse_json_format(fmt, jf)) {
-                std::cerr << Console::danger("Error: unknown --json-format '") << fmt
-                          << "'. Expected 'modern' or 'legacy'.\n";
-                return 1;
-            }
-            json_format = (jf == JSONFormat::Legacy) ? "legacy" : "modern";
-        } else if (arg == "--legacy" || arg == "--legacy-json") {
-            json_format = "legacy";
-        } else if (arg == "--modern" || arg == "--modern-json") {
-            json_format = "modern";
-        } else if (arg == "--progress") {
-            show_progress = true;
-        } else if (arg == "--no-progress") {
-            show_progress = false;
         } else if (arg == "--help" || arg == "-h") {
             print_usage(argv[0]);
             return 0;
@@ -155,52 +102,26 @@ int run_fubar(int argc, char* argv[]) {
         }
     }
 
-    if (alignment_file.empty()) {
+    if (cli.alignment_file.empty()) {
         std::cerr << Console::danger("Error: Missing required argument --alignment.\n\n");
         print_usage(argv[0]);
         return 1;
     }
 
-    if (output_file.empty()) {
-        output_file = alignment_file + ".FUBAR.json";
-    }
-
-#ifdef _OPENMP
-    if (num_threads > 0) {
-        omp_set_num_threads(num_threads);
-    }
-#endif
-
+    finalize_common_cli_options(cli, ".FUBAR.json");
     print_banner();
 
-    // 1. Load Alignment & Tree
-    std::shared_ptr<const GeneticCode> gcode;
-    try {
-        gcode = GeneticCode::from_name(code_name);
-    } catch (const std::exception& e) {
-        std::cerr << Console::danger("Error loading genetic code: ") << e.what() << "\n";
+    LoadedCodonDataset ds;
+    if (!load_codon_dataset(cli, ds, false)) {
         return 1;
     }
-
-    Alignment aln;
-    try {
-        aln = Alignment::load(alignment_file, gcode);
-    } catch (const std::exception& e) {
-        std::cerr << Console::danger("Error reading input files: ") << e.what() << "\n";
-        return 1;
-    }
-
-    Tree tree;
-    std::string tree_source;
-    try {
-        tree = TreeEngine::resolve_tree(aln, tree_file, use_ohmic, use_hyphaeon, embeddings_file, &tree_source);
-    } catch (const std::exception& e) {
-        std::cerr << Console::danger("Error resolving phylogeny: ") << e.what() << "\n";
-        return 1;
-    }
+    auto& gcode = ds.gcode;
+    auto& aln = ds.aln;
+    auto& tree = ds.tree;
+    const auto& tree_source = ds.tree_source;
 
     Panel::print_card("Dataset & Configuration", {
-        {"Alignment File", alignment_file},
+        {"Alignment File", cli.alignment_file},
         {"Sequences / Taxa", std::to_string(aln.num_taxa)},
         {"Codon Sites", std::to_string(aln.num_codons)},
         {"Unique Patterns", std::to_string(aln.patterns.size())},
@@ -211,7 +132,7 @@ int run_fubar(int argc, char* argv[]) {
         {"Concentration", format_float_val(settings.concentration, 2)},
         {"Posterior Threshold", format_float_val(settings.posterior_threshold, 2)},
 #ifdef _OPENMP
-        {"OpenMP Worker Threads", std::to_string((num_threads > 0) ? num_threads : omp_get_max_threads())}
+        {"OpenMP Worker Threads", std::to_string((cli.num_threads > 0) ? cli.num_threads : omp_get_max_threads())}
 #else
         {"OpenMP Worker Threads", "1 (Serial Build)"}
 #endif
@@ -219,18 +140,18 @@ int run_fubar(int argc, char* argv[]) {
 
     // 2. Initialize and Fit
     auto progress_cb = [&](const std::string& msg, double pct) {
-        if (!show_progress) return;
+        if (!cli.show_progress) return;
         std::cout << Console::brand("==> ") << Console::bold(msg) 
                   << Console::muted(" [" + std::to_string(static_cast<int>(pct * 100)) + "%]") << "\n";
     };
 
     FUBARAnalyzer fubar = FUBARAnalyzer::create_and_fit(tree, aln, settings, progress_cb);
-    FUBARResult result = fubar.run(progress_cb, show_progress);
+    FUBARResult result = fubar.run(progress_cb, cli.show_progress);
 
     // 3. Console Presentation
     FUBARAnalyzer::print_summary(result, settings);
 
-    if (all_sites) {
+    if (cli.all_sites) {
         Table all_tbl;
         all_tbl.add_column("Codon", Table::Align::Right);
         all_tbl.add_column("alpha", Table::Align::Right);
@@ -263,24 +184,12 @@ int run_fubar(int argc, char* argv[]) {
         FUBARAnalyzer::print_results_table(result, settings);
     }
 
-    // 4. Save JSON Output
-    std::string cli_cmd = "hyphy3 fubar";
-    for (int i = 1; i < argc; ++i) {
-        cli_cmd += " ";
-        cli_cmd += argv[i];
-    }
-
-    try {
-        std::string json_str = fubar.to_json(result, json_format, cli_cmd, alignment_file);
-        std::ofstream out(output_file);
-        if (!out.is_open()) {
-            throw std::runtime_error("Could not open output file: " + output_file);
-        }
-        out << json_str;
-        std::cout << Console::bold("Output:\n")
-                  << "  " << Console::muted("Analysis results saved to: ") << Console::brand(output_file) << "\n\n";
-    } catch (const std::exception& e) {
-        std::cerr << Console::danger("Error writing JSON output: ") << e.what() << "\n";
+    // 4. Save JSON Output (and optional HTML)
+    std::string cli_cmd = join_cli_command(argc, argv);
+    std::string json_format_str = (cli.json_format == JSONFormat::Legacy) ? "legacy" : "modern";
+    std::string json_str = fubar.to_json(result, json_format_str, cli_cmd, cli.alignment_file);
+    if (!write_cli_json_and_html(cli, json_str)) {
+        return 1;
     }
 
     return 0;

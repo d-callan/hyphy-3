@@ -1,8 +1,5 @@
 #include "hyphy/analyses/directional_fel.hpp"
-#include "hyphy/analyses/tree_engine.hpp"
-#include "hyphy/core/ohmic_network.hpp"
-#include "hyphy/core/console.hpp"
-#include "hyphy/report/html_report.hpp"
+#include "hyphy/core/cli_common.hpp"
 #include <iostream>
 #include <iomanip>
 #include <chrono>
@@ -84,77 +81,31 @@ static std::string render_rate_spark(Scalar alpha, Scalar beta) {
 }
 
 int run_dfel(int argc, char* argv[]) {
-    std::string alignment_file;
-    std::string tree_file;
-    std::string output_file;
-    std::string html_file;
-    std::string code_name = "Universal";
+    CommonCLIOptions cli;
     std::string root_strategy = "auto";
     std::string regimes_opt = "auto";
-    std::string embeddings_file;
-    int num_threads = 0;
     Scalar pvalue_threshold = 0.1;
     Scalar het_threshold = 0.05;
-    bool show_progress = ProgressBar::is_terminal();
-    bool force_progress = false;
     bool full_model = true;
-    bool all_sites = false;
-    bool use_ohmic = false;
-    bool use_hyphaeon = false;
-    JSONFormat json_format = JSONFormat::ModernV3;
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
-        if ((arg == "--alignment" || arg == "-a") && i + 1 < argc) {
-            alignment_file = argv[++i];
-        } else if ((arg == "--tree" || arg == "-t") && i + 1 < argc) {
-            tree_file = argv[++i];
-        } else if (arg == "--ohmic" || arg == "--omhic") {
-            use_ohmic = true;
-        } else if (arg == "--hyphaeon") {
-            use_hyphaeon = true;
-        } else if (arg == "--no-hyphaeon") {
-            use_hyphaeon = false;
-        } else if (arg == "--embeddings" && i + 1 < argc) {
-            embeddings_file = argv[++i];
-            use_ohmic = true;
-        } else if ((arg == "--code" || arg == "-c") && i + 1 < argc) {
-            code_name = argv[++i];
-        } else if ((arg == "--root" || arg == "-r") && i + 1 < argc) {
+        auto status = parse_common_cli_arg(i, argc, argv, cli);
+        if (status == CommonArgParseStatus::Handled) continue;
+        if (status == CommonArgParseStatus::Error) return 1;
+
+        if ((arg == "--root" || arg == "-r") && i + 1 < argc) {
             root_strategy = argv[++i];
         } else if ((arg == "--regimes" || arg == "-k") && i + 1 < argc) {
             regimes_opt = argv[++i];
         } else if ((arg == "--heterogeneity" || arg == "--heterogeneity-threshold") && i + 1 < argc) {
             het_threshold = std::stod(argv[++i]);
-        } else if ((arg == "--threads" || arg == "-T") && i + 1 < argc) {
-            num_threads = std::stoi(argv[++i]);
-        } else if ((arg == "--output" || arg == "-o") && i + 1 < argc) {
-            output_file = argv[++i];
-        } else if (arg == "--html" && i + 1 < argc) {
-            html_file = argv[++i];
         } else if ((arg == "--pvalue" || arg == "-p") && i + 1 < argc) {
             pvalue_threshold = std::stod(argv[++i]);
-        } else if (arg == "--json-format" && i + 1 < argc) {
-            std::string fmt = argv[++i];
-            if (!parse_json_format(fmt, json_format)) {
-                std::cerr << Console::danger("Error: unknown --json-format '") << fmt
-                          << "'. Expected 'modern' or 'legacy'.\n";
-                return 1;
-            }
-        } else if (arg == "--legacy-json") {
-            json_format = JSONFormat::Legacy;
-        } else if (arg == "--modern-json") {
-            json_format = JSONFormat::ModernV3;
         } else if (arg == "--quick" || arg == "--no-full-model") {
             full_model = false;
-        } else if (arg == "--all-sites") {
-            all_sites = true;
-        } else if (arg == "--progress") {
-            show_progress = true;
-            force_progress = true;
-        } else if (arg == "--no-progress") {
-            show_progress = false;
-            force_progress = false;
+        } else if (arg == "--full-model") {
+            full_model = true;
         } else if (arg == "--help" || arg == "-h") {
             print_dfel_usage(argv[0]);
             return 0;
@@ -165,56 +116,28 @@ int run_dfel(int argc, char* argv[]) {
         }
     }
 
-    if (alignment_file.empty()) {
+    if (cli.alignment_file.empty()) {
         std::cerr << Console::danger("Error: --alignment is required.\n\n");
         print_dfel_usage(argv[0]);
         return 1;
     }
 
-#ifdef _OPENMP
-    if (num_threads > 0) {
-        omp_set_num_threads(num_threads);
-    }
-#endif
-
-    if (output_file.empty()) {
-        output_file = alignment_file + ".dFEL.json";
-    }
-
+    finalize_common_cli_options(cli, ".dFEL.json");
     print_dfel_banner();
 
     auto start_time = std::chrono::high_resolution_clock::now();
 
-    // 0. Genetic Code
-    std::shared_ptr<const GeneticCode> gcode;
-    try {
-        gcode = GeneticCode::from_name(code_name);
-    } catch (const std::exception& e) {
-        std::cerr << Console::danger("Error resolving genetic code: ") << e.what() << "\n";
+    LoadedCodonDataset ds;
+    if (!load_codon_dataset(cli, ds, false)) {
         return 1;
     }
-
-    // 1. Load Alignment
-    Alignment aln;
-    try {
-        aln = Alignment::load(alignment_file, gcode);
-    } catch (const std::exception& e) {
-        std::cerr << Console::danger("Error loading alignment: ") << e.what() << "\n";
-        return 1;
-    }
-
-    // 2. Load or Infer Tree (supports --tree auto / --ohmic and tree-free FASTA alignments)
-    Tree tree;
-    std::string tree_source;
-    try {
-        tree = TreeEngine::resolve_tree(aln, tree_file, use_ohmic, use_hyphaeon, embeddings_file, &tree_source);
-    } catch (const std::exception& e) {
-        std::cerr << Console::danger("Error resolving phylogeny: ") << e.what() << "\n";
-        return 1;
-    }
+    auto& gcode = ds.gcode;
+    auto& aln = ds.aln;
+    auto& tree = ds.tree;
+    const auto& tree_source = ds.tree_source;
 
     Panel::print_card("Dataset & Phylogeny", {
-        {"Alignment File", alignment_file},
+        {"Alignment File", cli.alignment_file},
         {"Sequences / Taxa", std::to_string(aln.num_taxa)},
         {"Codon Sites", std::to_string(aln.num_codons) + " (" + std::to_string(aln.num_codons * 3) + " nt)"},
         {"Unique Patterns", std::to_string(aln.patterns.size())},
@@ -346,7 +269,7 @@ int run_dfel(int argc, char* argv[]) {
 
     // Step 4: Site-Level Testing
     Panel::print_step(4, 4, "Site-by-Site Directional Selection Testing", "Testing alpha vs beta with directed substitutions");
-    auto results = dfel.run(show_progress, force_progress);
+    auto results = dfel.run(cli.show_progress, cli.force_progress);
 
     // Candidates Table
     std::vector<size_t> sig_indices;
@@ -357,7 +280,7 @@ int run_dfel(int argc, char* argv[]) {
     }
 
     std::vector<size_t> display_indices;
-    if (all_sites) {
+    if (cli.all_sites) {
         display_indices.resize(results.size());
         for (size_t s = 0; s < results.size(); ++s) display_indices[s] = s;
     } else if (!sig_indices.empty()) {
@@ -421,41 +344,33 @@ int run_dfel(int argc, char* argv[]) {
     auto end_time = std::chrono::high_resolution_clock::now();
     double total_sec = std::chrono::duration<double>(end_time - start_time).count();
 
-    auto fmt_pct = [](size_t n, size_t tot) {
-        if (tot == 0) return std::string("0.0%");
-        double p = (100.0 * n) / tot;
-        std::ostringstream ss;
-        ss << std::fixed << std::setprecision(1) << p << "%";
-        return ss.str();
-    };
-
     Panel::print_card("Directional FEL Execution Summary", {
         {"Compositional Heterogeneity", comp_res.is_heterogeneous ? "Detected (Regimes Activated)" : "Homogeneous"},
         {"Selected Root Branch", root_res.chosen_branch_name + " (Support: " + SiteVisualizer::format_scalar(root_res.chosen_weight * 100.0, 1) + "%)"},
         {"Directional Regimes", std::to_string(dfel.regimes.size())},
         {"Tested Codon Sites", std::to_string(summary.tested_sites)},
-        {"Diversifying Selection (Positive)", Console::success(std::to_string(summary.positively_selected)) + " sites (" + fmt_pct(summary.positively_selected, summary.tested_sites) + ")"},
-        {"Purifying Selection (Negative)", Console::info(std::to_string(summary.negatively_selected)) + " sites (" + fmt_pct(summary.negatively_selected, summary.tested_sites) + ")"},
-        {"Neutral Sites", std::to_string(summary.neutral_sites) + " sites (" + fmt_pct(summary.neutral_sites, summary.tested_sites) + ")"},
+        {"Diversifying Selection (Positive)", Console::success(std::to_string(summary.positively_selected)) + " sites (" + format_percentage(summary.positively_selected, summary.tested_sites) + ")"},
+        {"Purifying Selection (Negative)", Console::info(std::to_string(summary.negatively_selected)) + " sites (" + format_percentage(summary.negatively_selected, summary.tested_sites) + ")"},
+        {"Neutral Sites", std::to_string(summary.neutral_sites) + " sites (" + format_percentage(summary.neutral_sites, summary.tested_sites) + ")"},
         {"Global MG94 Fit", SiteVisualizer::format_scalar(dfel.global_log_l, 2) + " (AICc: " + SiteVisualizer::format_scalar(dfel.global_aicc, 2) + ")"},
-        {"Output JSON", output_file},
+        {"Output JSON", cli.output_file},
         {"Total Runtime", SiteVisualizer::format_scalar(total_sec, 2) + " s"}
     });
 
     // Export JSON
     try {
-        dfel.export_json(output_file, json_format, alignment_file, dfel.tree.to_newick(true));
-        std::cout << Console::success("✓ ") << "Analysis results written to " << Console::bold(output_file) << "\n\n";
+        dfel.export_json(cli.output_file, cli.json_format, cli.alignment_file, dfel.tree.to_newick(true));
+        std::cout << Console::success("✓ ") << "Analysis results written to " << Console::bold(cli.output_file) << "\n\n";
     } catch (const std::exception& e) {
         std::cerr << Console::danger("Error exporting JSON: ") << e.what() << "\n";
         return 1;
     }
 
-    if (!html_file.empty()) {
+    if (!cli.html_file.empty()) {
         try {
-            hyphy::report::write_html_report(output_file, html_file);
+            hyphy::report::write_html_report(cli.output_file, cli.html_file);
             std::cout << Console::success("✔") << " " << Console::bold("Saved HTML report to: ")
-                      << Console::brand(html_file) << "\n\n";
+                      << Console::brand(cli.html_file) << "\n\n";
         } catch (const std::exception& e) {
             std::cerr << Console::danger("Error writing HTML report: ") << e.what() << "\n";
             return 1;

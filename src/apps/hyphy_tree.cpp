@@ -161,9 +161,30 @@ int run_tree(int argc, char* argv[]) {
 
         // Write JSON output if requested
         if (!output_json_path.empty()) {
+            Provenance prov;
+            prov.invocation.cli_command = "hyphy3 tree";
+            for (int i = 1; i < argc; ++i) {
+                prov.invocation.cli_command += " " + std::string(argv[i]);
+            }
+            prov.invocation.working_directory = Provenance::get_cwd();
+            if (!aln_path.empty()) {
+                size_t sz = 0;
+                std::string hash = crypto::SHA256::hash_file(aln_path, &sz);
+                if (!hash.empty()) {
+                    prov.inputs["alignment"] = {aln_path, "FASTA/NEXUS", hash, sz};
+                }
+            }
+            prov.execution.start_time = Provenance::current_iso8601();
+            prov.execution.end_time = prov.execution.start_time;
+            prov.execution.wall_time_seconds = res.runtime_seconds;
+            prov.execution.cpu_threads = (num_threads > 0) ? num_threads : 1;
+            prov.execution.hostname = Provenance::get_hostname();
+            prov.execution.os = Provenance::detect_os();
+            prov.execution.compiler = Provenance::detect_compiler();
+
             std::ofstream json_file(output_json_path);
             if (json_file.is_open()) {
-                json_file << engine.to_json(res).dump(2) << "\n";
+                json_file << engine.to_json(res, prov).dump(2) << "\n";
                 if (!quiet) {
                     std::cout << Console::success("Saved analysis JSON to: ") << output_json_path << "\n";
                 }
