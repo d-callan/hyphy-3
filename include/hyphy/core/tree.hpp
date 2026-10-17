@@ -83,8 +83,8 @@ public:
         const std::vector<double>& node_log_scale,
         VecType& out_L,
         double& out_child_scale_sum,
-        const std::vector<std::array<MatType, 3>>* P_bridges = nullptr,
-        double* out_boost_mult = nullptr
+        double* out_boost_mult = nullptr,
+        const std::vector<std::array<MatType, 3>>* P_bridges = nullptr
     ) const {
         int32_t b_idx = bridge_index(nid);
         if (b_idx >= 0) {

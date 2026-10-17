@@ -274,7 +274,7 @@ public:
                 for (int32_t cid : node.children) {
                     P_D[cid] = P_branches[cid] * res.D[cid];
                 }
-                tree.eval_internal_node(nid, P_branches, res.D, node_log_scale, res.D[nid], child_scale_sum, nullptr, &boost_mult);
+                tree.eval_internal_node(nid, P_branches, res.D, node_log_scale, res.D[nid], child_scale_sum, &boost_mult);
                 // B[nid] must record the node's own boost so the pre-order pass
                 // re-applies the same scaling to outside messages (v_msg *= B[uid]).
                 B[nid] = boost_mult;

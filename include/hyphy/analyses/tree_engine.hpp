@@ -433,7 +433,7 @@ public:
                                 for (int32_t cid : node.children) {
                                     P_D[cid] = P_b[cid] * node_L[cid];
                                 }
-                                tree_ref.eval_internal_node(nid, P_b, node_L, node_log_scale, node_L[nid], child_scale_sum, nullptr, &boost_mult);
+                                tree_ref.eval_internal_node(nid, P_b, node_L, node_log_scale, node_L[nid], child_scale_sum, &boost_mult);
                                 // B[nid] records the node's own boost so the pre-order
                                 // pass re-applies it (v_msg *= B[uid]).
                                 B[nid] = boost_mult;
@@ -677,7 +677,7 @@ public:
                         for (int32_t cid : node.children) {
                             P_D[cid] = P_b[cid] * D_all[cid];
                         }
-                        tree.eval_internal_node(nid, P_b, D_all, node_log_scale, D_all[nid], child_scale_sum, nullptr, &boost_mult);
+                        tree.eval_internal_node(nid, P_b, D_all, node_log_scale, D_all[nid], child_scale_sum, &boost_mult);
                         // B[nid] records the node's own boost so the pre-order
                         // pass re-applies it (v_msg *= B[uid]).
                         B[nid] = boost_mult;
