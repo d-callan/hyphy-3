@@ -52,6 +52,67 @@ public:
         return leaf_to_taxon;
     }
 
+    // One post-order pass over the tree for a single site pattern: leaf
+    // likelihoods are initialized from pattern.states and internal-node
+    // partials are computed via eval_internal_node (which rescales underflowing
+    // partials internally and folds the result into node_log_scale).
+    // Pass init_leaves=false on repeat traversals of the same pattern when leaf
+    // likelihoods are already populated — e.g. rate-class/mixture loops that
+    // re-evaluate internals under a different P_branches set.
+    template <typename VecType, typename MatType>
+    static void eval_pattern_postorder(
+        const Tree& tree,
+        const SitePattern& pattern,
+        const std::vector<size_t>& leaf_to_taxon,
+        const std::vector<MatType>& P_branches,
+        int S,
+        std::vector<VecType>& node_L,
+        std::vector<double>& node_log_scale,
+        bool init_leaves = true
+    ) {
+        for (int32_t node_id : tree.post_order) {
+            const auto& node = tree.nodes[node_id];
+            if (node.is_leaf) {
+                if (!init_leaves) continue;
+                size_t t_idx = leaf_to_taxon[node_id];
+                if (t_idx != static_cast<size_t>(-1)) {
+                    int8_t state = pattern.states[t_idx];
+                    if (state >= 0 && state < S) {
+                        node_L[node_id].setZero();
+                        node_L[node_id](state) = 1.0;
+                    } else {
+                        node_L[node_id].setOnes();
+                    }
+                } else {
+                    node_L[node_id].setOnes();
+                }
+                node_log_scale[node_id] = 0.0;
+            } else {
+                double child_scale_sum = 0.0;
+                tree.eval_internal_node(node_id, P_branches, node_L, node_log_scale, node_L[node_id], child_scale_sum);
+                node_log_scale[node_id] = child_scale_sum;
+            }
+        }
+    }
+
+    // Per-pattern log-likelihood under an MG94 model: postorder pass, root
+    // mixture over equilibrium frequencies, -1e20 sentinel when the root
+    // conditional likelihood is not positive.
+    static Scalar compute_pattern_log_likelihood(
+        const Tree& tree,
+        const SitePattern& pattern,
+        const std::vector<size_t>& leaf_to_taxon,
+        const MG94Matrix& mg94_model,
+        const std::vector<Matrix>& P_branches,
+        std::vector<Vector>& node_L,
+        std::vector<double>& node_log_scale
+    ) {
+        eval_pattern_postorder(tree, pattern, leaf_to_taxon, P_branches,
+                               static_cast<int>(mg94_model.pi.size()), node_L, node_log_scale);
+        Scalar pat_l = mg94_model.pi.dot(node_L[tree.root_id]);
+        return (pat_l > 0.0) ? std::log(pat_l) + node_log_scale[tree.root_id] : -1e20;
+    }
+
     // Nucleotide GTR Tree Likelihood
     static Scalar compute_gtr_log_likelihood(
         const Tree& tree,
@@ -85,29 +146,7 @@ public:
             for (size_t p = 0; p < num_patterns; ++p) {
                 const auto& pattern = aln.patterns[p];
 
-                for (int32_t node_id : tree.post_order) {
-                    const auto& node = tree.nodes[node_id];
-
-                    if (node.is_leaf) {
-                        size_t t_idx = leaf_to_taxon[node_id];
-                        if (t_idx != static_cast<size_t>(-1)) {
-                            int8_t state = pattern.states[t_idx];
-                            if (state >= 0 && state < 4) {
-                                node_L[node_id].setZero();
-                                node_L[node_id](state) = 1.0;
-                            } else {
-                                node_L[node_id].setOnes();
-                            }
-                        } else {
-                            node_L[node_id].setOnes();
-                        }
-                        node_log_scale[node_id] = 0.0;
-                    } else {
-                        double child_scale_sum = 0.0;
-                        tree.eval_internal_node(node_id, P_branches, node_L, node_log_scale, node_L[node_id], child_scale_sum);
-                        node_log_scale[node_id] = child_scale_sum;
-                    }
-                }
+                eval_pattern_postorder(tree, pattern, leaf_to_taxon, P_branches, 4, node_L, node_log_scale);
 
                 Scalar pattern_likelihood = gtr_model.pi.dot(node_L[tree.root_id]);
                 if (pattern_likelihood > 0.0) {
@@ -172,31 +211,7 @@ public:
             for (size_t p = 0; p < num_patterns; ++p) {
                 const auto& pattern = aln.patterns[p];
 
-                for (int32_t node_id : tree.post_order) {
-                    const auto& node = tree.nodes[node_id];
-
-                    if (node.is_leaf) {
-                        size_t t_idx = leaf_to_taxon[node_id];
-                        if (t_idx != static_cast<size_t>(-1)) {
-                            int8_t state = pattern.states[t_idx];
-                            if (state >= 0 && state < S) {
-                                node_L[node_id].setZero();
-                                node_L[node_id](state) = 1.0;
-                            } else {
-                                node_L[node_id].setOnes();
-                            }
-                        } else {
-                            node_L[node_id].setOnes();
-                        }
-                        node_log_scale[node_id] = 0.0;
-                    } else {
-                        double child_scale_sum = 0.0;
-                        tree.eval_internal_node(node_id, P_branches, node_L, node_log_scale, node_L[node_id], child_scale_sum);
-                        // eval_internal_node rescales underflowing partials internally and
-                        // returns the net log scale in child_scale_sum.
-                        node_log_scale[node_id] = child_scale_sum;
-                    }
-                }
+                eval_pattern_postorder(tree, pattern, leaf_to_taxon, P_branches, S, node_L, node_log_scale);
 
                 Scalar pattern_likelihood = pi.dot(node_L[tree.root_id]);
                 if (pattern_likelihood > 0.0) {

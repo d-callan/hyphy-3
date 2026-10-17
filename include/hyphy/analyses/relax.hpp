@@ -600,28 +600,7 @@ public:
                 Scalar pll = -1e20;
 
                 if (branch_site) {
-                    for (int32_t nid : t.post_order) {
-                        const auto& node = t.nodes[nid];
-                        if (node.is_leaf) {
-                            size_t t_idx = leaf_to_taxon[nid];
-                            if (t_idx != static_cast<size_t>(-1)) {
-                                int code_val = pattern.states[t_idx];
-                                if (code_val >= 0 && code_val < static_cast<int>(S)) {
-                                    node_L[nid].setZero();
-                                    node_L[nid](code_val) = 1.0;
-                                } else {
-                                    node_L[nid].setOnes();
-                                }
-                            } else {
-                                node_L[nid].setOnes();
-                            }
-                            node_log_scale[nid] = 0.0;
-                        } else {
-                            double child_scale_sum = 0.0;
-                            t.eval_internal_node(nid, P_branches[0], node_L, node_log_scale, node_L[nid], child_scale_sum);
-                            node_log_scale[nid] = child_scale_sum;
-                        }
-                    }
+                    LikelihoodEngine::eval_pattern_postorder(t, pattern, leaf_to_taxon, P_branches[0], static_cast<int>(S), node_L, node_log_scale);
 
                     Scalar class_L = eq_freqs.dot(node_L[t.root_id]);
                     if (class_L > 0.0) {
@@ -635,28 +614,7 @@ public:
                     for (int c = 0; c < 3; ++c) {
                         if (class_w[c] <= 1e-12) continue;
 
-                        for (int32_t nid : t.post_order) {
-                            const auto& node = t.nodes[nid];
-                            if (node.is_leaf) {
-                                size_t t_idx = leaf_to_taxon[nid];
-                                if (t_idx != static_cast<size_t>(-1)) {
-                                    int code_val = pattern.states[t_idx];
-                                    if (code_val >= 0 && code_val < static_cast<int>(S)) {
-                                        node_L[nid].setZero();
-                                        node_L[nid](code_val) = 1.0;
-                                    } else {
-                                        node_L[nid].setOnes();
-                                    }
-                                } else {
-                                    node_L[nid].setOnes();
-                                }
-                                node_log_scale[nid] = 0.0;
-                            } else {
-                                double child_scale_sum = 0.0;
-                                t.eval_internal_node(nid, P_branches[c], node_L, node_log_scale, node_L[nid], child_scale_sum);
-                                node_log_scale[nid] = child_scale_sum;
-                            }
-                        }
+                        LikelihoodEngine::eval_pattern_postorder(t, pattern, leaf_to_taxon, P_branches[c], static_cast<int>(S), node_L, node_log_scale);
 
                         Scalar class_L = eq_freqs.dot(node_L[t.root_id]);
                         if (class_L > 0.0) {

@@ -972,37 +972,9 @@ private:
         std::vector<double>& node_log_scale,
         int S
     ) {
-        for (int32_t node_id : tree.post_order) {
-            const auto& node = tree.nodes[node_id];
-
-            if (node.is_leaf) {
-                size_t t_idx = leaf_to_taxon[node_id];
-                if (t_idx != static_cast<size_t>(-1)) {
-                    int8_t state = pattern.states[t_idx];
-                    if (state >= 0 && state < S) {
-                        node_L[node_id].setZero();
-                        node_L[node_id](state) = 1.0;
-                    } else {
-                        node_L[node_id].setOnes();
-                    }
-                } else {
-                    node_L[node_id].setOnes();
-                }
-                node_log_scale[node_id] = 0.0;
-            } else {
-                double child_scale_sum = 0.0;
-                tree.eval_internal_node(node_id, P_branches, node_L, node_log_scale, node_L[node_id], child_scale_sum);
-                // eval_internal_node rescales underflowing partials internally.
-                node_log_scale[node_id] = child_scale_sum;
-            }
-        }
-
+        LikelihoodEngine::eval_pattern_postorder(tree, pattern, leaf_to_taxon, P_branches, S, node_L, node_log_scale);
         Scalar pat_l = mg94_model.pi.dot(node_L[tree.root_id]);
-        if (pat_l > 0.0) {
-            return std::log(pat_l) + node_log_scale[tree.root_id];
-        } else {
-            return -1e20;
-        }
+        return (pat_l > 0.0) ? std::log(pat_l) + node_log_scale[tree.root_id] : -1e20;
     }
 };
 

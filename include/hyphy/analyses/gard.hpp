@@ -519,26 +519,6 @@ public:
         auto eval_pattern = [&](size_t p, std::vector<Vector4>& node_L, std::vector<double>& node_log_scale) -> Scalar {
             const auto& pattern = aln.patterns[p];
 
-            // Initialize leaf states once for this pattern
-            for (int32_t node_id : tree.post_order) {
-                const auto& node = tree.nodes[node_id];
-                if (node.is_leaf) {
-                    size_t t_idx = leaf_to_taxon[node_id];
-                    if (t_idx != static_cast<size_t>(-1)) {
-                        int8_t state = pattern.states[t_idx];
-                        if (state >= 0 && state < 4) {
-                            node_L[node_id].setZero();
-                            node_L[node_id](state) = 1.0;
-                        } else {
-                            node_L[node_id].setOnes();
-                        }
-                    } else {
-                        node_L[node_id].setOnes();
-                    }
-                    node_log_scale[node_id] = 0.0;
-                }
-            }
-
             Scalar max_log = -1e300;
             std::vector<Scalar> log_terms(K_rates, -1e300);
 
@@ -546,14 +526,8 @@ public:
                 Scalar w_k = effective_weights[k];
                 const auto& P_k = P_branches[k];
 
-                for (int32_t node_id : tree.post_order) {
-                    const auto& node = tree.nodes[node_id];
-                    if (!node.is_leaf) {
-                        double child_scale_sum = 0.0;
-                        tree.eval_internal_node(node_id, P_k, node_L, node_log_scale, node_L[node_id], child_scale_sum);
-                        node_log_scale[node_id] = child_scale_sum;
-                    }
-                }
+                // First pass initializes leaf states; later passes reuse them.
+                LikelihoodEngine::eval_pattern_postorder(tree, pattern, leaf_to_taxon, P_k, 4, node_L, node_log_scale, k == 0);
 
                 Scalar cond_l = gtr_model.pi.dot(node_L[tree.root_id]);
                 if (cond_l > 0.0) {

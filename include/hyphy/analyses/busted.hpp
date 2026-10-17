@@ -294,28 +294,7 @@ public:
                 const auto& pattern = aln.patterns[p];
                 Scalar pll = -1e20;
                 if (M == 1) {
-                    for (int32_t node_id : tree.post_order) {
-                        const auto& node = tree.nodes[node_id];
-                        if (node.is_leaf) {
-                            size_t t_idx = leaf_to_taxon[node_id];
-                            if (t_idx != static_cast<size_t>(-1)) {
-                                int8_t state = pattern.states[t_idx];
-                                if (state >= 0 && state < S) {
-                                    node_L[node_id].setZero();
-                                    node_L[node_id](state) = 1.0;
-                                } else {
-                                    node_L[node_id].setOnes();
-                                }
-                            } else {
-                                node_L[node_id].setOnes();
-                            }
-                            node_log_scale[node_id] = 0.0;
-                        } else {
-                            double child_scale_sum = 0.0;
-                            tree.eval_internal_node(node_id, P_mix[0], node_L, node_log_scale, node_L[node_id], child_scale_sum);
-                            node_log_scale[node_id] = child_scale_sum;
-                        }
-                    }
+                    LikelihoodEngine::eval_pattern_postorder(tree, pattern, leaf_to_taxon, P_mix[0], S, node_L, node_log_scale);
                     Scalar cond_L = aln.codon_frequencies_f3x4.dot(node_L[tree.root_id]);
                     if (cond_L > 0.0) {
                         pll = std::log(cond_L) + node_log_scale[tree.root_id];
@@ -326,28 +305,7 @@ public:
                     std::vector<bool> valid(M, false);
 
                     for (size_t m = 0; m < M; ++m) {
-                        for (int32_t node_id : tree.post_order) {
-                            const auto& node = tree.nodes[node_id];
-                            if (node.is_leaf) {
-                                size_t t_idx = leaf_to_taxon[node_id];
-                                if (t_idx != static_cast<size_t>(-1)) {
-                                    int8_t state = pattern.states[t_idx];
-                                    if (state >= 0 && state < S) {
-                                        node_L[node_id].setZero();
-                                        node_L[node_id](state) = 1.0;
-                                    } else {
-                                        node_L[node_id].setOnes();
-                                    }
-                                } else {
-                                    node_L[node_id].setOnes();
-                                }
-                                node_log_scale[node_id] = 0.0;
-                            } else {
-                                double child_scale_sum = 0.0;
-                                tree.eval_internal_node(node_id, P_mix[m], node_L, node_log_scale, node_L[node_id], child_scale_sum);
-                                node_log_scale[node_id] = child_scale_sum;
-                            }
-                        }
+                        LikelihoodEngine::eval_pattern_postorder(tree, pattern, leaf_to_taxon, P_mix[m], S, node_L, node_log_scale);
                         Scalar cond_L = aln.codon_frequencies_f3x4.dot(node_L[tree.root_id]);
                         if (cond_L > 0.0) {
                             Scalar term = std::log(syn_weights[m]) + std::log(cond_L) + node_log_scale[tree.root_id];
@@ -2000,28 +1958,7 @@ public:
                 const auto& pattern = aln.patterns[p];
                 Scalar pll = -1e20;
                 if (M == 1) {
-                    for (int32_t node_id : tree.post_order) {
-                        const auto& node = tree.nodes[node_id];
-                        if (node.is_leaf) {
-                            size_t t_idx = leaf_to_taxon[node_id];
-                            if (t_idx != static_cast<size_t>(-1)) {
-                                int8_t state = pattern.states[t_idx];
-                                if (state >= 0 && state < S) {
-                                    node_L[node_id].setZero();
-                                    node_L[node_id](state) = 1.0;
-                                } else {
-                                    node_L[node_id].setOnes();
-                                }
-                            } else {
-                                node_L[node_id].setOnes();
-                            }
-                            node_log_scale[node_id] = 0.0;
-                        } else {
-                            double child_scale_sum = 0.0;
-                            tree.eval_internal_node(node_id, P_mix[0], node_L, node_log_scale, node_L[node_id], child_scale_sum);
-                            node_log_scale[node_id] = child_scale_sum;
-                        }
-                    }
+                    LikelihoodEngine::eval_pattern_postorder(tree, pattern, leaf_to_taxon, P_mix[0], S, node_L, node_log_scale);
                     Scalar cond_L = aln.codon_frequencies_f3x4.dot(node_L[tree.root_id]);
                     if (cond_L > 0.0) {
                         pll = std::log(cond_L) + node_log_scale[tree.root_id];
@@ -2032,28 +1969,7 @@ public:
                     std::vector<bool> valid(M, false);
 
                     for (size_t m = 0; m < M; ++m) {
-                        for (int32_t node_id : tree.post_order) {
-                            const auto& node = tree.nodes[node_id];
-                            if (node.is_leaf) {
-                                size_t t_idx = leaf_to_taxon[node_id];
-                                if (t_idx != static_cast<size_t>(-1)) {
-                                    int8_t state = pattern.states[t_idx];
-                                    if (state >= 0 && state < S) {
-                                        node_L[node_id].setZero();
-                                        node_L[node_id](state) = 1.0;
-                                    } else {
-                                        node_L[node_id].setOnes();
-                                    }
-                                } else {
-                                    node_L[node_id].setOnes();
-                                }
-                                node_log_scale[node_id] = 0.0;
-                            } else {
-                                double child_scale_sum = 0.0;
-                                tree.eval_internal_node(node_id, P_mix[m], node_L, node_log_scale, node_L[node_id], child_scale_sum);
-                                node_log_scale[node_id] = child_scale_sum;
-                            }
-                        }
+                        LikelihoodEngine::eval_pattern_postorder(tree, pattern, leaf_to_taxon, P_mix[m], S, node_L, node_log_scale);
                         Scalar cond_L = aln.codon_frequencies_f3x4.dot(node_L[tree.root_id]);
                         if (cond_L > 0.0) {
                             Scalar term = std::log(syn_weights[m]) + std::log(cond_L) + node_log_scale[tree.root_id];
