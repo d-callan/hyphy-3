@@ -696,15 +696,7 @@ public:
         size_t num_nodes = tree.num_nodes();
         size_t num_patterns = aln.patterns.size();
 
-        std::vector<size_t> leaf_to_taxon(num_nodes, static_cast<size_t>(-1));
-        for (size_t i = 0; i < num_nodes; ++i) {
-            if (tree.nodes[i].is_leaf) {
-                auto it = aln.taxon_to_index.find(tree.nodes[i].name);
-                if (it != aln.taxon_to_index.end()) {
-                    leaf_to_taxon[i] = it->second;
-                }
-            }
-        }
+        std::vector<size_t> leaf_to_taxon = LikelihoodEngine::build_leaf_to_taxon_map(tree, aln);
 
         // Parameter vector: [omega, lambda_0, ..., lambda_{K-1}]
         size_t dim = 1 + K;
@@ -786,15 +778,7 @@ public:
         const auto& code = *(aln.code ? aln.code : GeneticCode::universal());
         int S = code.num_sense_codons;
 
-        std::vector<size_t> leaf_to_taxon(num_nodes, static_cast<size_t>(-1));
-        for (size_t i = 0; i < num_nodes; ++i) {
-            if (tree.nodes[i].is_leaf) {
-                auto it = aln.taxon_to_index.find(tree.nodes[i].name);
-                if (it != aln.taxon_to_index.end()) {
-                    leaf_to_taxon[i] = it->second;
-                }
-            }
-        }
+        std::vector<size_t> leaf_to_taxon = LikelihoodEngine::build_leaf_to_taxon_map(tree, aln);
 
         // First: Compute site-level FEL baseline for all patterns
         FELAnalyzer fel_analyzer(tree, aln, base_params);

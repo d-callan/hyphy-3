@@ -576,22 +576,7 @@ public:
     }
 
     void init_leaf_mapping() {
-        leaf_to_taxon.assign(tree.num_nodes(), static_cast<size_t>(-1));
-        for (const auto& node : tree.nodes) {
-            if (node.is_leaf) {
-                auto it = aln.taxon_to_index.find(node.name);
-                if (it != aln.taxon_to_index.end()) {
-                    leaf_to_taxon[node.id] = it->second;
-                } else {
-                    std::string lower = node.name;
-                    std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
-                    auto it_lower = aln.lower_taxon_to_index.find(lower);
-                    if (it_lower != aln.lower_taxon_to_index.end()) {
-                        leaf_to_taxon[node.id] = it_lower->second;
-                    }
-                }
-            }
-        }
+        leaf_to_taxon = LikelihoodEngine::build_leaf_to_taxon_map(tree, aln);
     }
 
     void partition_branches() {

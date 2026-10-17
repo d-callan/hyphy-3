@@ -1020,15 +1020,7 @@ public:
             .enable_chart = true
         });
 
-        std::vector<size_t> leaf_to_taxon(tree.num_nodes(), static_cast<size_t>(-1));
-        for (const auto& node : tree.nodes) {
-            if (node.is_leaf) {
-                auto it = aln.taxon_to_index.find(node.name);
-                if (it != aln.taxon_to_index.end()) {
-                    leaf_to_taxon[node.id] = it->second;
-                }
-            }
-        }
+        std::vector<size_t> leaf_to_taxon = LikelihoodEngine::build_leaf_to_taxon_map(tree, aln);
 
         std::vector<ContrastSiteResult> pattern_results(num_patterns);
 
