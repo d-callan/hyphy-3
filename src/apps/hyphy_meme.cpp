@@ -8,6 +8,7 @@
 #include "hyphy/core/console.hpp"
 #include "hyphy/opt/optimizer.hpp"
 #include "hyphy/analyses/meme.hpp"
+#include "hyphy/analyses/tree_engine.hpp"
 #include "hyphy/report/html_report.hpp"
 
 #include <iostream>
@@ -39,7 +40,7 @@ static void print_usage(const char* prog) {
               << Console::bold("Required arguments:") << "\n"
               << "  " << Console::brand("--alignment") << " <file>   Path to codon alignment (FASTA or NEXUS)\n\n"
               << Console::bold("Optional arguments:") << "\n"
-              << "  " << Console::brand("--tree") << " <file>        Path to Newick tree file (optional; auto-infers Ohmic Network if omitted)\n"
+              << "  " << Console::brand("--tree") << " <file>        Path to Newick tree file or 'auto' (optional; auto-infers ML tree via TreeEngine if omitted or 'auto')\n"
               << "  " << Console::brand("--ohmic") << "              Build Ohmic Phylogenetic Network with Wheatstone bridges\n"
               << "  " << Console::brand("--hyphaeon") << "           Opt-in: HyphAeon 384D transformer conductances (needs Python aeon-core)\n"
               << "  " << Console::brand("--no-hyphaeon") << "        Use empirical codon conductances only (default)\n"
@@ -61,6 +62,7 @@ static void print_usage(const char* prog) {
               << "  " << Console::brand("--help, -h") << "           Show this help message\n\n"
               << Console::bold("Examples:") << "\n"
               << "  " << prog << " --alignment data/cd2.fna --tree data/cd2.nwk --output cd2.MEME.json\n"
+              << "  " << prog << " --alignment data/cd2.fna --tree auto --output cd2.MEME.json\n"
               << "  " << prog << " --alignment data/cd2.fna --ohmic --output cd2.MEME.json\n"
               << "  " << prog << " --alignment tests/data/adh.nex --threads 8 --legacy-json\n\n";
 }
@@ -188,7 +190,7 @@ int run_meme(int argc, char* argv[]) {
     OhmicNetwork ohmic_net;
     std::string tree_source;
     try {
-        tree = OhmicNetwork::resolve_tree(aln, tree_file, force_ohmic, use_hyphaeon, embeddings_file, &ohmic_net, &tree_source);
+        tree = TreeEngine::resolve_tree(aln, tree_file, force_ohmic, use_hyphaeon, embeddings_file, &ohmic_net, &tree_source);
     } catch (const std::exception& e) {
         std::cerr << Console::danger("Error resolving tree/network: ") << e.what() << "\n";
         return 1;
@@ -408,7 +410,7 @@ int run_meme(int argc, char* argv[]) {
     std::string aln_hash = crypto::SHA256::hash_file(alignment_file, &aln_sz);
     prov.inputs["alignment"] = {alignment_file, "FASTA/NEXUS", aln_hash, aln_sz};
 
-    if (!tree_file.empty()) {
+    if (!tree_file.empty() && !TreeEngine::is_auto_tree_spec(tree_file) && !TreeEngine::is_ohmic_tree_spec(tree_file)) {
         size_t tree_sz = 0;
         std::string tree_hash = crypto::SHA256::hash_file(tree_file, &tree_sz);
         prov.inputs["tree"] = {tree_file, "Newick", tree_hash, tree_sz};

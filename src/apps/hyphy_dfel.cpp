@@ -1,4 +1,5 @@
 #include "hyphy/analyses/directional_fel.hpp"
+#include "hyphy/analyses/tree_engine.hpp"
 #include "hyphy/core/ohmic_network.hpp"
 #include "hyphy/core/console.hpp"
 #include "hyphy/report/html_report.hpp"
@@ -28,7 +29,7 @@ void print_dfel_usage(const char* prog) {
               << "  " << Console::brand("--alignment, -a  ") << "  Path to in-frame codon alignment (FASTA or NEXUS)\n\n";
 
     std::cout << Console::bold("Model & Rooting Options:") << "\n"
-              << "  " << Console::brand("--tree, -t       ") << "  Path to Newick phylogenetic tree (optional; auto-inferred via Ohmic if omitted)\n"
+              << "  " << Console::brand("--tree, -t       ") << "  Path to Newick phylogenetic tree or 'auto' (optional; auto-inferred via TreeEngine if omitted or 'auto')\n"
               << "  " << Console::brand("--ohmic, --omhic ") << "  Infer Ohmic network & Wheatstone bridges (empirical conductances)\n"
               << "  " << Console::brand("--hyphaeon    ") << "     Opt-in: HyphAeon 384D transformer conductances (needs Python aeon-core)\n"
               << "  " << Console::brand("--embeddings <f> ") << "  Path to precomputed [N x D] taxon embeddings TSV/CSV for Ohmic\n"
@@ -197,11 +198,11 @@ int run_dfel(int argc, char* argv[]) {
         return 1;
     }
 
-    // 2. Load or Infer Tree (supports --ohmic / --omhic and tree-free FASTA alignments)
+    // 2. Load or Infer Tree (supports --tree auto / --ohmic and tree-free FASTA alignments)
     Tree tree;
     std::string tree_source;
     try {
-        tree = OhmicNetwork::resolve_tree(aln, tree_file, use_ohmic, use_hyphaeon, embeddings_file, &tree_source);
+        tree = TreeEngine::resolve_tree(aln, tree_file, use_ohmic, use_hyphaeon, embeddings_file, &tree_source);
     } catch (const std::exception& e) {
         std::cerr << Console::danger("Error resolving phylogeny: ") << e.what() << "\n";
         return 1;

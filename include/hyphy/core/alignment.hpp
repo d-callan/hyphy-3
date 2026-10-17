@@ -57,12 +57,46 @@ public:
     Vector codon_frequencies_f1x4;
     Vector codon_frequencies_f3x4;
 
-    static Alignment from_fasta(const std::string& filepath, std::shared_ptr<const GeneticCode> gcode = nullptr, bool as_nucleotide = false) {
-        Alignment aln;
-        std::ifstream file(filepath);
-        if (!file.is_open()) {
+    static std::string read_file_or_gzip(const std::string& filepath) {
+        std::ifstream test_f(filepath, std::ios::binary);
+        if (!test_f.is_open()) {
             throw std::runtime_error("Could not open alignment file: " + filepath);
         }
+        unsigned char magic[2] = {0, 0};
+        test_f.read(reinterpret_cast<char*>(magic), 2);
+        bool is_gz = (magic[0] == 0x1f && magic[1] == 0x8b) ||
+                     (filepath.size() >= 3 && filepath.substr(filepath.size() - 3) == ".gz");
+        test_f.close();
+
+        if (is_gz) {
+            std::string cmd = "gzip -dc \"" + filepath + "\"";
+            FILE* pipe = popen(cmd.c_str(), "r");
+            if (!pipe) {
+                throw std::runtime_error("Failed to decompress gzip alignment file: " + filepath);
+            }
+            std::string out;
+            char buf[65536];
+            size_t nread = 0;
+            while ((nread = std::fread(buf, 1, sizeof(buf), pipe)) > 0) {
+                out.append(buf, nread);
+            }
+            pclose(pipe);
+            if (out.empty()) {
+                throw std::runtime_error("Decompressed gzip alignment is empty: " + filepath);
+            }
+            return out;
+        }
+
+        std::ifstream file(filepath);
+        std::stringstream buffer;
+        buffer << file.rdbuf();
+        return buffer.str();
+    }
+
+    static Alignment from_fasta(const std::string& filepath, std::shared_ptr<const GeneticCode> gcode = nullptr, bool as_nucleotide = false) {
+        Alignment aln;
+        std::string raw = read_file_or_gzip(filepath);
+        std::istringstream file(raw);
 
         std::string line;
         std::string current_name;
@@ -104,14 +138,7 @@ public:
 
     static Alignment from_nexus(const std::string& filepath, std::shared_ptr<const GeneticCode> gcode = nullptr, bool as_nucleotide = false) {
         Alignment aln;
-        std::ifstream file(filepath);
-        if (!file.is_open()) {
-            throw std::runtime_error("Could not open alignment file: " + filepath);
-        }
-
-        std::stringstream buffer;
-        buffer << file.rdbuf();
-        std::string raw = buffer.str();
+        std::string raw = read_file_or_gzip(filepath);
 
         // 1. Remove comments [ ... ]
         std::string text;
@@ -312,10 +339,8 @@ public:
     }
 
     static Alignment load(const std::string& filepath, std::shared_ptr<const GeneticCode> gcode = nullptr) {
-        std::ifstream file(filepath);
-        if (!file.is_open()) {
-            throw std::runtime_error("Could not open alignment file: " + filepath);
-        }
+        std::string raw = read_file_or_gzip(filepath);
+        std::istringstream file(raw);
         std::string line;
         while (std::getline(file, line)) {
             while (!line.empty() && std::isspace(static_cast<unsigned char>(line.front()))) line.erase(line.begin());
@@ -336,10 +361,8 @@ public:
     }
 
     static Alignment load_nucleotide(const std::string& filepath) {
-        std::ifstream file(filepath);
-        if (!file.is_open()) {
-            throw std::runtime_error("Could not open alignment file: " + filepath);
-        }
+        std::string raw = read_file_or_gzip(filepath);
+        std::istringstream file(raw);
         std::string line;
         while (std::getline(file, line)) {
             while (!line.empty() && std::isspace(static_cast<unsigned char>(line.front()))) line.erase(line.begin());

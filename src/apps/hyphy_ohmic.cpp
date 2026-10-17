@@ -44,6 +44,8 @@ static void print_ohmic_usage(const char* prog) {
               << "  " << Console::brand("--no-hyphaeon") << "                  Use empirical conductances only (default)\n"
               << "  " << Console::brand("--embeddings") << " <file>            Path to precomputed [N x D] taxon embeddings TSV/CSV\n"
               << "  " << Console::brand("--scale-mode, -s") << " <mode>        Solver mode: 'auto' (default), 'dense', or 'woodbury'\n"
+              << "  " << Console::brand("--scalable-method") << " <method>     Backbone method: 'spectral' (Multi-Scale Spectral-Foster, default) or 'ward'\n"
+              << "  " << Console::brand("--foster-threshold") << " <N>       Cluster size threshold T for Spectral to Foster transition (default: 128)\n"
               << "  " << Console::brand("--min-stress") << " <tau>             Minimum shunt stress tau_Ohm to promote a bridge (default: 0.05)\n"
               << "  " << Console::brand("--max-bridges") << " <K>              Maximum disjoint Wheatstone bridges (default: 64)\n"
               << "  " << Console::brand("--woodbury-rank") << " <p>            Rank p for ScalableWoodbury landmarks (default: 256)\n"
@@ -65,6 +67,8 @@ int run_ohmic(int argc, char* argv[]) {
     std::string html_file;
     std::string datatype = "nucleotide";
     std::string scale_mode_str = "auto";
+    std::string scalable_method_str = "spectral";
+    size_t foster_threshold = 128;
     std::string output_format = "modern";
     std::string embeddings_file;
     Scalar min_stress = 0.05;
@@ -73,6 +77,8 @@ int run_ohmic(int argc, char* argv[]) {
     int num_threads = 0;
     bool quiet = false;
     bool use_hyphaeon = false;
+    bool use_site_weights = false;
+    bool perform_nni = false;
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -92,10 +98,22 @@ int run_ohmic(int argc, char* argv[]) {
             use_hyphaeon = true;
         } else if (arg == "--no-hyphaeon") {
             use_hyphaeon = false;
+        } else if (arg == "--site-weights") {
+            use_site_weights = true;
+        } else if (arg == "--no-site-weights") {
+            use_site_weights = false;
+        } else if (arg == "--nni") {
+            perform_nni = true;
+        } else if (arg == "--no-nni") {
+            perform_nni = false;
         } else if (arg == "--embeddings" && i + 1 < argc) {
             embeddings_file = argv[++i];
         } else if ((arg == "--scale-mode" || arg == "-s") && i + 1 < argc) {
             scale_mode_str = argv[++i];
+        } else if ((arg == "--scalable-method" || arg == "--backbone") && i + 1 < argc) {
+            scalable_method_str = argv[++i];
+        } else if (arg == "--foster-threshold" && i + 1 < argc) {
+            foster_threshold = std::stoull(argv[++i]);
         } else if (arg == "--min-stress" && i + 1 < argc) {
             min_stress = std::stod(argv[++i]);
         } else if (arg == "--max-bridges" && i + 1 < argc) {
@@ -161,6 +179,8 @@ int run_ohmic(int argc, char* argv[]) {
     settings.network_settings.max_bridges = max_bridges;
     settings.network_settings.woodbury_rank = woodbury_rank;
     settings.network_settings.use_hyphaeon_transformer = use_hyphaeon;
+    settings.network_settings.use_site_rate_weights = use_site_weights;
+    settings.network_settings.perform_nni_refinement = perform_nni;
     settings.network_settings.embeddings_filepath = embeddings_file;
 
     if (scale_mode_str == "dense" || scale_mode_str == "ExactDense") {
@@ -170,6 +190,13 @@ int run_ohmic(int argc, char* argv[]) {
     } else {
         settings.network_settings.scale_mode = OhmicScaleMode::Auto;
     }
+
+    if (scalable_method_str == "ward" || scalable_method_str == "WoodburyWard") {
+        settings.network_settings.scalable_method = ScalableBackboneMethod::WoodburyWard;
+    } else {
+        settings.network_settings.scalable_method = ScalableBackboneMethod::SpectralFosterHybrid;
+    }
+    settings.network_settings.foster_cluster_threshold = foster_threshold;
 
     std::string model_desc = use_codon
         ? "Codon MG94xREV (Empirical F3x4 Frequencies)"
@@ -277,7 +304,7 @@ int run_ohmic(int argc, char* argv[]) {
                 {"Substitution Model", actual_sub_model},
                 {"Conductance / Topology", actual_conductance_model},
                 {"Electrical Solver", mode_label + " [" + std::to_string(result.num_super_nodes) + " super-nodes]"},
-                {"Foster Sum Invariant", (result.network.active_mode == OhmicScaleMode::ExactDense) ? foster_ss.str() : "N/A (Woodbury Mode)"},
+                {"Foster Sum Invariant", foster_ss.str()},
                 {"Wheatstone Bridges (K)", std::to_string(result.num_bridges) + " active 4-way bridges, " + std::to_string(result.num_collapsed_polytomies) + " collapsed polytomies"},
                 {"Single-Tree Log(L) / AICc", lnl_s.str() + "  /  " + aicc_s.str()},
                 {"Ohmic Network Log(L) / AICc", lnl_o.str() + "  /  " + aicc_o.str()},

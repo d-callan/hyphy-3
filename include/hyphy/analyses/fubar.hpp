@@ -363,8 +363,27 @@ public:
 
         if (needs_rescaling) {
             if (progress_cb) progress_cb("Phase 2b: Re-evaluating Grid with Optimal Tree Scaling", 0.40);
-            Scalar scale_a = res.best_scaler_alpha;
-            Scalar scale_b = res.best_scaler_beta;
+            
+            MG94Matrix base_mg;
+            base_mg.update(base_params, aln.pos_nuc_frequencies, aln.codon_frequencies_f3x4, gcode);
+
+            MG94Parameters opt_params = base_params;
+            opt_params.alpha = res.best_scaler_alpha;
+            opt_params.beta = res.best_scaler_beta;
+
+            MG94Matrix opt_mg;
+            opt_mg.update(opt_params, aln.pos_nuc_frequencies, aln.codon_frequencies_f3x4, gcode);
+
+            Scalar tree_scale = (base_mg.scale_factor > 1e-12) ? (opt_mg.scale_factor / base_mg.scale_factor) : 1.0;
+
+            for (auto& node : tree.nodes) {
+                if (node.id != tree.root_id) {
+                    node.branch_length *= tree_scale;
+                }
+            }
+            tree.scale_bridge_lengths(tree_scale);
+            baseline_tree_length *= tree_scale;
+            res.baseline_tree_length = baseline_tree_length;
 
             std::unique_ptr<ProgressBar> pbar_rescale;
             if (verbose && ProgressBar::is_terminal()) {
@@ -375,8 +394,8 @@ public:
 
             #pragma omp parallel for schedule(dynamic)
             for (size_t g = 0; g < G; ++g) {
-                Scalar a = grid[g].first * scale_a;
-                Scalar b = grid[g].second * scale_b;
+                Scalar a = grid[g].first;
+                Scalar b = grid[g].second;
 
                 MG94Parameters params = base_params;
                 params.alpha = a;

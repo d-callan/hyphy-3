@@ -8,6 +8,7 @@
 #include "hyphy/core/console.hpp"
 #include "hyphy/opt/optimizer.hpp"
 #include "hyphy/analyses/prime.hpp"
+#include "hyphy/analyses/tree_engine.hpp"
 
 #include <iostream>
 #include <string>
@@ -40,7 +41,7 @@ static void print_prime_usage(const char* prog) {
               << Console::bold("Required arguments:") << "\n"
               << "  " << Console::brand("--alignment") << " <file>       Path to codon alignment (FASTA or NEXUS)\n\n"
               << Console::bold("Optional arguments:") << "\n"
-              << "  " << Console::brand("--tree") << " <file>            Path to Newick tree file (optional; auto-inferred via Ohmic if omitted)\n"
+              << "  " << Console::brand("--tree") << " <file>            Path to Newick tree file or 'auto' (optional; auto-inferred via TreeEngine if omitted or 'auto')\n"
               << "  " << Console::brand("--ohmic, --omhic") << "         Infer Ohmic network & Wheatstone bridges (empirical conductances)\n"
               << "  " << Console::brand("--hyphaeon") << "               Opt-in: HyphAeon 384D transformer conductances (needs Python aeon-core)\n"
               << "  " << Console::brand("--embeddings") << " <file>      Path to precomputed [N x D] taxon embeddings TSV/CSV for Ohmic\n"
@@ -60,6 +61,7 @@ static void print_prime_usage(const char* prog) {
               << "  " << Console::brand("--help, -h") << "               Show this help message\n\n"
               << Console::bold("Examples:") << "\n"
               << "  " << prog << " --alignment data/cd2.fna --tree data/cd2.nwk\n"
+              << "  " << prog << " --alignment data/cd2.fna --tree auto --output cd2.PRIME.json\n"
               << "  " << prog << " --alignment tests/data/bglobin.nex --property-set 3PROP\n"
               << "  " << prog << " --alignment data/yokoyama.nex --property-set Atchley --shrinkage 1.0\n\n";
 }
@@ -194,7 +196,7 @@ int run_prime(int argc, char* argv[]) {
     Tree tree;
     std::string tree_source;
     try {
-        tree = OhmicNetwork::resolve_tree(aln, tree_file, use_ohmic, use_hyphaeon, embeddings_file, &tree_source);
+        tree = TreeEngine::resolve_tree(aln, tree_file, use_ohmic, use_hyphaeon, embeddings_file, &tree_source);
         std::cout << "  " << Console::muted("Tree source    : ") << Console::bold(tree_source) << "\n";
     } catch (const std::exception& e) {
         std::cerr << Console::danger("Error resolving phylogeny: ") << e.what() << "\n";

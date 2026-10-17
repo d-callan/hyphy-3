@@ -206,7 +206,28 @@ public:
         result.num_collapsed_polytomies = result.network.num_collapsed_polytomies;
         result.foster_sum = result.network.foster_sum;
 
-        // Helper to collect leaf taxon names descending from a subtree root in collapsed_tree
+        init_bridge_summaries(result);
+
+        if (settings.use_codon_model && aln.num_codons > 0) {
+            fit_codon_network(result);
+        } else {
+            fit_nucleotide_network(result);
+        }
+
+        for (size_t k = 0; k < result.num_bridges; ++k) {
+            result.bridge_summaries[k].fitted_weights = result.network.bridges[k].weights;
+            result.bridge_summaries[k].fitted_branch_lengths = result.network.bridges[k].branch_lengths;
+        }
+        result.network.collapsed_tree.bridges = result.network.bridges;
+        result.network.collapsed_tree.node_to_bridge_idx = result.network.node_to_bridge_idx;
+
+        auto t_end = std::chrono::steady_clock::now();
+        result.runtime_seconds = std::chrono::duration<double>(t_end - t_start).count();
+        return result;
+    }
+
+private:
+    void init_bridge_summaries(OhmicResult& result) const {
         auto collect_clade_leaves = [&](int32_t root_nid) -> std::vector<std::string> {
             std::vector<std::string> leaves;
             if (root_nid < 0 || static_cast<size_t>(root_nid) >= result.network.collapsed_tree.nodes.size()) return leaves;
@@ -224,7 +245,7 @@ public:
             return leaves;
         };
 
-        // Record initial bridge weights before ML refinement
+        result.bridge_summaries.clear();
         result.bridge_summaries.resize(result.num_bridges);
         for (size_t k = 0; k < result.num_bridges; ++k) {
             const auto& wb = result.network.bridges[k];
@@ -250,26 +271,8 @@ public:
             bs.ohmic_support = wb.ohmic_support;
             bs.shunt_stress = wb.shunt_stress;
         }
-
-        if (settings.use_codon_model && aln.num_codons > 0) {
-            fit_codon_network(result);
-        } else {
-            fit_nucleotide_network(result);
-        }
-
-        for (size_t k = 0; k < result.num_bridges; ++k) {
-            result.bridge_summaries[k].fitted_weights = result.network.bridges[k].weights;
-            result.bridge_summaries[k].fitted_branch_lengths = result.network.bridges[k].branch_lengths;
-        }
-        result.network.collapsed_tree.bridges = result.network.bridges;
-        result.network.collapsed_tree.node_to_bridge_idx = result.network.node_to_bridge_idx;
-
-        auto t_end = std::chrono::steady_clock::now();
-        result.runtime_seconds = std::chrono::duration<double>(t_end - t_start).count();
-        return result;
     }
 
-private:
     static Scalar compute_aicc(Scalar log_l, size_t k_params, size_t n_obs) {
         Scalar k = static_cast<Scalar>(k_params);
         Scalar n = std::max<Scalar>(static_cast<Scalar>(n_obs), k + 2.0);
@@ -281,16 +284,45 @@ private:
             ? aln
             : aln.to_nucleotide_alignment();
 
-        // 1. Fit baseline single tree (GTR)
+        // 1. Fit baseline single tree (GTR) + Ohmic-regularized Spectral-Cavity NNI
         opt::GTRFitter gtr_fitter(result.network.backbone_tree, nuc_aln);
         auto base_fit = gtr_fitter.fit();
-        result.single_tree_log_l = base_fit.log_likelihood;
         result.gtr_params = base_fit.params;
         result.network.backbone_tree = base_fit.tree;
 
+        GTRMatrix gtr;
+        gtr.update(result.gtr_params, nuc_aln.nuc_frequencies);
+        auto bb_leaf_map = LikelihoodEngine::build_leaf_to_taxon_map(result.network.backbone_tree, nuc_aln);
+
+        int total_nni_swaps = 0;
+        const Matrix* d_syn_ptr = (result.network.D_backbone.rows() > 0) ? &result.network.D_backbone : nullptr;
+        for (int nni_pass = 0; nni_pass < 4; ++nni_pass) {
+            int sw = opt::GTRFitter::sweep_gtr_nni_cavity(
+                result.network.backbone_tree, nuc_aln, gtr, bb_leaf_map, d_syn_ptr
+            );
+            total_nni_swaps += sw;
+            if (sw == 0) break;
+            opt::GTRFitter::sweep_gtr_branches_cavity(
+                result.network.backbone_tree, nuc_aln, gtr, bb_leaf_map, 1e-3, 10
+            );
+            if (sw <= 1) break;
+        }
+
+        if (total_nni_swaps > 0) {
+            result.single_tree_log_l = LikelihoodEngine::compute_gtr_log_likelihood(
+                result.network.backbone_tree, nuc_aln, gtr, &bb_leaf_map
+            );
+            OhmicNetwork::rebuild_bridges(result.network, aln, settings.network_settings);
+            result.num_bridges = result.network.bridges.size();
+            result.num_collapsed_polytomies = result.network.num_collapsed_polytomies;
+            init_bridge_summaries(result);
+        } else {
+            result.single_tree_log_l = base_fit.log_likelihood;
+        }
+
         // Transfer optimized backbone branch lengths onto collapsed_tree and bridges
         for (size_t nid = 0; nid < result.network.collapsed_tree.nodes.size(); ++nid) {
-            if (nid < base_fit.tree.nodes.size() &&
+            if (nid < result.network.backbone_tree.nodes.size() &&
                 (result.network.collapsed_tree.nodes[nid].is_leaf ||
                  !result.network.collapsed_tree.nodes[nid].children.empty())) {
                 // Keep 0.0 on root-child bridge hub if hub_node_id == bridge_node_id
@@ -298,91 +330,323 @@ private:
                 if (b_idx >= 0 && result.network.bridges[b_idx].hub_node_id == result.network.bridges[b_idx].bridge_node_id) {
                     result.network.collapsed_tree.nodes[nid].branch_length = 0.0;
                 } else {
-                    result.network.collapsed_tree.nodes[nid].branch_length = base_fit.tree.nodes[nid].branch_length;
+                    result.network.collapsed_tree.nodes[nid].branch_length = result.network.backbone_tree.nodes[nid].branch_length;
                 }
             }
         }
         for (auto& wb : result.network.bridges) {
-            if (wb.bridge_node_id >= 0 && static_cast<size_t>(wb.bridge_node_id) < base_fit.tree.nodes.size()) {
-                wb.branch_lengths[0] = base_fit.tree.nodes[wb.bridge_node_id].branch_length;
+            if (wb.bridge_node_id >= 0 && static_cast<size_t>(wb.bridge_node_id) < result.network.backbone_tree.nodes.size()) {
+                wb.branch_lengths[0] = result.network.backbone_tree.nodes[wb.bridge_node_id].branch_length;
                 wb.branch_lengths[1] = std::max<Scalar>(1e-5, wb.branch_lengths[0] * wb.shunt_stress);
             }
         }
 
-        GTRMatrix gtr;
-        gtr.update(result.gtr_params, nuc_aln.nuc_frequencies);
         auto leaf_map = LikelihoodEngine::build_leaf_to_taxon_map(result.network.collapsed_tree, nuc_aln);
 
-        // 2. Refine Wheatstone bridge branch lengths and shunt weights under GTR
+        // 2. Refine Wheatstone bridge branch lengths and shunt weights under GTR via exact O(N * L) spectral-cavity DFS
         if (!result.network.bridges.empty() && (settings.optimize_branch_lengths || settings.optimize_bridge_weights)) {
+            Tree& tree = result.network.collapsed_tree;
+            size_t num_nodes = tree.num_nodes();
+            size_t num_bridges = result.network.bridges.size();
+            size_t num_patterns = nuc_aln.patterns.size();
+
+            std::vector<std::vector<Vector4>> D(num_nodes, std::vector<Vector4>(num_patterns, Vector4::Ones()));
+            std::vector<std::vector<Vector4>> P_D(num_nodes, std::vector<Vector4>(num_patterns, Vector4::Ones()));
+            std::vector<std::vector<Vector4>> U(num_nodes, std::vector<Vector4>(num_patterns, Vector4::Ones()));
+            std::vector<Matrix4> P_branch(num_nodes, Matrix4::Identity());
+            std::vector<std::array<Matrix4, 3>> P_bridges(num_bridges);
+
+            std::vector<Vector4> c_spec(num_patterns);
+            std::vector<Scalar> base_vec(num_patterns, 0.0);
+            std::vector<Scalar> p1_vec(num_patterns, 0.0);
+            std::vector<Scalar> p2_vec(num_patterns, 0.0);
+            std::vector<Vector4> u_below(num_patterns);
+
             for (int pass = 0; pass < 2; ++pass) {
-                for (size_t k = 0; k < result.network.bridges.size(); ++k) {
-                    // Optimize secondary bridge length t_{k,2}
-                    if (settings.optimize_branch_lengths && result.network.bridges[k].weights[1] > 0.0) {
-                        Scalar init_t2 = result.network.bridges[k].branch_lengths[1];
-                        auto t2_obj = [&](Scalar t2) -> Scalar {
-                            Scalar old_t2 = result.network.bridges[k].branch_lengths[1];
-                            result.network.bridges[k].branch_lengths[1] = t2;
-                            Scalar lnl = WheatstoneLikelihood::compute_gtr_log_likelihood(
-                                result.network, nuc_aln, gtr, 1.0, &leaf_map
-                            );
-                            result.network.bridges[k].branch_lengths[1] = old_t2;
-                            return -lnl;
-                        };
-                        auto [best_t2, _] = opt::Brent1D::minimize(t2_obj, 1e-6, std::max<Scalar>(init_t2, 1e-4), 2.0, 1e-4, 20);
-                        result.network.bridges[k].branch_lengths[1] = best_t2;
+                for (const auto& node : tree.nodes) {
+                    if (node.id != tree.root_id && (node.is_leaf || !node.children.empty())) {
+                        P_branch[node.id] = gtr.transition_matrix(node.branch_length);
                     }
-                    // Optimize primary bridge length t_{k,1}
-                    if (settings.optimize_branch_lengths) {
-                        Scalar init_t1 = result.network.bridges[k].branch_lengths[0];
-                        auto t1_obj = [&](Scalar t1) -> Scalar {
-                            Scalar old_t1 = result.network.bridges[k].branch_lengths[0];
-                            result.network.bridges[k].branch_lengths[0] = t1;
-                            Scalar lnl = WheatstoneLikelihood::compute_gtr_log_likelihood(
-                                result.network, nuc_aln, gtr, 1.0, &leaf_map
-                            );
-                            result.network.bridges[k].branch_lengths[0] = old_t1;
-                            return -lnl;
-                        };
-                        auto [best_t1, _] = opt::Brent1D::minimize(t1_obj, 1e-6, std::max<Scalar>(init_t1, 1e-4), 2.0, 1e-4, 20);
-                        result.network.bridges[k].branch_lengths[0] = best_t1;
+                }
+                for (size_t k = 0; k < num_bridges; ++k) {
+                    for (int r = 0; r < 3; ++r) {
+                        P_bridges[k][r] = (result.network.bridges[k].weights[r] > 0.0 || r < 2)
+                            ? gtr.transition_matrix(result.network.bridges[k].branch_lengths[r])
+                            : Matrix4::Identity();
                     }
-                    // Optimize shunt weight w_{k,2} in [0, 0.99]
-                    if (settings.optimize_bridge_weights) {
-                        Scalar init_w2 = result.network.bridges[k].weights[1];
-                        auto w2_obj = [&](Scalar w2) -> Scalar {
-                            auto old_w = result.network.bridges[k].weights;
-                            result.network.bridges[k].weights = {1.0 - w2, w2, 0.0};
-                            Scalar lnl = WheatstoneLikelihood::compute_gtr_log_likelihood(
-                                result.network, nuc_aln, gtr, 1.0, &leaf_map
-                            );
-                            result.network.bridges[k].weights = old_w;
-                            return -lnl;
-                        };
-                        auto [best_w2, _] = opt::Brent1D::minimize(w2_obj, 0.0, std::clamp<Scalar>(init_w2, 0.01, 0.95), 0.99, 1e-4, 20);
-                        result.network.bridges[k].weights = {1.0 - best_w2, best_w2, 0.0};
-                    }
-                    // Also refine the 3 incident child branches {id_A, id_B, id_C} so terminal branches
-                    // can relax once homoplasy is routed through the shunt bridge
-                    if (settings.optimize_branch_lengths && result.network.bridges[k].weights[1] > 1e-4) {
-                        for (int c_idx = 0; c_idx < 3; ++c_idx) {
-                            int32_t cid = result.network.bridges[k].children[c_idx];
-                            if (cid < 0) continue;
-                            Scalar init_bl = result.network.collapsed_tree.nodes[cid].branch_length;
-                            auto c_obj = [&](Scalar bl) -> Scalar {
-                                Scalar old_bl = result.network.collapsed_tree.nodes[cid].branch_length;
-                                result.network.collapsed_tree.nodes[cid].branch_length = bl;
-                                Scalar lnl = WheatstoneLikelihood::compute_gtr_log_likelihood(
-                                    result.network, nuc_aln, gtr, 1.0, &leaf_map
-                                );
-                                result.network.collapsed_tree.nodes[cid].branch_length = old_bl;
-                                return -lnl;
-                            };
-                            auto [best_c, _] = opt::Brent1D::minimize(c_obj, 1e-6, std::max<Scalar>(init_bl, 1e-4), 2.0, 1e-4, 15);
-                            result.network.collapsed_tree.nodes[cid].branch_length = best_c;
+                }
+
+                // Bottom-up postorder pass
+                for (int32_t nid : tree.post_order) {
+                    const auto& node = tree.nodes[nid];
+                    if (node.is_leaf) {
+                        size_t t_idx = leaf_map[nid];
+                        for (size_t p = 0; p < num_patterns; ++p) {
+                            int8_t state = (t_idx != static_cast<size_t>(-1)) ? nuc_aln.patterns[p].states[t_idx] : -1;
+                            if (state >= 0 && state < 4) {
+                                D[nid][p].setZero();
+                                D[nid][p](state) = 1.0;
+                            } else {
+                                D[nid][p].setOnes();
+                            }
+                            if (nid != tree.root_id) {
+                                P_D[nid][p] = P_branch[nid] * D[nid][p];
+                            }
+                        }
+                    } else {
+                        int32_t b_idx = (static_cast<size_t>(nid) < result.network.node_to_bridge_idx.size())
+                            ? result.network.node_to_bridge_idx[nid] : -1;
+                        for (size_t p = 0; p < num_patterns; ++p) {
+                            Vector4 d_vec = Vector4::Zero();
+                            if (b_idx >= 0) {
+                                const auto& wb = result.network.bridges[static_cast<size_t>(b_idx)];
+                                const Vector4& M_A = P_D[wb.children[0]][p];
+                                const Vector4& M_B = P_D[wb.children[1]][p];
+                                const Vector4& M_C = P_D[wb.children[2]][p];
+                                if (wb.weights[0] > 0.0) {
+                                    d_vec.noalias() += wb.weights[0] * (P_bridges[b_idx][0] * M_A.cwiseProduct(M_B)).cwiseProduct(M_C);
+                                }
+                                if (wb.weights[1] > 0.0) {
+                                    d_vec.noalias() += wb.weights[1] * (P_bridges[b_idx][1] * M_A.cwiseProduct(M_C)).cwiseProduct(M_B);
+                                }
+                            } else {
+                                d_vec.setOnes();
+                                for (int32_t cid : node.children) {
+                                    d_vec.array() *= P_D[cid][p].array();
+                                }
+                            }
+                            Scalar mx = d_vec.maxCoeff();
+                            if (mx > 0.0 && mx < 1e-100) d_vec /= mx;
+                            D[nid][p] = d_vec;
+                            if (nid != tree.root_id) {
+                                P_D[nid][p] = P_branch[nid] * d_vec;
+                            }
                         }
                     }
                 }
+
+                for (size_t p = 0; p < num_patterns; ++p) {
+                    U[tree.root_id][p] = gtr.pi;
+                }
+
+                std::function<void(int32_t)> dfs_bridge = [&](int32_t uid) {
+                    const auto& node = tree.nodes[uid];
+                    if (node.is_leaf || node.children.empty()) return;
+
+                    for (size_t p = 0; p < num_patterns; ++p) {
+                        u_below[p] = (uid == tree.root_id)
+                            ? gtr.pi
+                            : (P_branch[uid].transpose() * U[uid][p]);
+                        Scalar mx = u_below[p].maxCoeff();
+                        if (mx > 0.0 && mx < 1e-100) u_below[p] /= mx;
+                    }
+
+                    int32_t b_idx = (static_cast<size_t>(uid) < result.network.node_to_bridge_idx.size())
+                        ? result.network.node_to_bridge_idx[uid] : -1;
+
+                    if (b_idx >= 0) {
+                        size_t k = static_cast<size_t>(b_idx);
+                        auto& wb = result.network.bridges[k];
+                        int32_t id_A = wb.children[0];
+                        int32_t id_B = wb.children[1];
+                        int32_t id_C = wb.children[2];
+
+                        // 1. Optimize secondary bridge length t_{k,2}
+                        if (settings.optimize_branch_lengths && wb.weights[1] > 0.0) {
+                            for (size_t p = 0; p < num_patterns; ++p) {
+                                const Vector4& M_A = P_D[id_A][p];
+                                const Vector4& M_B = P_D[id_B][p];
+                                const Vector4& M_C = P_D[id_C][p];
+                                Vector4 Y1 = M_A.cwiseProduct(M_B);
+                                base_vec[p] = wb.weights[0] * u_below[p].dot((P_bridges[k][0] * Y1).cwiseProduct(M_C));
+                                Vector4 Y2 = M_A.cwiseProduct(M_C);
+                                Vector4 W2 = wb.weights[1] * u_below[p].cwiseProduct(M_B);
+                                c_spec[p] = (gtr.U_pi.transpose() * W2).cwiseProduct(gtr.V_pi * Y2);
+                            }
+                            Scalar init_t2 = wb.branch_lengths[1];
+                            auto t2_obj = [&](Scalar t2) -> Scalar {
+                                Vector4 exp_lam = (gtr.eigenvalues * t2).array().exp();
+                                Scalar lnl = 0.0;
+                                for (size_t p = 0; p < num_patterns; ++p) {
+                                    Scalar lk = base_vec[p] + c_spec[p].dot(exp_lam);
+                                    lnl += nuc_aln.patterns[p].weight * ((lk > 1e-300) ? std::log(lk) : -690.7755);
+                                }
+                                return -lnl;
+                            };
+                            auto [best_t2, _] = opt::Brent1D::minimize(t2_obj, 1e-6, std::max<Scalar>(init_t2, 1e-4), 2.0, 1e-4, 20);
+                            wb.branch_lengths[1] = best_t2;
+                            P_bridges[k][1] = gtr.transition_matrix(best_t2);
+                        }
+
+                        // 2. Optimize primary bridge length t_{k,1}
+                        if (settings.optimize_branch_lengths) {
+                            for (size_t p = 0; p < num_patterns; ++p) {
+                                const Vector4& M_A = P_D[id_A][p];
+                                const Vector4& M_B = P_D[id_B][p];
+                                const Vector4& M_C = P_D[id_C][p];
+                                Vector4 Y2 = M_A.cwiseProduct(M_C);
+                                base_vec[p] = wb.weights[1] * u_below[p].dot((P_bridges[k][1] * Y2).cwiseProduct(M_B));
+                                Vector4 Y1 = M_A.cwiseProduct(M_B);
+                                Vector4 W1 = wb.weights[0] * u_below[p].cwiseProduct(M_C);
+                                c_spec[p] = (gtr.U_pi.transpose() * W1).cwiseProduct(gtr.V_pi * Y1);
+                            }
+                            Scalar init_t1 = wb.branch_lengths[0];
+                            auto t1_obj = [&](Scalar t1) -> Scalar {
+                                Vector4 exp_lam = (gtr.eigenvalues * t1).array().exp();
+                                Scalar lnl = 0.0;
+                                for (size_t p = 0; p < num_patterns; ++p) {
+                                    Scalar lk = base_vec[p] + c_spec[p].dot(exp_lam);
+                                    lnl += nuc_aln.patterns[p].weight * ((lk > 1e-300) ? std::log(lk) : -690.7755);
+                                }
+                                return -lnl;
+                            };
+                            auto [best_t1, _] = opt::Brent1D::minimize(t1_obj, 1e-6, std::max<Scalar>(init_t1, 1e-4), 2.0, 1e-4, 20);
+                            wb.branch_lengths[0] = best_t1;
+                            P_bridges[k][0] = gtr.transition_matrix(best_t1);
+                        }
+
+                        // 3. Optimize shunt weight w_{k,2} in [0, 0.99] via pure scalar mixture (zero matrix multiplies)
+                        if (settings.optimize_bridge_weights) {
+                            for (size_t p = 0; p < num_patterns; ++p) {
+                                const Vector4& M_A = P_D[id_A][p];
+                                const Vector4& M_B = P_D[id_B][p];
+                                const Vector4& M_C = P_D[id_C][p];
+                                p1_vec[p] = u_below[p].dot((P_bridges[k][0] * M_A.cwiseProduct(M_B)).cwiseProduct(M_C));
+                                p2_vec[p] = u_below[p].dot((P_bridges[k][1] * M_A.cwiseProduct(M_C)).cwiseProduct(M_B));
+                            }
+                            Scalar init_w2 = wb.weights[1];
+                            auto w2_obj = [&](Scalar w2) -> Scalar {
+                                Scalar w1 = 1.0 - w2;
+                                Scalar lnl = 0.0;
+                                for (size_t p = 0; p < num_patterns; ++p) {
+                                    Scalar lk = w1 * p1_vec[p] + w2 * p2_vec[p];
+                                    lnl += nuc_aln.patterns[p].weight * ((lk > 1e-300) ? std::log(lk) : -690.7755);
+                                }
+                                return -lnl;
+                            };
+                            auto [best_w2, _] = opt::Brent1D::minimize(w2_obj, 0.0, std::clamp<Scalar>(init_w2, 0.01, 0.95), 0.99, 1e-4, 20);
+                            wb.weights = {1.0 - best_w2, best_w2, 0.0};
+                        }
+
+                        // 4. Refine the 3 incident child branches {id_A, id_B, id_C} via spectral dot product
+                        if (settings.optimize_branch_lengths && wb.weights[1] > 1e-4) {
+                            for (int c_idx = 0; c_idx < 3; ++c_idx) {
+                                int32_t cid = wb.children[c_idx];
+                                if (cid < 0) continue;
+                                for (size_t p = 0; p < num_patterns; ++p) {
+                                    const Vector4& M_A = P_D[id_A][p];
+                                    const Vector4& M_B = P_D[id_B][p];
+                                    const Vector4& M_C = P_D[id_C][p];
+                                    Vector4 v_c;
+                                    if (c_idx == 0) {
+                                        Vector4 Z1 = P_bridges[k][0].transpose() * u_below[p].cwiseProduct(M_C);
+                                        Vector4 Z2 = P_bridges[k][1].transpose() * u_below[p].cwiseProduct(M_B);
+                                        v_c = wb.weights[0] * Z1.cwiseProduct(M_B) + wb.weights[1] * Z2.cwiseProduct(M_C);
+                                    } else if (c_idx == 1) {
+                                        Vector4 Z1 = P_bridges[k][0].transpose() * u_below[p].cwiseProduct(M_C);
+                                        Vector4 PY2 = P_bridges[k][1] * M_A.cwiseProduct(M_C);
+                                        v_c = wb.weights[0] * Z1.cwiseProduct(M_A) + wb.weights[1] * u_below[p].cwiseProduct(PY2);
+                                    } else {
+                                        Vector4 PY1 = P_bridges[k][0] * M_A.cwiseProduct(M_B);
+                                        Vector4 Z2 = P_bridges[k][1].transpose() * u_below[p].cwiseProduct(M_B);
+                                        v_c = wb.weights[0] * u_below[p].cwiseProduct(PY1) + wb.weights[1] * Z2.cwiseProduct(M_A);
+                                    }
+                                    c_spec[p] = (gtr.U_pi.transpose() * v_c).cwiseProduct(gtr.V_pi * D[cid][p]);
+                                }
+                                Scalar init_bl = tree.nodes[cid].branch_length;
+                                auto c_obj = [&](Scalar bl) -> Scalar {
+                                    Vector4 exp_lam = (gtr.eigenvalues * bl).array().exp();
+                                    Scalar lnl = 0.0;
+                                    for (size_t p = 0; p < num_patterns; ++p) {
+                                        Scalar lk = c_spec[p].dot(exp_lam);
+                                        lnl += nuc_aln.patterns[p].weight * ((lk > 1e-300) ? std::log(lk) : -690.7755);
+                                    }
+                                    return -lnl;
+                                };
+                                auto [best_c, _] = opt::Brent1D::minimize(c_obj, 1e-6, std::max<Scalar>(init_bl, 1e-4), 2.0, 1e-4, 15);
+                                tree.nodes[cid].branch_length = best_c;
+                                P_branch[cid] = gtr.transition_matrix(best_c);
+                                for (size_t p = 0; p < num_patterns; ++p) {
+                                    P_D[cid][p] = P_branch[cid] * D[cid][p];
+                                }
+                            }
+                        }
+
+                        // Propagate upward cavity vectors U[id_A], U[id_B], U[id_C] and recurse into child subtrees
+                        for (size_t p = 0; p < num_patterns; ++p) {
+                            const Vector4& M_A = P_D[id_A][p];
+                            const Vector4& M_B = P_D[id_B][p];
+                            const Vector4& M_C = P_D[id_C][p];
+                            Vector4 Z1 = P_bridges[k][0].transpose() * u_below[p].cwiseProduct(M_C);
+                            Vector4 Z2 = P_bridges[k][1].transpose() * u_below[p].cwiseProduct(M_B);
+                            Vector4 PY1 = P_bridges[k][0] * M_A.cwiseProduct(M_B);
+                            Vector4 PY2 = P_bridges[k][1] * M_A.cwiseProduct(M_C);
+
+                            Vector4 v_a = wb.weights[0] * Z1.cwiseProduct(M_B) + wb.weights[1] * Z2.cwiseProduct(M_C);
+                            Vector4 v_b = wb.weights[0] * Z1.cwiseProduct(M_A) + wb.weights[1] * u_below[p].cwiseProduct(PY2);
+                            Vector4 v_c = wb.weights[0] * u_below[p].cwiseProduct(PY1) + wb.weights[1] * Z2.cwiseProduct(M_A);
+
+                            Scalar mxa = v_a.maxCoeff(); if (mxa > 0.0 && mxa < 1e-100) v_a /= mxa;
+                            Scalar mxb = v_b.maxCoeff(); if (mxb > 0.0 && mxb < 1e-100) v_b /= mxb;
+                            Scalar mxc = v_c.maxCoeff(); if (mxc > 0.0 && mxc < 1e-100) v_c /= mxc;
+
+                            U[id_A][p] = v_a;
+                            U[id_B][p] = v_b;
+                            U[id_C][p] = v_c;
+                        }
+                        dfs_bridge(id_A);
+                        dfs_bridge(id_B);
+                        dfs_bridge(id_C);
+
+                        // Refresh D[uid] and P_D[uid] after child subtrees return
+                        for (size_t p = 0; p < num_patterns; ++p) {
+                            const Vector4& M_A = P_D[id_A][p];
+                            const Vector4& M_B = P_D[id_B][p];
+                            const Vector4& M_C = P_D[id_C][p];
+                            Vector4 d_vec = wb.weights[0] * (P_bridges[k][0] * M_A.cwiseProduct(M_B)).cwiseProduct(M_C)
+                                          + wb.weights[1] * (P_bridges[k][1] * M_A.cwiseProduct(M_C)).cwiseProduct(M_B);
+                            Scalar mx = d_vec.maxCoeff();
+                            if (mx > 0.0 && mx < 1e-100) d_vec /= mx;
+                            D[uid][p] = d_vec;
+                            if (uid != tree.root_id) {
+                                P_D[uid][p] = P_branch[uid] * d_vec;
+                            }
+                        }
+                    } else {
+                        size_t n_ch = node.children.size();
+                        for (size_t i = 0; i < n_ch; ++i) {
+                            int32_t cid = node.children[i];
+                            for (size_t p = 0; p < num_patterns; ++p) {
+                                Vector4 u_c = (uid == tree.root_id)
+                                    ? gtr.pi
+                                    : (P_branch[uid].transpose() * U[uid][p]);
+                                for (size_t j = 0; j < n_ch; ++j) {
+                                    if (j != i) {
+                                        u_c.array() *= P_D[node.children[j]][p].array();
+                                    }
+                                }
+                                Scalar mx = u_c.maxCoeff();
+                                if (mx > 0.0 && mx < 1e-100) u_c /= mx;
+                                U[cid][p] = u_c;
+                            }
+                            dfs_bridge(cid);
+                        }
+                        for (size_t p = 0; p < num_patterns; ++p) {
+                            Vector4 d_vec = Vector4::Ones();
+                            for (int32_t cid : node.children) {
+                                d_vec.array() *= P_D[cid][p].array();
+                            }
+                            Scalar mx = d_vec.maxCoeff();
+                            if (mx > 0.0 && mx < 1e-100) d_vec /= mx;
+                            D[uid][p] = d_vec;
+                            if (uid != tree.root_id) {
+                                P_D[uid][p] = P_branch[uid] * d_vec;
+                            }
+                        }
+                    }
+                };
+
+                dfs_bridge(tree.root_id);
             }
         }
 

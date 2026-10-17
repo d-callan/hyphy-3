@@ -1065,14 +1065,20 @@ public:
                 rho_hist.clear();
             }
 
-            // Backtracking Armijo line search
-            Scalar step_size = 1.0;
+            // Backtracking Armijo line search with initial step size scaling
+            Scalar max_step = 0.0;
+            for (size_t i = 0; i < num_nodes; ++i) {
+                if (i != static_cast<size_t>(tree.root_id)) {
+                    max_step = std::max(max_step, std::abs(d[i]));
+                }
+            }
+            Scalar step_size = (max_step > 0.2) ? (0.2 / max_step) : 1.0;
             std::vector<Scalar> new_bl(num_nodes);
             Scalar new_ll = curr_ll;
             std::vector<Scalar> new_grad;
 
             bool line_search_ok = false;
-            for (int ls = 0; ls < 8; ++ls) {
+            for (int ls = 0; ls < 15; ++ls) {
                 for (size_t i = 0; i < num_nodes; ++i) {
                     if (i != static_cast<size_t>(tree.root_id)) {
                         new_bl[i] = std::clamp(bl[i] + step_size * d[i], 1e-4, 10.0);
@@ -1081,7 +1087,7 @@ public:
                     }
                 }
                 auto [test_ll, test_grad] = compute_busted_branch_gradients(new_bl, omegas, weights, syn_rates, syn_weights, delta, psi, eps_sink);
-                if (test_ll > curr_ll + 1e-4 * step_size * dir_dot_grad) {
+                if (test_ll > curr_ll + 1e-4 * step_size * dir_dot_grad || (test_ll > curr_ll + 1e-5 && ls >= 3)) {
                     new_ll = test_ll;
                     new_grad = test_grad;
                     line_search_ok = true;
@@ -1151,6 +1157,19 @@ public:
         Scalar psi = 0.0;
         Scalar eps_sink = use_error_sink ? std::min(0.002, max_eps_sink * 0.5) : 0.0;
 
+        // Initialize SRV synonymous rate distribution
+        size_t M = srv ? num_syn_rates : 1;
+        std::vector<Scalar> syn_rates(M, 1.0);
+        std::vector<Scalar> syn_weights(M, 1.0 / M);
+
+        if (srv && M == 2) {
+            syn_rates = {0.35, 1.65};
+            syn_weights = {0.50, 0.50};
+        } else if (srv && M == 3) {
+            syn_rates = {0.20, 0.60, 2.20};
+            syn_weights = {1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0};
+        }
+
         // Initialize rates and weights
         std::vector<Scalar> omegas(K);
         std::vector<Scalar> weights(K);
@@ -1166,27 +1185,42 @@ public:
                 omegas = {0.10, 3.0};
             }
         } else {
-            // Default K = 3
+            // Default K = 3: evaluate grid of candidate distributions to seed ECM in best global basin
             if (is_constrained) {
-                omegas = {0.05, 0.50, 1.0};
-                weights = {0.45, 0.45, 0.10};
+                std::vector<std::pair<std::vector<Scalar>, std::vector<Scalar>>> candidates = {
+                    {{0.05, 0.50, 1.0}, {0.45, 0.45, 0.10}},
+                    {{0.01, 0.20, 1.0}, {0.30, 0.30, 0.40}},
+                    {{0.10, 0.80, 1.0}, {0.20, 0.20, 0.60}},
+                    {{0.001, 0.05, 1.0}, {0.15, 0.15, 0.70}}
+                };
+                Scalar best_start_ll = -1e20;
+                for (const auto& [cand_o, cand_w] : candidates) {
+                    Scalar ll = evaluate_log_l(s, cand_o, cand_w, syn_rates, syn_weights, nullptr, nullptr, delta, psi, eps_sink);
+                    if (ll > best_start_ll) {
+                        best_start_ll = ll;
+                        omegas = cand_o;
+                        weights = cand_w;
+                    }
+                }
             } else {
-                omegas = {0.05, 0.50, 4.0};
-                weights = {0.50, 0.40, 0.10};
+                std::vector<std::pair<std::vector<Scalar>, std::vector<Scalar>>> candidates = {
+                    {{0.05, 0.50, 4.0}, {0.50, 0.40, 0.10}},
+                    {{0.01, 0.50, 2.0}, {0.40, 0.10, 0.50}},
+                    {{0.01, 1.00, 2.0}, {0.40, 0.05, 0.55}},
+                    {{0.02, 0.20, 3.0}, {0.35, 0.35, 0.30}},
+                    {{0.10, 0.90, 5.0}, {0.30, 0.40, 0.30}},
+                    {{0.005, 0.10, 1.8}, {0.45, 0.15, 0.40}}
+                };
+                Scalar best_start_ll = -1e20;
+                for (const auto& [cand_o, cand_w] : candidates) {
+                    Scalar ll = evaluate_log_l(s, cand_o, cand_w, syn_rates, syn_weights, nullptr, nullptr, delta, psi, eps_sink);
+                    if (ll > best_start_ll) {
+                        best_start_ll = ll;
+                        omegas = cand_o;
+                        weights = cand_w;
+                    }
+                }
             }
-        }
-
-        // Initialize SRV synonymous rate distribution
-        size_t M = srv ? num_syn_rates : 1;
-        std::vector<Scalar> syn_rates(M, 1.0);
-        std::vector<Scalar> syn_weights(M, 1.0 / M);
-
-        if (srv && M == 2) {
-            syn_rates = {0.35, 1.65};
-            syn_weights = {0.50, 0.50};
-        } else if (srv && M == 3) {
-            syn_rates = {0.20, 0.60, 2.20};
-            syn_weights = {1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0};
         }
 
         if (allow_double) {
@@ -1377,9 +1411,9 @@ public:
                     omegas[1] = opt.x[2];
                 } else if (K == 3) {
                     auto opt = NelderMeadND<4>::minimize([&](const std::array<Scalar, 4>& x) {
-                        if (x[1] > x[2]) return 1e20;
+                        if (x[1] > x[2] || x[2] > x[3]) return 1e20;
                         return -evaluate_log_l(x[0], {x[1], x[2], x[3]}, weights, syn_rates, syn_weights, nullptr, nullptr, delta, psi, eps_sink);
-                    }, {s, omegas[0], omegas[1], omegas[2]}, {0.01, 1e-4, 1e-4, 1.0}, {50.0, 1.0, 1.0, max_omega}, 1e-4, 50);
+                    }, {s, omegas[0], omegas[1], omegas[2]}, {0.01, 1e-4, 1e-4, 1.0}, {50.0, 1.0, max_omega, max_omega}, 1e-4, 80);
                     s = opt.x[0];
                     omegas[0] = opt.x[1];
                     omegas[1] = opt.x[2];
@@ -1459,19 +1493,83 @@ public:
         }
 
         if (refine_branches) {
-            bl = refine_branch_lengths(bl, omegas, weights, syn_rates, syn_weights, delta, psi, 1, eps_sink);
+            int num_cycles = (K == 1) ? 2 : 3;
+            for (int cycle = 0; cycle < num_cycles; ++cycle) {
+                bl = refine_branch_lengths(bl, omegas, weights, syn_rates, syn_weights, delta, psi, 25, eps_sink);
+
+                if (K >= 2 || use_error_sink) {
+                    for (int em = 0; em < 3; ++em) {
+                        weights = compute_expected_weights(1.0, omegas, weights, syn_rates, syn_weights, &bl, delta, psi, eps_sink, use_error_sink ? &eps_sink : nullptr, max_eps_sink);
+                        if (srv && M >= 2) {
+                            syn_weights = compute_expected_syn_weights(1.0, omegas, weights, syn_rates, syn_weights, &bl, delta, psi, eps_sink);
+                        }
+                    }
+                }
+
+                // Polish omegas given refined branch lengths
+                if (is_constrained) {
+                    if (K == 2) {
+                        auto [w1_opt, val] = Brent1D::minimize([&](Scalar w1) {
+                            return -evaluate_log_l(1.0, {w1, 1.0}, weights, syn_rates, syn_weights, &bl, nullptr, delta, psi, eps_sink);
+                        }, 1e-4, omegas[0], 1.0, 1e-4, 40);
+                        omegas[0] = std::clamp(w1_opt, 1e-4, 1.0);
+                        omegas[1] = 1.0;
+                    } else if (K == 3) {
+                        auto opt = NelderMeadND<2>::minimize([&](const std::array<Scalar, 2>& x) {
+                            if (x[0] > x[1]) return 1e20;
+                            return -evaluate_log_l(1.0, {x[0], x[1], 1.0}, weights, syn_rates, syn_weights, &bl, nullptr, delta, psi, eps_sink);
+                        }, {omegas[0], omegas[1]}, {1e-4, 1e-4}, {1.0, 1.0}, 1e-4, 50);
+                        omegas[0] = opt.x[0];
+                        omegas[1] = opt.x[1];
+                        omegas[2] = 1.0;
+                    }
+                } else {
+                    Scalar max_omega = use_error_sink ? 50.0 : 2000.0;
+                    if (K == 2) {
+                        auto opt = NelderMeadND<2>::minimize([&](const std::array<Scalar, 2>& x) {
+                            return -evaluate_log_l(1.0, {x[0], x[1]}, weights, syn_rates, syn_weights, &bl, nullptr, delta, psi, eps_sink);
+                        }, {omegas[0], omegas[1]}, {1e-4, 1.0}, {1.0, max_omega}, 1e-4, 50);
+                        omegas[0] = opt.x[0];
+                        omegas[1] = opt.x[1];
+                    } else if (K == 3) {
+                        auto opt = NelderMeadND<3>::minimize([&](const std::array<Scalar, 3>& x) {
+                            if (x[0] > x[1] || x[1] > x[2]) return 1e20;
+                            return -evaluate_log_l(1.0, {x[0], x[1], x[2]}, weights, syn_rates, syn_weights, &bl, nullptr, delta, psi, eps_sink);
+                        }, {omegas[0], omegas[1], omegas[2]}, {1e-4, 1e-4, 1.0}, {1.0, max_omega, max_omega}, 1e-4, 80);
+                        omegas[0] = opt.x[0];
+                        omegas[1] = opt.x[1];
+                        omegas[2] = opt.x[2];
+                    }
+                }
+
+                // If SRV, polish syn_rates given bl
+                if (srv && M == 3) {
+                    auto syn_opt = NelderMeadND<2>::minimize([&](const std::array<Scalar, 2>& x) {
+                        Scalar a1 = x[0], a2 = x[1];
+                        Scalar q1 = syn_weights[0], q2 = syn_weights[1], q3 = syn_weights[2];
+                        Scalar a3 = (1.0 - q1 * a1 - q2 * a2) / q3;
+                        if (a1 < 0.01 || a2 < a1 || a3 < a2 || a3 > 50.0) return 1e20;
+                        return -evaluate_log_l(1.0, omegas, weights, {a1, a2, a3}, syn_weights, &bl, nullptr, delta, psi, eps_sink);
+                    }, {syn_rates[0], syn_rates[1]}, {0.01, 0.01}, {5.0, 5.0}, 1e-3, 30);
+
+                        Scalar a1 = syn_opt.x[0];
+                        Scalar a2 = syn_opt.x[1];
+                        Scalar a3 = (1.0 - syn_weights[0] * a1 - syn_weights[1] * a2) / syn_weights[2];
+                        if (a1 >= 0.01 && a2 >= a1 && a3 >= a2) {
+                            syn_rates[0] = a1;
+                            syn_rates[1] = a2;
+                            syn_rates[2] = a3;
+                        }
+                }
+            }
+
             if (pbar) {
                 std::ostringstream ss;
                 ss << model_desc << ": Branch lengths refined";
                 pbar->set_status(ss.str());
                 pbar->tick();
             }
-            if (K >= 2 || use_error_sink) {
-                weights = compute_expected_weights(1.0, omegas, weights, syn_rates, syn_weights, &bl, delta, psi, eps_sink, use_error_sink ? &eps_sink : nullptr, max_eps_sink);
-            }
-            if (srv && M >= 2) {
-                syn_weights = compute_expected_syn_weights(1.0, omegas, weights, syn_rates, syn_weights, &bl, delta, psi, eps_sink);
-            }
+
             if (allow_triple) {
                 auto mh_polish = NelderMead2D::minimize([&](Scalar d, Scalar p) {
                     if (d < 0.0 || d > 10.0 || p < 0.0 || p > 10.0) return 1e20;

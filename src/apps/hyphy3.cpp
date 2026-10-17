@@ -20,6 +20,7 @@ int run_gard(int argc, char* argv[]);
 int run_slac(int argc, char* argv[]);
 int run_dfel(int argc, char* argv[]);
 int run_ohmic(int argc, char* argv[]);
+int run_tree(int argc, char* argv[]);
 int run_report(int argc, char* argv[]);
 
 void print_hyphy3_banner() {
@@ -50,7 +51,8 @@ void print_hyphy3_usage(const char* prog) {
               << "  " << Console::brand("gard         ") << "  Genetic Algorithm for Recombination Detection (breakpoint screening)\n"
               << "  " << Console::brand("slac         ") << "  Single-Likelihood Ancestor Counting (counting site selection)\n"
               << "  " << Console::brand("dfel         ") << "  Directional FEL (non-stationary selection & auto-rooting)\n"
-              << "  " << Console::brand("ohmic        ") << "  Ohmic Phylogenetic Networks & Wheatstone Pruning\n\n";
+              << "  " << Console::brand("ohmic        ") << "  Ohmic Phylogenetic Networks & Wheatstone Pruning\n"
+              << "  " << Console::brand("tree         ") << "  ML/Ohmic Tree Engine (spectral scaffold & native polytomies)\n\n";
 
     std::cout << Console::bold("Reports:") << "\n"
               << "  " << Console::brand("report       ") << "  Write a self-contained HTML report for an existing result JSON\n\n";
@@ -127,6 +129,8 @@ int main(int argc, char* argv[]) {
             return run_dfel(sub_argc, sub_argv.data());
         } else if (cmd == "ohmic" || cmd == "OHMIC" || cmd == "--ohmic") {
             return run_ohmic(sub_argc, sub_argv.data());
+        } else if (cmd == "tree" || cmd == "TREE" || cmd == "tree-search") {
+            return run_tree(sub_argc, sub_argv.data());
         } else if (cmd == "report") {
             return run_report(sub_argc, sub_argv.data());
         } else {

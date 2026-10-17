@@ -149,6 +149,10 @@ add_executable(hyphy_report_test tests/test_report.cpp)
 target_link_libraries(hyphy_report_test PRIVATE hyphy3_report)
 add_test(NAME ReportTest COMMAND hyphy_report_test)
 
+add_executable(hyphy_tree_engine_test tests/test_tree_engine.cpp)
+target_link_libraries(hyphy_tree_engine_test PRIVATE hyphy3_core)
+add_test(NAME TreeEngineTest COMMAND hyphy_tree_engine_test)
+
 add_test(NAME HTMLReportEndToEndTest
     COMMAND ${CMAKE_COMMAND}
         -DHYPHY3=$<TARGET_FILE:hyphy3>
@@ -173,6 +177,7 @@ add_executable(hyphy3
     src/apps/hyphy_slac.cpp
     src/apps/hyphy_dfel.cpp
     src/apps/hyphy_ohmic.cpp
+    src/apps/hyphy_tree.cpp
     src/apps/hyphy_report.cpp
 )
 target_compile_definitions(hyphy3 PRIVATE HYPHY3_COMBINED_DRIVER)
@@ -215,6 +220,9 @@ target_link_libraries(hyphy3-dfel PRIVATE hyphy3_report)
 add_executable(hyphy3-ohmic src/apps/hyphy_ohmic.cpp)
 target_link_libraries(hyphy3-ohmic PRIVATE hyphy3_report)
 
+add_executable(hyphy3-tree src/apps/hyphy_tree.cpp)
+target_link_libraries(hyphy3-tree PRIVATE hyphy3_core)
+
 # Backward-compatible aliases
 add_executable(hyphy-fel ALIAS hyphy3-fel)
 add_executable(hyphy-contrast-fel ALIAS hyphy3-contrast-fel)
@@ -228,6 +236,7 @@ add_executable(hyphy-gard ALIAS hyphy3-gard)
 add_executable(hyphy-slac ALIAS hyphy3-slac)
 add_executable(hyphy-dfel ALIAS hyphy3-dfel)
 add_executable(hyphy-ohmic ALIAS hyphy3-ohmic)
+add_executable(hyphy-tree ALIAS hyphy3-tree)
 
 # Python & nanobind bindings
 find_package(Python 3.8 COMPONENTS Interpreter Development.Module)

@@ -83,7 +83,7 @@ public:
             return -eval_tree_lnl(t_scale, params);
         };
 
-        auto [opt_s, opt_s_nll] = Brent1D::minimize(scale_obj, 0.01, 1.0, 50.0, 1e-3, 30);
+        auto [opt_s, opt_s_nll] = Brent1D::minimize(scale_obj, 0.01, 1.0, 50.0, 1e-2, 12);
         for (size_t b = 0; b < num_branches; ++b) {
             int32_t nid = branch_node_ids[b];
             curr_tree.nodes[nid].branch_length *= opt_s;
@@ -92,41 +92,50 @@ public:
 
         // Stage 2 & 3: Alternating coordinate-wise optimization of GTR rates and individual branch lengths
         int total_evals = 0;
-        for (int cycle = 0; cycle < 3; ++cycle) {
-            // Optimize 5 GTR rate parameters coordinate-wise
-            auto opt_rate = [&](Scalar& r_ref) {
-                auto rate_obj = [&](Scalar val) -> Scalar {
-                    Scalar old_val = r_ref;
-                    r_ref = val;
-                    Scalar lnl = eval_tree_lnl(curr_tree, params);
-                    r_ref = old_val;
-                    return -lnl;
+        for (int cycle = 0; cycle < 2; ++cycle) {
+            if (cycle == 0) {
+                // Optimize 5 GTR rate parameters coordinate-wise
+                auto opt_rate = [&](Scalar& r_ref) {
+                    auto rate_obj = [&](Scalar val) -> Scalar {
+                        Scalar old_val = r_ref;
+                        r_ref = val;
+                        Scalar lnl = eval_tree_lnl(curr_tree, params);
+                        r_ref = old_val;
+                        return -lnl;
+                    };
+                    auto [best_r, _] = Brent1D::minimize(rate_obj, 1e-4, r_ref, 20.0, 5e-3, 10);
+                    r_ref = best_r;
+                    total_evals += 10;
                 };
-                auto [best_r, _] = Brent1D::minimize(rate_obj, 1e-4, r_ref, 20.0, 1e-3, 20);
-                r_ref = best_r;
-                total_evals += 20;
-            };
 
-            opt_rate(params.theta_AC);
-            opt_rate(params.theta_AT);
-            opt_rate(params.theta_CG);
-            opt_rate(params.theta_CT);
-            opt_rate(params.theta_GT);
+                opt_rate(params.theta_AC);
+                opt_rate(params.theta_AT);
+                opt_rate(params.theta_CG);
+                opt_rate(params.theta_CT);
+                opt_rate(params.theta_GT);
+            }
 
-            // Optimize individual branch lengths coordinate-wise
-            for (size_t b = 0; b < num_branches; ++b) {
-                int32_t nid = branch_node_ids[b];
-                Scalar init_bl = curr_tree.nodes[nid].branch_length;
-                auto bl_obj = [&](Scalar bl) -> Scalar {
-                    Scalar old_bl = curr_tree.nodes[nid].branch_length;
-                    curr_tree.nodes[nid].branch_length = bl;
-                    Scalar lnl = eval_tree_lnl(curr_tree, params);
-                    curr_tree.nodes[nid].branch_length = old_bl;
-                    return -lnl;
-                };
-                auto [best_bl, _] = Brent1D::minimize(bl_obj, 1e-6, std::max(init_bl, 1e-4), 5.0, 1e-3, 20);
-                curr_tree.nodes[nid].branch_length = best_bl;
-                total_evals += 20;
+            // Optimize individual branch lengths via exact O(N * L) spectral-cavity DFS sweep
+            if (curr_tree.bridges.empty()) {
+                GTRMatrix gtr_cur;
+                gtr_cur.update(params, nuc_aln.nuc_frequencies);
+                sweep_gtr_branches_cavity(curr_tree, nuc_aln, gtr_cur, leaf_to_taxon, 1e-3, 12);
+                total_evals += static_cast<int>(num_branches);
+            } else {
+                for (size_t b = 0; b < num_branches; ++b) {
+                    int32_t nid = branch_node_ids[b];
+                    Scalar init_bl = curr_tree.nodes[nid].branch_length;
+                    auto bl_obj = [&](Scalar bl) -> Scalar {
+                        Scalar old_bl = curr_tree.nodes[nid].branch_length;
+                        curr_tree.nodes[nid].branch_length = bl;
+                        Scalar lnl = eval_tree_lnl(curr_tree, params);
+                        curr_tree.nodes[nid].branch_length = old_bl;
+                        return -lnl;
+                    };
+                    auto [best_bl, _] = Brent1D::minimize(bl_obj, 1e-6, std::max(init_bl, 1e-4), 5.0, 1e-3, 20);
+                    curr_tree.nodes[nid].branch_length = best_bl;
+                    total_evals += 20;
+                }
             }
         }
         for (auto& br : curr_tree.bridges) {
@@ -148,6 +157,462 @@ public:
         size_t N = nuc_aln.num_nucleotides;
         res.aicc = -2.0 * res.log_likelihood + 2.0 * K * N / (N - K - 1.0);
         return res;
+    }
+
+    static void sweep_gtr_branches_cavity(
+        Tree& curr_tree,
+        const Alignment& nuc_aln,
+        const GTRMatrix& gtr,
+        const std::vector<size_t>& leaf_to_taxon,
+        Scalar tol = 1e-3,
+        int max_iter = 20
+    ) {
+        size_t num_nodes = curr_tree.num_nodes();
+        size_t num_patterns = nuc_aln.patterns.size();
+        if (num_nodes == 0 || num_patterns == 0) return;
+
+        std::vector<std::vector<Vector4>> D(num_nodes, std::vector<Vector4>(num_patterns, Vector4::Ones()));
+        std::vector<std::vector<Vector4>> P_D(num_nodes, std::vector<Vector4>(num_patterns, Vector4::Ones()));
+        std::vector<std::vector<Vector4>> U(num_nodes, std::vector<Vector4>(num_patterns, Vector4::Ones()));
+        std::vector<Matrix4> P_branch(num_nodes, Matrix4::Identity());
+
+        for (const auto& node : curr_tree.nodes) {
+            if (node.id != curr_tree.root_id && (node.is_leaf || !node.children.empty())) {
+                P_branch[node.id] = gtr.transition_matrix(node.branch_length);
+            }
+        }
+
+        for (int32_t nid : curr_tree.post_order) {
+            const auto& node = curr_tree.nodes[nid];
+            if (node.is_leaf) {
+                size_t t_idx = leaf_to_taxon[nid];
+                for (size_t p = 0; p < num_patterns; ++p) {
+                    int8_t state = (t_idx != static_cast<size_t>(-1)) ? nuc_aln.patterns[p].states[t_idx] : -1;
+                    if (state >= 0 && state < 4) {
+                        D[nid][p].setZero();
+                        D[nid][p](state) = 1.0;
+                    } else {
+                        D[nid][p].setOnes();
+                    }
+                    if (nid != curr_tree.root_id) {
+                        P_D[nid][p] = P_branch[nid] * D[nid][p];
+                    }
+                }
+            } else {
+                for (size_t p = 0; p < num_patterns; ++p) {
+                    Vector4 d_vec = Vector4::Ones();
+                    for (int32_t cid : node.children) {
+                        d_vec.array() *= P_D[cid][p].array();
+                    }
+                    Scalar mx = d_vec.maxCoeff();
+                    if (mx > 0.0 && mx < 1e-100) d_vec /= mx;
+                    D[nid][p] = d_vec;
+                    if (nid != curr_tree.root_id) {
+                        P_D[nid][p] = P_branch[nid] * d_vec;
+                    }
+                }
+            }
+        }
+
+        for (size_t p = 0; p < num_patterns; ++p) {
+            U[curr_tree.root_id][p] = gtr.pi;
+        }
+
+        std::vector<Vector4> c_spec(num_patterns);
+
+        std::function<void(int32_t)> dfs = [&](int32_t uid) {
+            const auto& node = curr_tree.nodes[uid];
+            if (uid != curr_tree.root_id && (node.is_leaf || !node.children.empty())) {
+                for (size_t p = 0; p < num_patterns; ++p) {
+                    Vector4 u_hat = gtr.U_pi.transpose() * U[uid][p];
+                    Vector4 d_hat = gtr.V_pi * D[uid][p];
+                    c_spec[p] = u_hat.cwiseProduct(d_hat);
+                }
+                Scalar init_bl = curr_tree.nodes[uid].branch_length;
+                auto bl_obj = [&](Scalar bl) -> Scalar {
+                    Vector4 exp_lam = (gtr.eigenvalues * bl).array().exp();
+                    Scalar lnl = 0.0;
+                    for (size_t p = 0; p < num_patterns; ++p) {
+                        Scalar lk = c_spec[p].dot(exp_lam);
+                        lnl += nuc_aln.patterns[p].weight * ((lk > 1e-300) ? std::log(lk) : -690.7755);
+                    }
+                    return -lnl;
+                };
+                auto [best_bl, _] = Brent1D::minimize(bl_obj, 1e-6, std::max<Scalar>(init_bl, 1e-4), 5.0, tol, max_iter);
+                curr_tree.nodes[uid].branch_length = best_bl;
+                P_branch[uid] = gtr.transition_matrix(best_bl);
+                for (size_t p = 0; p < num_patterns; ++p) {
+                    P_D[uid][p] = P_branch[uid] * D[uid][p];
+                }
+            }
+
+            if (!node.is_leaf && !node.children.empty()) {
+                size_t n_ch = node.children.size();
+                for (size_t i = 0; i < n_ch; ++i) {
+                    int32_t cid = node.children[i];
+                    for (size_t p = 0; p < num_patterns; ++p) {
+                        Vector4 u_c = (uid == curr_tree.root_id)
+                            ? gtr.pi
+                            : (P_branch[uid].transpose() * U[uid][p]);
+                        for (size_t j = 0; j < n_ch; ++j) {
+                            if (j != i) {
+                                u_c.array() *= P_D[node.children[j]][p].array();
+                            }
+                        }
+                        Scalar mx = u_c.maxCoeff();
+                        if (mx > 0.0 && mx < 1e-100) u_c /= mx;
+                        U[cid][p] = u_c;
+                    }
+                    dfs(cid);
+                }
+                for (size_t p = 0; p < num_patterns; ++p) {
+                    Vector4 d_vec = Vector4::Ones();
+                    for (int32_t cid : node.children) {
+                        d_vec.array() *= P_D[cid][p].array();
+                    }
+                    Scalar mx = d_vec.maxCoeff();
+                    if (mx > 0.0 && mx < 1e-100) d_vec /= mx;
+                    D[uid][p] = d_vec;
+                    if (uid != curr_tree.root_id) {
+                        P_D[uid][p] = P_branch[uid] * d_vec;
+                    }
+                }
+            }
+        };
+
+        dfs(curr_tree.root_id);
+    }
+
+    static int sweep_gtr_nni_cavity(
+        Tree& curr_tree,
+        const Alignment& nuc_aln,
+        const GTRMatrix& gtr,
+        const std::vector<size_t>& leaf_to_taxon,
+        const Matrix* D_backbone = nullptr
+    ) {
+        size_t num_nodes = curr_tree.num_nodes();
+        size_t num_patterns = nuc_aln.patterns.size();
+        size_t N_taxa = nuc_aln.num_taxa;
+        if (num_nodes == 0 || num_patterns == 0 || N_taxa < 4) return 0;
+
+        curr_tree.compute_post_order();
+
+        (void)D_backbone;
+        std::vector<std::vector<Vector4>> D(num_nodes, std::vector<Vector4>(num_patterns, Vector4::Ones()));
+        std::vector<std::vector<Vector4>> P_D(num_nodes, std::vector<Vector4>(num_patterns, Vector4::Ones()));
+        std::vector<std::vector<Vector4>> U(num_nodes, std::vector<Vector4>(num_patterns, Vector4::Ones()));
+        std::vector<Matrix4> P_branch(num_nodes, Matrix4::Identity());
+
+        for (const auto& node : curr_tree.nodes) {
+            if (node.id != curr_tree.root_id && (node.is_leaf || !node.children.empty())) {
+                P_branch[node.id] = gtr.transition_matrix(node.branch_length);
+            }
+        }
+
+        for (int32_t nid : curr_tree.post_order) {
+            const auto& node = curr_tree.nodes[nid];
+            if (node.is_leaf) {
+                size_t t_idx = leaf_to_taxon[nid];
+                for (size_t p = 0; p < num_patterns; ++p) {
+                    int8_t state = (t_idx != static_cast<size_t>(-1)) ? nuc_aln.patterns[p].states[t_idx] : -1;
+                    if (state >= 0 && state < 4) {
+                        D[nid][p].setZero();
+                        D[nid][p](state) = 1.0;
+                    } else {
+                        D[nid][p].setOnes();
+                    }
+                    if (nid != curr_tree.root_id) {
+                        P_D[nid][p] = P_branch[nid] * D[nid][p];
+                    }
+                }
+            } else {
+                for (size_t p = 0; p < num_patterns; ++p) {
+                    Vector4 d_vec = Vector4::Ones();
+                    for (int32_t cid : node.children) {
+                        d_vec.array() *= P_D[cid][p].array();
+                    }
+                    Scalar mx = d_vec.maxCoeff();
+                    if (mx > 0.0 && mx < 1e-100) d_vec /= mx;
+                    D[nid][p] = d_vec;
+                    if (nid != curr_tree.root_id) {
+                        P_D[nid][p] = P_branch[nid] * d_vec;
+                    }
+                }
+            }
+        }
+
+        for (size_t p = 0; p < num_patterns; ++p) {
+            U[curr_tree.root_id][p] = gtr.pi;
+        }
+
+        std::vector<Vector4> c_spec1(num_patterns);
+        std::vector<Vector4> c_spec2(num_patterns);
+        std::vector<Vector4> c_spec3(num_patterns);
+        std::vector<Vector4> M_D(num_patterns);
+        std::vector<Scalar> dp_vec(num_patterns, 0.0);
+        int accepted_swaps = 0;
+        size_t L_sites = nuc_aln.site_to_pattern.size();
+        bool is_coding = (L_sites >= 30 && (L_sites % 3) == 0);
+        size_t n_codons = L_sites / 3;
+        size_t k_trim_codons = std::max<size_t>(2, static_cast<size_t>(std::round(0.025 * n_codons)));
+        Scalar trim_budget_sites = std::max<Scalar>(2.0, 0.025 * static_cast<Scalar>(std::max<size_t>(1, nuc_aln.num_nucleotides)));
+
+        // Stratify patterns into 4 empirical Gamma rate quartiles by site Shannon entropy
+        std::vector<std::pair<Scalar, size_t>> pat_ent(num_patterns);
+        for (size_t p = 0; p < num_patterns; ++p) {
+            std::array<int, 4> cnt{0, 0, 0, 0};
+            int tot = 0;
+            for (int8_t st : nuc_aln.patterns[p].states) {
+                if (st >= 0 && st < 4) {
+                    cnt[st]++;
+                    tot++;
+                }
+            }
+            Scalar ent = 0.0;
+            if (tot > 0) {
+                for (int b = 0; b < 4; ++b) {
+                    if (cnt[b] > 0) {
+                        Scalar f = static_cast<Scalar>(cnt[b]) / static_cast<Scalar>(tot);
+                        ent -= f * std::log(f);
+                    }
+                }
+            }
+            pat_ent[p] = {ent, p};
+        }
+        std::sort(pat_ent.begin(), pat_ent.end());
+        std::vector<uint8_t> pat_bin(num_patterns, 1);
+        for (size_t rank = 0; rank < num_patterns; ++rank) {
+            uint8_t bin = static_cast<uint8_t>(std::min<size_t>(3, (rank * 4) / num_patterns));
+            pat_bin[pat_ent[rank].second] = bin;
+        }
+        const std::array<Scalar, 4> gamma_rates{0.22, 0.60, 1.08, 2.10};
+
+        auto eval_nni_at = [&](int32_t pid) {
+            size_t n_ch = curr_tree.nodes[pid].children.size();
+            for (size_t c_slot = 0; c_slot < n_ch; ++c_slot) {
+                int32_t uid = curr_tree.nodes[pid].children[c_slot];
+                if (curr_tree.nodes[uid].is_leaf || curr_tree.nodes[uid].children.size() != 2) continue;
+
+                // Test against each sibling slot under pid
+                for (size_t sib_slot = 0; sib_slot < n_ch; ++sib_slot) {
+                    if (sib_slot == c_slot) continue;
+                    int32_t id_C = curr_tree.nodes[pid].children[sib_slot];
+                    int32_t id_A = curr_tree.nodes[uid].children[0];
+                    int32_t id_B = curr_tree.nodes[uid].children[1];
+
+                    for (size_t p = 0; p < num_patterns; ++p) {
+                        Vector4 md = (pid == curr_tree.root_id)
+                            ? gtr.pi
+                            : (P_branch[pid].transpose() * U[pid][p]);
+                        for (size_t k = 0; k < n_ch; ++k) {
+                            if (k != c_slot && k != sib_slot) {
+                                md.array() *= P_D[curr_tree.nodes[pid].children[k]][p].array();
+                            }
+                        }
+                        Scalar mx = md.maxCoeff();
+                        if (mx > 0.0 && mx < 1e-100) md /= mx;
+                        M_D[p] = md;
+
+                        const Vector4& M_A = P_D[id_A][p];
+                        const Vector4& M_B = P_D[id_B][p];
+                        const Vector4& M_C = P_D[id_C][p];
+
+                        Vector4 Y1 = M_A.cwiseProduct(M_B);
+                        Vector4 W1 = md.cwiseProduct(M_C);
+                        c_spec1[p] = (gtr.U_pi.transpose() * W1).cwiseProduct(gtr.V_pi * Y1);
+
+                        Vector4 Y2 = M_A.cwiseProduct(M_C);
+                        Vector4 W2 = md.cwiseProduct(M_B);
+                        c_spec2[p] = (gtr.U_pi.transpose() * W2).cwiseProduct(gtr.V_pi * Y2);
+
+                        Vector4 Y3 = M_B.cwiseProduct(M_C);
+                        Vector4 W3 = md.cwiseProduct(M_A);
+                        c_spec3[p] = (gtr.U_pi.transpose() * W3).cwiseProduct(gtr.V_pi * Y3);
+                    }
+
+                    auto make_obj = [&](const std::vector<Vector4>& spec) {
+                        return [&](Scalar bl) -> Scalar {
+                            std::array<Vector4, 4> exp_lam;
+                            for (int b = 0; b < 4; ++b) {
+                                exp_lam[b] = (gtr.eigenvalues * (gamma_rates[b] * bl)).array().exp();
+                            }
+                            Scalar lnl = 0.0;
+                            for (size_t p = 0; p < num_patterns; ++p) {
+                                Scalar lk = spec[p].dot(exp_lam[pat_bin[p]]);
+                                lnl += nuc_aln.patterns[p].weight * ((lk > 1e-300) ? std::log(lk) : -690.7755);
+                            }
+                            return -lnl;
+                        };
+                    };
+
+                    Scalar init_bl = std::clamp<Scalar>(curr_tree.nodes[uid].branch_length, 1e-4, 1.0);
+                    auto [t1, nll1] = Brent1D::minimize(make_obj(c_spec1), 1e-6, init_bl, 2.0, 2e-3, 10);
+                    auto [t2, nll2] = Brent1D::minimize(make_obj(c_spec2), 1e-6, init_bl, 2.0, 2e-3, 10);
+                    auto [t3, nll3] = Brent1D::minimize(make_obj(c_spec3), 1e-6, init_bl, 2.0, 2e-3, 10);
+
+                    Scalar lnl1 = -nll1;
+                    Scalar lnl2 = -nll2;
+                    Scalar lnl3 = -nll3;
+
+                    int best_r = (lnl2 >= lnl3) ? 2 : 3;
+                    Scalar best_lnl = (best_r == 2) ? lnl2 : lnl3;
+                    Scalar best_t = (best_r == 2) ? t2 : t3;
+                    const auto& best_spec = (best_r == 2) ? c_spec2 : c_spec3;
+
+                    if (best_lnl > lnl1 + 0.25) {
+                        std::array<Vector4, 4> exp1, expr;
+                        for (int b = 0; b < 4; ++b) {
+                            exp1[b] = (gtr.eigenvalues * (gamma_rates[b] * t1)).array().exp();
+                            expr[b] = (gtr.eigenvalues * (gamma_rates[b] * best_t)).array().exp();
+                        }
+                        Scalar d_pos = 0.0, d_neg = 0.0;
+
+                        for (size_t p = 0; p < num_patterns; ++p) {
+                            Scalar lk1 = c_spec1[p].dot(exp1[pat_bin[p]]);
+                            Scalar lkr = best_spec[p].dot(expr[pat_bin[p]]);
+                            Scalar l1 = (lk1 > 1e-300) ? std::log(lk1) : -690.7755;
+                            Scalar lr = (lkr > 1e-300) ? std::log(lkr) : -690.7755;
+                            Scalar dp = lr - l1;
+                            dp_vec[p] = dp;
+                            Scalar w = nuc_aln.patterns[p].weight;
+                            if (dp > 0.0) {
+                                d_pos += w * dp;
+                            } else if (dp < 0.0) {
+                                d_neg += w * (-dp);
+                            }
+                        }
+
+                        bool accept_move = false;
+                        if (is_coding) {
+                            Scalar tot_p12 = 0.0, tot_p3 = 0.0;
+                            std::vector<Scalar> pos_codons;
+                            pos_codons.reserve(n_codons);
+                            int n_pos_cod = 0, n_neg_cod = 0;
+
+                            for (size_t c = 0; c < n_codons; ++c) {
+                                Scalar d12 = dp_vec[nuc_aln.site_to_pattern[3 * c]] +
+                                             dp_vec[nuc_aln.site_to_pattern[3 * c + 1]];
+                                Scalar d3 = dp_vec[nuc_aln.site_to_pattern[3 * c + 2]];
+                                tot_p12 += d12;
+                                tot_p3 += d3;
+                                Scalar dc = d12 + d3;
+                                if (dc > 0.05) {
+                                    pos_codons.push_back(dc);
+                                    n_pos_cod++;
+                                } else if (dc < -0.05) {
+                                    n_neg_cod++;
+                                }
+                            }
+                            std::sort(pos_codons.begin(), pos_codons.end(), std::greater<Scalar>());
+                            Scalar top_outliers = 0.0;
+                            for (size_t k = 0; k < std::min(k_trim_codons, pos_codons.size()); ++k) {
+                                top_outliers += pos_codons[k];
+                            }
+                            Scalar d_trimmed_codon = (tot_p12 + tot_p3) - top_outliers;
+
+                            if (tot_p3 >= -0.25 && (d_neg <= 1.5 || d_trimmed_codon > 0.1)) {
+                                accept_move = true;
+                            } else if (d_trimmed_codon > 1.5 && n_pos_cod >= n_neg_cod + 2) {
+                                accept_move = true;
+                            }
+                        } else {
+                            std::vector<std::pair<Scalar, Scalar>> pos_pats;
+                            for (size_t p = 0; p < num_patterns; ++p) {
+                                if (dp_vec[p] > 0.0) pos_pats.push_back({dp_vec[p], nuc_aln.patterns[p].weight});
+                            }
+                            std::sort(pos_pats.begin(), pos_pats.end(), [](const auto& a, const auto& b) {
+                                return a.first > b.first;
+                            });
+                            Scalar rem_trim = trim_budget_sites;
+                            Scalar trimmed_pos = d_pos;
+                            for (const auto& [dp, w] : pos_pats) {
+                                if (rem_trim <= 0.0) break;
+                                Scalar take = std::min(w, rem_trim);
+                                trimmed_pos -= take * dp;
+                                rem_trim -= take;
+                            }
+                            accept_move = (d_neg <= 1.5 || (trimmed_pos - d_neg) > 0.2);
+                        }
+
+                        if (accept_move) {
+                            if (best_r == 2) {
+                                curr_tree.nodes[uid].children[1] = id_C;
+                                curr_tree.nodes[pid].children[sib_slot] = id_B;
+                                curr_tree.nodes[id_C].parent_id = uid;
+                                curr_tree.nodes[id_B].parent_id = pid;
+                            } else {
+                                curr_tree.nodes[uid].children[0] = id_C;
+                                curr_tree.nodes[pid].children[sib_slot] = id_A;
+                                curr_tree.nodes[id_C].parent_id = uid;
+                                curr_tree.nodes[id_A].parent_id = pid;
+                            }
+                            curr_tree.nodes[uid].branch_length = best_t;
+                            P_branch[uid] = gtr.transition_matrix(best_t);
+
+                            int32_t new_A = curr_tree.nodes[uid].children[0];
+                            int32_t new_B = curr_tree.nodes[uid].children[1];
+                            for (size_t p = 0; p < num_patterns; ++p) {
+                                Vector4 d_vec = P_D[new_A][p].cwiseProduct(P_D[new_B][p]);
+                                Scalar mx = d_vec.maxCoeff();
+                                if (mx > 0.0 && mx < 1e-100) d_vec /= mx;
+                                D[uid][p] = d_vec;
+                                P_D[uid][p] = P_branch[uid] * d_vec;
+                            }
+                            accepted_swaps++;
+                        }
+                    }
+                }
+            }
+        };
+
+        std::function<void(int32_t)> dfs_nni = [&](int32_t pid) {
+            if (curr_tree.nodes[pid].is_leaf || curr_tree.nodes[pid].children.size() < 2) return;
+
+            // 1. Pre-order NNI check at pid
+            eval_nni_at(pid);
+
+            // 2. Propagate U[cid] and recurse into child subtrees
+            size_t n_ch = curr_tree.nodes[pid].children.size();
+            for (size_t i = 0; i < n_ch; ++i) {
+                int32_t cid = curr_tree.nodes[pid].children[i];
+                for (size_t p = 0; p < num_patterns; ++p) {
+                    Vector4 u_c = (pid == curr_tree.root_id)
+                        ? gtr.pi
+                        : (P_branch[pid].transpose() * U[pid][p]);
+                    for (size_t j = 0; j < n_ch; ++j) {
+                        if (j != i) {
+                            u_c.array() *= P_D[curr_tree.nodes[pid].children[j]][p].array();
+                        }
+                    }
+                    Scalar mx = u_c.maxCoeff();
+                    if (mx > 0.0 && mx < 1e-100) u_c /= mx;
+                    U[cid][p] = u_c;
+                }
+                dfs_nni(cid);
+            }
+
+            // 3. Post-order NNI check at pid using freshly refined child subtrees
+            eval_nni_at(pid);
+
+            for (size_t p = 0; p < num_patterns; ++p) {
+                Vector4 d_vec = Vector4::Ones();
+                for (int32_t cid : curr_tree.nodes[pid].children) {
+                    d_vec.array() *= P_D[cid][p].array();
+                }
+                Scalar mx = d_vec.maxCoeff();
+                if (mx > 0.0 && mx < 1e-100) d_vec /= mx;
+                D[pid][p] = d_vec;
+                if (pid != curr_tree.root_id) {
+                    P_D[pid][p] = P_branch[pid] * d_vec;
+                }
+            }
+        };
+
+        dfs_nni(curr_tree.root_id);
+        if (accepted_swaps > 0) {
+            curr_tree.compute_post_order();
+        }
+        return accepted_swaps;
     }
 };
 
@@ -206,18 +671,22 @@ public:
 
         // Stage 2: Coordinate sweeps
         for (int p = 0; p < passes; ++p) {
-            for (size_t b = 0; b < num_branches; ++b) {
-                int32_t nid = branch_node_ids[b];
-                Scalar init_bl = curr_tree.nodes[nid].branch_length;
-                auto bl_obj = [&](Scalar bl) -> Scalar {
-                    Scalar old_bl = curr_tree.nodes[nid].branch_length;
-                    curr_tree.nodes[nid].branch_length = bl;
-                    Scalar lnl = eval_tree_lnl(curr_tree);
-                    curr_tree.nodes[nid].branch_length = old_bl;
-                    return -lnl;
-                };
-                auto [best_bl, _] = Brent1D::minimize(bl_obj, 1e-6, std::max(init_bl, static_cast<Scalar>(1e-4)), 5.0, 1e-3, 15);
-                curr_tree.nodes[nid].branch_length = best_bl;
+            if (curr_tree.bridges.empty()) {
+                GTRFitter::sweep_gtr_branches_cavity(curr_tree, aln, gtr, leaf_to_taxon, 1e-3, 15);
+            } else {
+                for (size_t b = 0; b < num_branches; ++b) {
+                    int32_t nid = branch_node_ids[b];
+                    Scalar init_bl = curr_tree.nodes[nid].branch_length;
+                    auto bl_obj = [&](Scalar bl) -> Scalar {
+                        Scalar old_bl = curr_tree.nodes[nid].branch_length;
+                        curr_tree.nodes[nid].branch_length = bl;
+                        Scalar lnl = eval_tree_lnl(curr_tree);
+                        curr_tree.nodes[nid].branch_length = old_bl;
+                        return -lnl;
+                    };
+                    auto [best_bl, _] = Brent1D::minimize(bl_obj, 1e-6, std::max(init_bl, static_cast<Scalar>(1e-4)), 5.0, 1e-3, 15);
+                    curr_tree.nodes[nid].branch_length = best_bl;
+                }
             }
         }
         for (auto& br : curr_tree.bridges) {
