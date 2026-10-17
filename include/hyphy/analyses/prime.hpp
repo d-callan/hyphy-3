@@ -715,22 +715,16 @@ public:
             PRIMEMatrix pm;
             pm.update(1.0, omega, lams, codon_prop_diffs, gtr_rates, aln.pos_nuc_frequencies, aln.codon_frequencies_f3x4, code, settings.max_bound);
 
-            std::vector<Matrix> P_branches(num_nodes);
-            for (size_t i = 0; i < num_nodes; ++i) {
-                if (tree.nodes[i].id != tree.root_id) {
-                    P_branches[i] = pm.transition_matrix(tree.nodes[i].branch_length);
-                }
-            }
+            auto P_branches = LikelihoodEngine::build_P_branches<Matrix>(tree, pm);
 
             Scalar total_lnl = 0.0;
             #pragma omp parallel
             {
-                std::vector<Vector> thread_node_L(num_nodes, Vector::Zero(S));
-                std::vector<double> thread_node_scale(num_nodes, 0.0);
+                auto [thread_node_L, thread_node_scale] = LikelihoodEngine::make_pattern_scratch<Vector>(num_nodes, S);
 
                 #pragma omp for reduction(+:total_lnl) schedule(dynamic, 8)
                 for (size_t p = 0; p < num_patterns; ++p) {
-                    Scalar lnl = FELAnalyzer::compute_pattern_log_likelihood(
+                    Scalar lnl = LikelihoodEngine::compute_pattern_log_likelihood(
                         tree, aln.patterns[p], leaf_to_taxon,
                         // Passing dummy MG94 with same pi
                         static_cast<const MG94Matrix&>(pm),
@@ -808,8 +802,7 @@ public:
 
         #pragma omp parallel
         {
-            std::vector<Vector> thread_node_L(num_nodes, Vector::Zero(S));
-            std::vector<double> thread_node_scale(num_nodes, 0.0);
+            auto [thread_node_L, thread_node_scale] = LikelihoodEngine::make_pattern_scratch<Vector>(num_nodes, S);
             std::vector<Matrix> P_branches(num_nodes);
 
             #pragma omp for schedule(dynamic, 4)
@@ -1054,7 +1047,7 @@ private:
                 }
             }
 
-            return FELAnalyzer::compute_pattern_log_likelihood(
+            return LikelihoodEngine::compute_pattern_log_likelihood(
                 tree, pattern, leaf_to_taxon,
                 static_cast<const MG94Matrix&>(pm),
                 P_branches, thread_node_L, thread_node_scale

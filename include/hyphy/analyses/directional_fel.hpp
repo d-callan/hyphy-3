@@ -237,20 +237,6 @@ public:
         setup_regimes_and_matrices();
     }
 
-    // Evaluate single pattern log-likelihood with underflow protection
-    static Scalar compute_pattern_log_likelihood(
-        const Tree& tree,
-        const SitePattern& pattern,
-        const std::vector<size_t>& leaf_to_taxon,
-        const MG94Matrix& mg94_model,
-        const std::vector<Matrix>& P_branches,
-        std::vector<Vector>& node_L,
-        std::vector<double>& node_log_scale
-    ) {
-        return LikelihoodEngine::compute_pattern_log_likelihood(
-            tree, pattern, leaf_to_taxon, mg94_model, P_branches, node_L, node_log_scale);
-    }
-
     // ========================================================================
     // 1. Upfront Compositional Heterogeneity Test
     // ========================================================================
@@ -684,12 +670,11 @@ public:
             // Pattern likelihood evaluation
             Scalar tree_lnl = 0.0;
             int S = gcode.num_sense_codons;
-            std::vector<Vector> node_L(num_nodes, Vector(S));
-            std::vector<double> node_log_scale(num_nodes, 0.0);
+            auto [node_L, node_log_scale] = LikelihoodEngine::make_pattern_scratch<Vector>(num_nodes, S);
 
             for (size_t p = 0; p < aln.patterns.size(); ++p) {
                 const auto& pat = aln.patterns[p];
-                Scalar pat_l = compute_pattern_log_likelihood(
+                Scalar pat_l = LikelihoodEngine::compute_pattern_log_likelihood(
                     cand_tree, pat, leaf_to_taxon, base_matrix, P_branches, node_L, node_log_scale
                 );
                 tree_lnl += pat.weight * pat_l;
@@ -1080,8 +1065,7 @@ public:
         }
 
         // Thread-local likelihood scratchpad
-        std::vector<Vector> thread_node_L(num_nodes, Vector(S));
-        std::vector<double> thread_node_scale(num_nodes, 0.0);
+        auto [thread_node_L, thread_node_scale] = LikelihoodEngine::make_pattern_scratch<Vector>(num_nodes, S);
         std::vector<Matrix> P_branches(num_nodes);
         std::vector<MG94Matrix> regime_matrices(K);
 
@@ -1117,7 +1101,7 @@ public:
             }
 
             const auto& mg_root = (K == 3) ? regime_matrices[1] : regime_matrices[0];
-            return compute_pattern_log_likelihood(
+            return LikelihoodEngine::compute_pattern_log_likelihood(
                 tree, pattern, leaf_to_taxon, mg_root, P_branches, thread_node_L, thread_node_scale
             );
         };

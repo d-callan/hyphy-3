@@ -436,12 +436,7 @@ public:
         }
         tree.scale_bridge_lengths(conversion_factor);
 
-        branch_transition_matrices.resize(tree.num_nodes());
-        for (const auto& node : tree.nodes) {
-            if (node.id != tree.root_id) {
-                branch_transition_matrices[node.id] = base_mg94_matrix.transition_matrix(node.branch_length);
-            }
-        }
+        branch_transition_matrices = LikelihoodEngine::build_P_branches<Matrix>(tree, base_mg94_matrix);
     }
 
     // Static factory that performs Phase 1 GTR and Phase 2 MG94 fitting automatically
@@ -492,20 +487,6 @@ public:
         return analyzer;
     }
 
-    // Pattern log-likelihood evaluator with scaling for underflow protection
-    static Scalar compute_pattern_log_likelihood(
-        const Tree& tree,
-        const SitePattern& pattern,
-        const std::vector<size_t>& leaf_to_taxon,
-        const MG94Matrix& mg94_model,
-        const std::vector<Matrix>& P_branches,
-        std::vector<Vector>& node_L,
-        std::vector<double>& node_log_scale
-    ) {
-        return LikelihoodEngine::compute_pattern_log_likelihood(
-            tree, pattern, leaf_to_taxon, mg94_model, P_branches, node_L, node_log_scale);
-    }
-
     // Single site optimization with Empirical Bayes Ridge Shrinkage
     ContrastSiteResult analyze_pattern(size_t p_idx, const std::vector<size_t>& leaf_to_taxon) const {
         const auto& pattern = aln.patterns[p_idx];
@@ -546,8 +527,7 @@ public:
             return res;
         }
 
-        std::vector<Vector> thread_node_L(tree.num_nodes(), Vector::Zero(S));
-        std::vector<double> thread_node_scale(tree.num_nodes(), 0.0);
+        auto [thread_node_L, thread_node_scale] = LikelihoodEngine::make_pattern_scratch<Vector>(tree.num_nodes(), S);
         std::vector<Matrix> P_branches(tree.num_nodes());
 
         // Pre-allocate matrices per group
@@ -582,7 +562,7 @@ public:
                 }
             }
 
-            return compute_pattern_log_likelihood(tree, pattern, leaf_to_taxon, mg_groups[0], P_branches, thread_node_L, thread_node_scale);
+            return LikelihoodEngine::compute_pattern_log_likelihood(tree, pattern, leaf_to_taxon, mg_groups[0], P_branches, thread_node_L, thread_node_scale);
         };
 
         // Ridge Shrinkage Penalty Calculation

@@ -6,6 +6,8 @@
 #include "hyphy/core/rate_matrix.hpp"
 #include <vector>
 #include <cmath>
+#include <limits>
+#include <utility>
 #include <iostream>
 #include <cctype>
 #include <algorithm>
@@ -50,6 +52,53 @@ public:
             throw std::runtime_error("Phylogenetic tree leaves do not match any sequences in alignment! (0/" + std::to_string(leaves) + " matched)");
         }
         return leaf_to_taxon;
+    }
+
+    // Per-thread traversal scratch: node likelihood vectors + per-node log
+    // scales, destructured at each call site to keep the usual local names:
+    //   auto [node_L, node_log_scale] = make_pattern_scratch<Vector>(n, S);
+    template <typename VecType>
+    static std::pair<std::vector<VecType>, std::vector<double>>
+    make_pattern_scratch(size_t num_nodes, int S) {
+        return {std::vector<VecType>(num_nodes, VecType::Zero(S)),
+                std::vector<double>(num_nodes, 0.0)};
+    }
+
+    // Max-shifted log-sum-exp over a container of log-domain terms (each term
+    // already folds in log class weight and node log-scale). Entries equal to
+    // -infinity mark absent or degenerate classes; -infinity is returned when
+    // no term is finite so callers keep their own sentinel.
+    template <typename Terms>
+    static Scalar logsumexp(const Terms& terms) {
+        Scalar max_t = -std::numeric_limits<Scalar>::infinity();
+        for (const Scalar t : terms) {
+            if (t > max_t) max_t = t;
+        }
+        if (!std::isfinite(max_t)) return max_t;
+        Scalar sum_exp = 0.0;
+        for (const Scalar t : terms) {
+            if (std::isfinite(t)) sum_exp += std::exp(t - max_t);
+        }
+        return (sum_exp > 0.0)
+            ? max_t + std::log(sum_exp)
+            : -std::numeric_limits<Scalar>::infinity();
+    }
+
+    // Standard per-branch transition set: P[node.id] =
+    // model.transition_matrix(node.branch_length * branch_scale) for every
+    // non-root node. The root entry stays default-constructed; traversals
+    // never read it.
+    template <typename MatType, typename Model>
+    static std::vector<MatType> build_P_branches(
+        const Tree& tree, const Model& model, Scalar branch_scale = 1.0
+    ) {
+        std::vector<MatType> P(tree.nodes.size());
+        for (const auto& node : tree.nodes) {
+            if (node.id != tree.root_id) {
+                P[node.id] = model.transition_matrix(node.branch_length * branch_scale);
+            }
+        }
+        return P;
     }
 
     // One post-order pass over the tree for a single site pattern: leaf
@@ -124,12 +173,7 @@ public:
         size_t num_patterns = aln.patterns.size();
 
         // Precompute transition matrices for all branches
-        std::vector<Matrix4> P_branches(num_nodes);
-        for (const auto& node : tree.nodes) {
-            if (node.id != tree.root_id) {
-                P_branches[node.id] = gtr_model.transition_matrix(node.branch_length);
-            }
-        }
+        auto P_branches = build_P_branches<Matrix4>(tree, gtr_model);
 
         std::vector<size_t> local_map;
         const std::vector<size_t>& leaf_to_taxon = custom_leaf_to_taxon
@@ -140,8 +184,7 @@ public:
 
         #pragma omp parallel
         {
-            std::vector<Vector4> node_L(num_nodes);
-            std::vector<double> node_log_scale(num_nodes, 0.0);
+            auto [node_L, node_log_scale] = make_pattern_scratch<Vector4>(num_nodes, 4);
             #pragma omp for reduction(+:total_log_l) schedule(dynamic)
             for (size_t p = 0; p < num_patterns; ++p) {
                 const auto& pattern = aln.patterns[p];
@@ -172,12 +215,7 @@ public:
         int S = mg94_model.pi.size();
 
         // Precompute transition matrices for all branches
-        std::vector<Matrix> P_branches(num_nodes);
-        for (const auto& node : tree.nodes) {
-            if (node.id != tree.root_id) {
-                P_branches[node.id] = mg94_model.transition_matrix(node.branch_length * branch_scale);
-            }
-        }
+        auto P_branches = build_P_branches<Matrix>(tree, mg94_model, branch_scale);
 
         return compute_tree_log_likelihood_from_P(tree, aln, P_branches, mg94_model.pi, S, custom_leaf_to_taxon);
     }
@@ -204,8 +242,7 @@ public:
 
         #pragma omp parallel
         {
-            std::vector<Vector> node_L(num_nodes, Vector::Zero(S));
-            std::vector<double> node_log_scale(num_nodes, 0.0);
+            auto [node_L, node_log_scale] = make_pattern_scratch<Vector>(num_nodes, S);
 
             #pragma omp for reduction(+:total_log_l) schedule(dynamic)
             for (size_t p = 0; p < num_patterns; ++p) {

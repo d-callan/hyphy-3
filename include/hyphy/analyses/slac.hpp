@@ -608,13 +608,7 @@ public:
         }
 
         // Branch transition matrices for ancestral reconstruction
-        branch_transition_matrices.resize(tree.num_nodes());
-        for (const auto& node : tree.nodes) {
-            if (node.id != tree.root_id) {
-                Scalar bl_scaled = node.branch_length * conversion_factor;
-                branch_transition_matrices[node.id] = base_mg94_matrix.transition_matrix(bl_scaled);
-            }
-        }
+        branch_transition_matrices = LikelihoodEngine::build_P_branches<Matrix>(tree, base_mg94_matrix, conversion_factor);
     }
 
     /**

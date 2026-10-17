@@ -395,8 +395,7 @@ public:
                 #pragma omp parallel if(!omp_in_parallel())
                 #endif
                 {
-                    std::vector<Vector4> node_L(n_nodes);
-                    std::vector<double> node_log_scale(n_nodes, 0.0);
+                    auto [node_L, node_log_scale] = LikelihoodEngine::make_pattern_scratch<Vector4>(n_nodes, 4);
                     std::vector<Vector4> P_D(n_nodes);
                     std::vector<double> B(n_nodes, 1.0);
                     std::vector<Vector4> U(n_nodes, Vector4::Zero());
@@ -617,12 +616,7 @@ public:
         std::vector<size_t> leaf_to_taxon = LikelihoodEngine::build_leaf_to_taxon_map(tree, aln);
 
         // Precompute P and dP for current branch lengths
-        std::vector<Matrix4> P_b(num_nodes);
-        for (const auto& node : tree.nodes) {
-            if (node.id != tree.root_id && node.parent_id != INVALID_INDEX) {
-                P_b[node.id] = gtr.transition_matrix(node.branch_length);
-            }
-        }
+        auto P_b = LikelihoodEngine::build_P_branches<Matrix4>(tree, gtr);
 
         // Find internal nodes with >= 3 children (polytomies)
         std::vector<int32_t> polytomies;
@@ -635,9 +629,8 @@ public:
         if (polytomies.empty()) return 0;
 
         // Inside-Outside pass to get partials at all nodes
-        std::vector<Vector4> D_all(num_nodes);
+        auto [D_all, node_log_scale] = LikelihoodEngine::make_pattern_scratch<Vector4>(num_nodes, 4);
         std::vector<Vector4> V_all(num_nodes);
-        std::vector<double> node_log_scale(num_nodes, 0.0);
         std::vector<Vector4> P_D(num_nodes);
         std::vector<double> B(num_nodes, 1.0);
 

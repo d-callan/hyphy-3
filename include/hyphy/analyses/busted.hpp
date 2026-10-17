@@ -287,8 +287,7 @@ public:
         Scalar total_log_l = 0.0;
         #pragma omp parallel
         {
-            std::vector<Vector> node_L(num_nodes, Vector::Zero(S));
-            std::vector<double> node_log_scale(num_nodes, 0.0);
+            auto [node_L, node_log_scale] = LikelihoodEngine::make_pattern_scratch<Vector>(num_nodes, S);
             #pragma omp for reduction(+:total_log_l) schedule(dynamic)
             for (size_t p = 0; p < num_patterns; ++p) {
                 const auto& pattern = aln.patterns[p];
@@ -300,30 +299,17 @@ public:
                         pll = std::log(cond_L) + node_log_scale[tree.root_id];
                     }
                 } else {
-                    Scalar max_term = -std::numeric_limits<Scalar>::infinity();
-                    std::vector<Scalar> terms(M);
-                    std::vector<bool> valid(M, false);
-
+                    std::vector<Scalar> terms(M, -std::numeric_limits<Scalar>::infinity());
                     for (size_t m = 0; m < M; ++m) {
                         LikelihoodEngine::eval_pattern_postorder(tree, pattern, leaf_to_taxon, P_mix[m], S, node_L, node_log_scale);
                         Scalar cond_L = aln.codon_frequencies_f3x4.dot(node_L[tree.root_id]);
                         if (cond_L > 0.0) {
-                            Scalar term = std::log(syn_weights[m]) + std::log(cond_L) + node_log_scale[tree.root_id];
-                            terms[m] = term;
-                            valid[m] = true;
-                            if (term > max_term) max_term = term;
+                            terms[m] = std::log(syn_weights[m]) + std::log(cond_L) + node_log_scale[tree.root_id];
                         }
                     }
 
-                    if (max_term > -1e19) {
-                        Scalar sum_exp = 0.0;
-                        for (size_t m = 0; m < M; ++m) {
-                            if (valid[m]) sum_exp += std::exp(terms[m] - max_term);
-                        }
-                        if (sum_exp > 0.0) {
-                            pll = max_term + std::log(sum_exp);
-                        }
-                    }
+                    Scalar lse = LikelihoodEngine::logsumexp(terms);
+                    if (std::isfinite(lse)) pll = lse;
                 }
                 total_log_l += pattern.weight * pll;
                 if (out_pattern_ll) {
@@ -694,45 +680,35 @@ public:
                     }
                 } else {
                     std::vector<LikelihoodEngine::InsideOutsideResult> io_m(M);
-                    Scalar max_ll = -std::numeric_limits<Scalar>::infinity();
+                    std::vector<Scalar> terms(M, -std::numeric_limits<Scalar>::infinity());
                     for (size_t m = 0; m < M; ++m) {
                         if (syn_weights[m] <= 1e-12) continue;
                         io_m[m] = LikelihoodEngine::compute_inside_outside(
                             tree, pattern, leaf_to_taxon, P_mix[m], aln.codon_frequencies_f3x4, S
                         );
                         if (io_m[m].likelihood > 0.0) {
-                            Scalar term = std::log(syn_weights[m]) + io_m[m].log_likelihood;
-                            if (term > max_ll) max_ll = term;
+                            terms[m] = std::log(syn_weights[m]) + io_m[m].log_likelihood;
                         }
                     }
 
-                    if (max_ll > -1e19) {
-                        Scalar sum_exp = 0.0;
+                    Scalar pat_ll = LikelihoodEngine::logsumexp(terms);
+                    if (std::isfinite(pat_ll)) {
+                        local_ll += pattern.weight * pat_ll;
                         std::vector<Scalar> post_w(M, 0.0);
                         for (size_t m = 0; m < M; ++m) {
-                            if (syn_weights[m] > 1e-12 && io_m[m].likelihood > 0.0) {
-                                Scalar e = std::exp(std::log(syn_weights[m]) + io_m[m].log_likelihood - max_ll);
-                                post_w[m] = e;
-                                sum_exp += e;
-                            }
+                            if (std::isfinite(terms[m])) post_w[m] = std::exp(terms[m] - pat_ll);
                         }
-                        if (sum_exp > 0.0) {
-                            Scalar pat_ll = max_ll + std::log(sum_exp);
-                            local_ll += pattern.weight * pat_ll;
-                            Scalar inv_sum = 1.0 / sum_exp;
-                            for (size_t m = 0; m < M; ++m) post_w[m] *= inv_sum;
 
-                            for (const auto& node : tree.nodes) {
-                                if (node.id != tree.root_id) {
-                                    int32_t vid = node.id;
-                                    Scalar d_lnL_dt = 0.0;
-                                    for (size_t m = 0; m < M; ++m) {
-                                        if (post_w[m] > 1e-12 && io_m[m].likelihood > 0.0) {
-                                            d_lnL_dt += post_w[m] * (io_m[m].V[vid].dot(dP_mix[m][vid] * io_m[m].D[vid]) / io_m[m].likelihood);
-                                        }
+                        for (const auto& node : tree.nodes) {
+                            if (node.id != tree.root_id) {
+                                int32_t vid = node.id;
+                                Scalar d_lnL_dt = 0.0;
+                                for (size_t m = 0; m < M; ++m) {
+                                    if (post_w[m] > 1e-12 && io_m[m].likelihood > 0.0) {
+                                        d_lnL_dt += post_w[m] * (io_m[m].V[vid].dot(dP_mix[m][vid] * io_m[m].D[vid]) / io_m[m].likelihood);
                                     }
-                                    local_grad[vid] += pattern.weight * d_lnL_dt;
                                 }
+                                local_grad[vid] += pattern.weight * d_lnL_dt;
                             }
                         }
                     }
@@ -1951,8 +1927,7 @@ public:
         Scalar total_log_l = 0.0;
         #pragma omp parallel
         {
-            std::vector<Vector> node_L(num_nodes, Vector::Zero(S));
-            std::vector<double> node_log_scale(num_nodes, 0.0);
+            auto [node_L, node_log_scale] = LikelihoodEngine::make_pattern_scratch<Vector>(num_nodes, S);
             #pragma omp for reduction(+:total_log_l) schedule(dynamic)
             for (size_t p = 0; p < num_patterns; ++p) {
                 const auto& pattern = aln.patterns[p];
@@ -1964,30 +1939,17 @@ public:
                         pll = std::log(cond_L) + node_log_scale[tree.root_id];
                     }
                 } else {
-                    Scalar max_term = -std::numeric_limits<Scalar>::infinity();
-                    std::vector<Scalar> terms(M);
-                    std::vector<bool> valid(M, false);
-
+                    std::vector<Scalar> terms(M, -std::numeric_limits<Scalar>::infinity());
                     for (size_t m = 0; m < M; ++m) {
                         LikelihoodEngine::eval_pattern_postorder(tree, pattern, leaf_to_taxon, P_mix[m], S, node_L, node_log_scale);
                         Scalar cond_L = aln.codon_frequencies_f3x4.dot(node_L[tree.root_id]);
                         if (cond_L > 0.0) {
-                            Scalar term = std::log(syn_weights[m]) + std::log(cond_L) + node_log_scale[tree.root_id];
-                            terms[m] = term;
-                            valid[m] = true;
-                            if (term > max_term) max_term = term;
+                            terms[m] = std::log(syn_weights[m]) + std::log(cond_L) + node_log_scale[tree.root_id];
                         }
                     }
 
-                    if (max_term > -1e19) {
-                        Scalar sum_exp = 0.0;
-                        for (size_t m = 0; m < M; ++m) {
-                            if (valid[m]) sum_exp += std::exp(terms[m] - max_term);
-                        }
-                        if (sum_exp > 0.0) {
-                            pll = max_term + std::log(sum_exp);
-                        }
-                    }
+                    Scalar lse = LikelihoodEngine::logsumexp(terms);
+                    if (std::isfinite(lse)) pll = lse;
                 }
                 total_log_l += pattern.weight * pll;
                 if (out_pattern_ll) {
@@ -2468,45 +2430,35 @@ public:
                     }
                 } else {
                     std::vector<LikelihoodEngine::InsideOutsideResult> io_m(M);
-                    Scalar max_ll = -std::numeric_limits<Scalar>::infinity();
+                    std::vector<Scalar> terms(M, -std::numeric_limits<Scalar>::infinity());
                     for (size_t m = 0; m < M; ++m) {
                         if (syn_weights[m] <= 1e-12) continue;
                         io_m[m] = LikelihoodEngine::compute_inside_outside(
                             tree, pattern, leaf_to_taxon, P_mix[m], aln.codon_frequencies_f3x4, S
                         );
                         if (io_m[m].likelihood > 0.0) {
-                            Scalar term = std::log(syn_weights[m]) + io_m[m].log_likelihood;
-                            if (term > max_ll) max_ll = term;
+                            terms[m] = std::log(syn_weights[m]) + io_m[m].log_likelihood;
                         }
                     }
 
-                    if (max_ll > -1e19) {
-                        Scalar sum_exp = 0.0;
+                    Scalar pat_ll = LikelihoodEngine::logsumexp(terms);
+                    if (std::isfinite(pat_ll)) {
+                        local_ll += pattern.weight * pat_ll;
                         std::vector<Scalar> post_w(M, 0.0);
                         for (size_t m = 0; m < M; ++m) {
-                            if (syn_weights[m] > 1e-12 && io_m[m].likelihood > 0.0) {
-                                Scalar e = std::exp(std::log(syn_weights[m]) + io_m[m].log_likelihood - max_ll);
-                                post_w[m] = e;
-                                sum_exp += e;
-                            }
+                            if (std::isfinite(terms[m])) post_w[m] = std::exp(terms[m] - pat_ll);
                         }
-                        if (sum_exp > 0.0) {
-                            Scalar pat_ll = max_ll + std::log(sum_exp);
-                            local_ll += pattern.weight * pat_ll;
-                            Scalar inv_sum = 1.0 / sum_exp;
-                            for (size_t m = 0; m < M; ++m) post_w[m] *= inv_sum;
 
-                            for (const auto& node : tree.nodes) {
-                                if (node.id != tree.root_id) {
-                                    int32_t vid = node.id;
-                                    Scalar d_lnL_dt = 0.0;
-                                    for (size_t m = 0; m < M; ++m) {
-                                        if (post_w[m] > 1e-12 && io_m[m].likelihood > 0.0) {
-                                            d_lnL_dt += post_w[m] * (io_m[m].V[vid].dot(dP_mix[m][vid] * io_m[m].D[vid]) / io_m[m].likelihood);
-                                        }
+                        for (const auto& node : tree.nodes) {
+                            if (node.id != tree.root_id) {
+                                int32_t vid = node.id;
+                                Scalar d_lnL_dt = 0.0;
+                                for (size_t m = 0; m < M; ++m) {
+                                    if (post_w[m] > 1e-12 && io_m[m].likelihood > 0.0) {
+                                        d_lnL_dt += post_w[m] * (io_m[m].V[vid].dot(dP_mix[m][vid] * io_m[m].D[vid]) / io_m[m].likelihood);
                                     }
-                                    local_grad[vid] += pattern.weight * d_lnL_dt;
                                 }
+                                local_grad[vid] += pattern.weight * d_lnL_dt;
                             }
                         }
                     }
