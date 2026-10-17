@@ -405,10 +405,6 @@ public:
                     Scalar local_ll = 0.0;
                     std::vector<Scalar> local_dL(n_nodes, 0.0);
 
-                    const double SCALER_THRESH = 1e-150;
-                    const double SCALER_UP = 1e150;
-                    const double LOG_SCALER = 345.38776394910684;
-
                     #pragma omp for schedule(dynamic)
                     for (size_t p = 0; p < n_pat; ++p) {
                         const auto& pattern = aln_ref.patterns[p];
@@ -433,22 +429,15 @@ public:
                                 B[nid] = 1.0;
                             } else {
                                 double child_scale_sum = 0.0;
+                                double boost_mult = 1.0;
                                 for (int32_t cid : node.children) {
                                     P_D[cid] = P_b[cid] * node_L[cid];
                                 }
-                                tree_ref.eval_internal_node(nid, P_b, node_L, node_log_scale, node_L[nid], child_scale_sum);
-
-                                double max_val = node_L[nid].maxCoeff();
-                                int boost_count = 0;
-                                double boost_mult = 1.0;
-                                while (max_val < SCALER_THRESH && max_val > 0.0) {
-                                    node_L[nid] *= SCALER_UP;
-                                    max_val *= SCALER_UP;
-                                    boost_mult *= SCALER_UP;
-                                    boost_count++;
-                                }
+                                tree_ref.eval_internal_node(nid, P_b, node_L, node_log_scale, node_L[nid], child_scale_sum, nullptr, &boost_mult);
+                                // B[nid] records the node's own boost so the pre-order
+                                // pass re-applies it (v_msg *= B[uid]).
                                 B[nid] = boost_mult;
-                                node_log_scale[nid] = child_scale_sum - boost_count * LOG_SCALER;
+                                node_log_scale[nid] = child_scale_sum;
                             }
                         }
 
@@ -652,10 +641,6 @@ public:
         std::vector<Vector4> P_D(num_nodes);
         std::vector<double> B(num_nodes, 1.0);
 
-        const double SCALER_THRESH = 1e-150;
-        const double SCALER_UP = 1e150;
-        const double LOG_SCALER = 345.38776394910684;
-
         for (int32_t poly_id : polytomies) {
             const auto& pnode = tree.nodes[poly_id];
             size_t k = pnode.children.size();
@@ -688,22 +673,15 @@ public:
                         B[nid] = 1.0;
                     } else {
                         double child_scale_sum = 0.0;
+                        double boost_mult = 1.0;
                         for (int32_t cid : node.children) {
                             P_D[cid] = P_b[cid] * D_all[cid];
                         }
-                        tree.eval_internal_node(nid, P_b, D_all, node_log_scale, D_all[nid], child_scale_sum);
-
-                        double max_val = D_all[nid].maxCoeff();
-                        int boost_count = 0;
-                        double boost_mult = 1.0;
-                        while (max_val < SCALER_THRESH && max_val > 0.0) {
-                            D_all[nid] *= SCALER_UP;
-                            max_val *= SCALER_UP;
-                            boost_mult *= SCALER_UP;
-                            boost_count++;
-                        }
+                        tree.eval_internal_node(nid, P_b, D_all, node_log_scale, D_all[nid], child_scale_sum, nullptr, &boost_mult);
+                        // B[nid] records the node's own boost so the pre-order
+                        // pass re-applies it (v_msg *= B[uid]).
                         B[nid] = boost_mult;
-                        node_log_scale[nid] = child_scale_sum - boost_count * LOG_SCALER;
+                        node_log_scale[nid] = child_scale_sum;
                     }
                 }
 
