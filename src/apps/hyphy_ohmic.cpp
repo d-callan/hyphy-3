@@ -2,6 +2,7 @@
 #include "hyphy/core/alignment.hpp"
 #include "hyphy/core/tree.hpp"
 #include "hyphy/core/console.hpp"
+#include "hyphy/core/provenance.hpp"
 #include "hyphy/analyses/ohmic.hpp"
 #if __has_include("hyphy/report/html_report.hpp")
 #include "hyphy/report/html_report.hpp"
@@ -123,7 +124,14 @@ int run_ohmic(int argc, char* argv[]) {
         } else if ((arg == "--threads" || arg == "-t") && i + 1 < argc) {
             num_threads = std::stoi(argv[++i]);
         } else if ((arg == "--format" || arg == "--json-format") && i + 1 < argc) {
-            output_format = argv[++i];
+            std::string fmt = argv[++i];
+            JSONFormat jf;
+            if (!parse_json_format(fmt, jf)) {
+                std::cerr << Console::danger("Error: unknown --json-format '") << fmt
+                          << "'. Expected 'modern' or 'legacy'.\n";
+                return 1;
+            }
+            output_format = (jf == JSONFormat::Legacy) ? "legacy" : "modern";
         } else if (arg == "--legacy-json") {
             output_format = "legacy";
         } else if (arg == "--modern-json") {

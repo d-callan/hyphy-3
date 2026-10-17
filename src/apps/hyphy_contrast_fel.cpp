@@ -109,10 +109,10 @@ int run_contrast_fel(int argc, char* argv[]) {
             num_threads = std::stoi(argv[++i]);
         } else if (arg == "--json-format" && i + 1 < argc) {
             std::string fmt = argv[++i];
-            if (fmt == "legacy" || fmt == "datamonkey") {
-                json_format = JSONFormat::Legacy;
-            } else {
-                json_format = JSONFormat::ModernV3;
+            if (!parse_json_format(fmt, json_format)) {
+                std::cerr << Console::danger("Error: unknown --json-format '") << fmt
+                          << "'. Expected 'modern' or 'legacy'.\n";
+                return 1;
             }
         } else if (arg == "--legacy-json" || arg == "--legacy") {
             json_format = JSONFormat::Legacy;

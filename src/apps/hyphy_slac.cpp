@@ -118,7 +118,12 @@ int run_slac(int argc, char* argv[]) {
         } else if (arg == "--output" && i + 1 < argc) {
             output_file = argv[++i];
         } else if (arg == "--json-format" && i + 1 < argc) {
-            json_format = parse_json_format(argv[++i]);
+            std::string fmt = argv[++i];
+            if (!parse_json_format(fmt, json_format)) {
+                std::cerr << Console::danger("Error: unknown --json-format '") << fmt
+                          << "'. Expected 'modern' or 'legacy'.\n";
+                return 1;
+            }
         } else if (arg == "--legacy-json") {
             json_format = JSONFormat::Legacy;
         } else if (arg == "--modern-json") {

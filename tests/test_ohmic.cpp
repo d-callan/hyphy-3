@@ -7,6 +7,7 @@
 #include "hyphy/core/rate_matrix.hpp"
 #include "hyphy/core/likelihood.hpp"
 #include "hyphy/core/ohmic_network.hpp"
+#include "hyphy/core/hyphaeon.hpp"
 #include "hyphy/core/wheatstone_likelihood.hpp"
 #include "hyphy/analyses/ohmic.hpp"
 #include "hyphy/analyses/fel.hpp"
@@ -501,7 +502,10 @@ TEST_CASE("OHMIC 8: Standard Analyses (FEL & FUBAR) on Wheatstone Tree + HyphAeo
 
     OhmicNetwork net;
     std::string source_desc;
-    Tree tree = OhmicNetwork::resolve_tree(aln_cd2, "", true, true, "", &net, &source_desc);
+    // Request HyphAeon only when aeon-core + cached weights are present; the
+    // Wheatstone/FEL/FUBAR checks below run either way.
+    const bool use_hyphaeon = hyphaeon::is_available();
+    Tree tree = OhmicNetwork::resolve_tree(aln_cd2, "", true, use_hyphaeon, "", &net, &source_desc);
 
     CHECK(tree.num_leaves() == 10);
     CHECK(tree.has_wheatstone_bridges());

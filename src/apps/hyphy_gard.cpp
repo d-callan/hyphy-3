@@ -2,6 +2,7 @@
 #include "hyphy/core/alignment.hpp"
 #include "hyphy/core/tree.hpp"
 #include "hyphy/core/console.hpp"
+#include "hyphy/core/provenance.hpp"
 #include "hyphy/analyses/gard.hpp"
 
 #include <iostream>
@@ -136,10 +137,19 @@ int run_gard(int argc, char* argv[]) {
             topology_test_replicates = std::stoull(argv[++i]);
         } else if ((arg == "--threads" || arg == "-t") && i + 1 < argc) {
             num_threads = std::stoi(argv[++i]);
-        } else if (arg == "--format" && i + 1 < argc) {
-            output_format = argv[++i];
+        } else if ((arg == "--format" || arg == "--json-format") && i + 1 < argc) {
+            std::string fmt = argv[++i];
+            JSONFormat jf;
+            if (!parse_json_format(fmt, jf)) {
+                std::cerr << Console::danger("Error: unknown --json-format '") << fmt
+                          << "'. Expected 'modern' or 'legacy'.\n";
+                return 1;
+            }
+            output_format = (jf == JSONFormat::Legacy) ? "legacy" : "modern";
         } else if (arg == "--legacy-json") {
             output_format = "legacy";
+        } else if (arg == "--modern-json") {
+            output_format = "modern";
         } else if (arg == "--no-chart") {
             dynamic_chart = false;
         } else if (arg == "--chart") {

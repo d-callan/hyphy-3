@@ -8,6 +8,29 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 # Optimization flags
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -Wall -Wextra")
 
+# Build-speed options -----------------------------------------------------------
+# All targets share the same large header stack (nlohmann/json, Eigen, core and
+# analysis headers), so full builds parse it once per translation unit.
+#
+# - ccache: if found on PATH, identical translation units are served from
+#   cache. Harmless when absent.
+find_program(HYPHY3_CCACHE_PROGRAM ccache)
+if(HYPHY3_CCACHE_PROGRAM)
+    set(CMAKE_CXX_COMPILER_LAUNCHER "${HYPHY3_CCACHE_PROGRAM}")
+endif()
+#
+# - HYPHY3_FAST_COMPILE=ON: compiles at -O1 for faster iteration builds.
+#   Release artifacts must be built without it.
+option(HYPHY3_FAST_COMPILE "Trade optimization for compile speed (dev builds)" OFF)
+if(HYPHY3_FAST_COMPILE)
+    string(REGEX REPLACE "-O3" "-O1" CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
+endif()
+#
+# - HYPHY3_PCH (default ON): precompile the stable part of the shared header
+#   stack once (src/pch.hpp) and reuse it for every target. Set
+#   -DHYPHY3_PCH=OFF to disable.
+option(HYPHY3_PCH "Shared precompiled header for all executable targets" ON)
+
 # Header-only Eigen 3.4.0
 include(FetchContent)
 FetchContent_Declare(
@@ -27,6 +50,30 @@ add_library(hyphy_core ALIAS hyphy3_core)
 target_include_directories(hyphy3_core INTERFACE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${eigen3_SOURCE_DIR}
+)
+
+# Build metadata for the JSON output software block (consumed by
+# include/hyphy/core/json_output.hpp). git_commit is captured at configure
+# time; falls back to "unknown" outside a git checkout.
+execute_process(
+    COMMAND git rev-parse --short HEAD
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    OUTPUT_VARIABLE HYPHY3_GIT_COMMIT
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET
+)
+if(NOT HYPHY3_GIT_COMMIT)
+    set(HYPHY3_GIT_COMMIT "unknown")
+endif()
+if(NOT CMAKE_BUILD_TYPE)
+    set(HYPHY3_BUILD_TYPE_VALUE "unknown")
+else()
+    set(HYPHY3_BUILD_TYPE_VALUE "${CMAKE_BUILD_TYPE}")
+endif()
+target_compile_definitions(hyphy3_core INTERFACE
+    HYPHY3_VERSION="${PROJECT_VERSION}"
+    HYPHY3_GIT_COMMIT="${HYPHY3_GIT_COMMIT}"
+    HYPHY3_BUILD_TYPE="${HYPHY3_BUILD_TYPE_VALUE}"
 )
 
 # OpenMP support
@@ -72,6 +119,27 @@ add_library(hyphy3_report INTERFACE)
 target_include_directories(hyphy3_report INTERFACE ${HYPHY3_GENERATED_DIR})
 target_link_libraries(hyphy3_report INTERFACE hyphy3_core)
 add_dependencies(hyphy3_report hyphy3_viewer_assets)
+
+# Out-of-line JSON emitters (src/analyses/*.cpp). The emitter bodies live in
+# this one static library instead of the analysis headers so that editing an
+# emitter recompiles a single TU rather than all ~45 consumers.
+add_library(hyphy3_emitters STATIC
+    src/analyses/absrel.cpp
+    src/analyses/busted.cpp
+    src/analyses/contrast_fel.cpp
+    src/analyses/directional_fel.cpp
+    src/analyses/fel.cpp
+    src/analyses/fubar.cpp
+    src/analyses/gard.cpp
+    src/analyses/meme.cpp
+    src/analyses/ohmic.cpp
+    src/analyses/prime.cpp
+    src/analyses/relax.cpp
+    src/analyses/slac.cpp
+)
+target_link_libraries(hyphy3_emitters PUBLIC hyphy3_core)
+# The nanobind module links this static lib into a MODULE: it needs PIC.
+set_target_properties(hyphy3_emitters PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 # Test targets
 enable_testing()
@@ -254,7 +322,7 @@ if(Python_FOUND)
             nanobind_add_module(_hyphy3 NB_STATIC
                 src/python/bindings.cpp
             )
-            target_link_libraries(_hyphy3 PRIVATE hyphy3_core)
+            target_link_libraries(_hyphy3 PRIVATE hyphy3_core hyphy3_emitters)
             set_target_properties(_hyphy3 PROPERTIES
                 LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/python"
             )
@@ -278,3 +346,31 @@ if(Python_FOUND)
     endif()
 endif()
 
+
+# Consumer wiring ----------------------------------------------------------------
+# Every executable links hyphy3_emitters (out-of-line emitter definitions) and,
+# when HYPHY3_PCH is on, reuses the shared precompiled header compiled by
+# hyphy3_pch instead of re-parsing nlohmann/json + Eigen + the ubiquitous core
+# headers. Per-analysis emitters are intentionally excluded from the PCH (see
+# src/pch.hpp). Disable PCH with -DHYPHY3_PCH=OFF if it causes toolchain issues.
+if(HYPHY3_PCH)
+    add_library(hyphy3_pch STATIC src/pch.cpp)
+    target_link_libraries(hyphy3_pch PUBLIC hyphy3_core)
+    target_precompile_headers(hyphy3_pch PUBLIC "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/pch.hpp>")
+endif()
+
+get_property(_hyphy3_all_targets DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+             PROPERTY BUILDSYSTEM_TARGETS)
+foreach(_tgt IN LISTS _hyphy3_all_targets)
+    if(_tgt STREQUAL "hyphy3_pch" OR _tgt STREQUAL "hyphy3_emitters")
+        continue()
+    endif()
+    get_target_property(_tgt_type ${_tgt} TYPE)
+    if(_tgt_type STREQUAL "EXECUTABLE")
+        target_link_libraries(${_tgt} PRIVATE hyphy3_emitters)
+        if(HYPHY3_PCH)
+            target_link_libraries(${_tgt} PRIVATE hyphy3_pch)
+            target_precompile_headers(${_tgt} REUSE_FROM hyphy3_pch)
+        endif()
+    endif()
+endforeach()

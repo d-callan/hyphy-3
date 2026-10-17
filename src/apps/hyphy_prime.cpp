@@ -123,7 +123,13 @@ int run_prime(int argc, char* argv[]) {
             stage2_pvalue = std::stod(argv[++i]);
         } else if ((arg == "--format" || arg == "--json-format") && i + 1 < argc) {
             std::string fmt = argv[++i];
-            output_format = (fmt == "datamonkey") ? "legacy" : fmt;
+            JSONFormat jf;
+            if (!parse_json_format(fmt, jf)) {
+                std::cerr << Console::danger("Error: unknown --json-format '") << fmt
+                          << "'. Expected 'modern' or 'legacy'.\n";
+                return 1;
+            }
+            output_format = (jf == JSONFormat::Legacy) ? "legacy" : "modern";
         } else if (arg == "--legacy-json" || arg == "--legacy") {
             output_format = "legacy";
         } else if (arg == "--modern-json" || arg == "--modern") {

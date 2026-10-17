@@ -335,13 +335,24 @@ public:
         }
 
         // The root is the node with parent_id == INVALID_INDEX
+        // Auto-names for unnamed nodes must skip labels already present in the
+        // Newick (explicit "NodeN" internal labels are common) or the JSON
+        // phylogeny block would collide on the generated name.
+        std::unordered_set<std::string> used_names;
+        used_names.reserve(tree.nodes.size());
+        for (const auto& node : tree.nodes) used_names.insert(node.name);
         int node_counter = 1;
         for (auto& node : tree.nodes) {
             if (node.parent_id == INVALID_INDEX) {
                 tree.root_id = node.id;
             }
             if (node.name.empty()) {
-                node.name = "Node" + std::to_string(node_counter++);
+                std::string candidate;
+                do {
+                    candidate = "Node" + std::to_string(node_counter++);
+                } while (used_names.count(candidate));
+                node.name = candidate;
+                used_names.insert(node.name);
             }
         }
 

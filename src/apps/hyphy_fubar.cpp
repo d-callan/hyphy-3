@@ -130,7 +130,13 @@ int run_fubar(int argc, char* argv[]) {
             all_sites = true;
         } else if (arg == "--json-format" && i + 1 < argc) {
             std::string fmt = argv[++i];
-            json_format = (fmt == "legacy" || fmt == "datamonkey") ? "legacy" : "modern";
+            JSONFormat jf;
+            if (!parse_json_format(fmt, jf)) {
+                std::cerr << Console::danger("Error: unknown --json-format '") << fmt
+                          << "'. Expected 'modern' or 'legacy'.\n";
+                return 1;
+            }
+            json_format = (jf == JSONFormat::Legacy) ? "legacy" : "modern";
         } else if (arg == "--legacy" || arg == "--legacy-json") {
             json_format = "legacy";
         } else if (arg == "--modern" || arg == "--modern-json") {
