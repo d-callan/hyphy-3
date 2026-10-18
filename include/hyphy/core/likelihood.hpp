@@ -211,7 +211,6 @@ public:
         const std::vector<size_t>* custom_leaf_to_taxon = nullptr,
         Scalar branch_scale = 1.0
     ) {
-        size_t num_nodes = tree.num_nodes();
         int S = mg94_model.pi.size();
 
         // Precompute transition matrices for all branches
