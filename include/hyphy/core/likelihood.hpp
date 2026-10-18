@@ -264,26 +264,36 @@ public:
 
     // Inside-Outside two-pass traversal for a single site pattern
     // Returns downward vectors D, parent-sibling context vectors V, and total likelihood L
-    struct InsideOutsideResult {
-        std::vector<Vector> D; // Downward subtree likelihoods D[node]
-        std::vector<Vector> V; // Upward parent-sibling messages V[node]
+    template <typename VecType>
+    struct InsideOutsideResultT {
+        std::vector<VecType> D; // Downward subtree likelihoods D[node]
+        std::vector<VecType> V; // Upward parent-sibling messages V[node]
         Scalar likelihood = 0.0;
         Scalar log_likelihood = 0.0;
     };
+    using InsideOutsideResult = InsideOutsideResultT<Vector>;
 
-    static InsideOutsideResult compute_inside_outside(
+    // Inside-outside (sum-product) pass for one pattern. When out_P_D is
+    // non-null it is filled with the per-child messages P_b[c] * D[c] computed
+    // during the inside pass — callers needing pairwise child products (e.g.
+    // polytomy resolution) reuse them instead of recomputing.
+    template <typename VecType, typename MatType>
+    static InsideOutsideResultT<VecType> compute_inside_outside(
         const Tree& tree,
         const SitePattern& pattern,
         const std::vector<size_t>& leaf_to_taxon,
-        const std::vector<Matrix>& P_branches,
-        const Vector& pi,
-        int S
+        const std::vector<MatType>& P_branches,
+        const VecType& pi,
+        int S,
+        std::vector<VecType>* out_P_D = nullptr
     ) {
         size_t num_nodes = tree.num_nodes();
-        InsideOutsideResult res;
-        res.D.assign(num_nodes, Vector::Zero(S));
-        res.V.assign(num_nodes, Vector::Zero(S));
-        std::vector<Vector> P_D(num_nodes, Vector::Zero(S));
+        InsideOutsideResultT<VecType> res;
+        res.D.assign(num_nodes, VecType::Zero(S));
+        res.V.assign(num_nodes, VecType::Zero(S));
+        std::vector<VecType> local_P_D;
+        std::vector<VecType>& P_D = out_P_D ? *out_P_D : local_P_D;
+        P_D.assign(num_nodes, VecType::Zero(S));
         std::vector<double> B(num_nodes, 1.0);
         std::vector<double> node_log_scale(num_nodes, 0.0);
 
@@ -327,7 +337,7 @@ public:
         }
 
         // 2. Pre-order (top-down) pass to compute U and V reusing cached P_D
-        std::vector<Vector> U(num_nodes, Vector::Zero(S));
+        std::vector<VecType> U(num_nodes, VecType::Zero(S));
         U[tree.root_id] = pi;
 
         for (auto it = tree.post_order.rbegin(); it != tree.post_order.rend(); ++it) {
@@ -338,7 +348,7 @@ public:
             size_t num_children = node.children.size();
             for (size_t i = 0; i < num_children; ++i) {
                 int32_t vid = node.children[i];
-                Vector v_msg = U[uid];
+                VecType v_msg = U[uid];
                 for (size_t j = 0; j < num_children; ++j) {
                     if (i != j) {
                         v_msg.array() *= P_D[node.children[j]].array();
