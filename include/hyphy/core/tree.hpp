@@ -83,8 +83,16 @@ public:
         const std::vector<double>& node_log_scale,
         VecType& out_L,
         double& out_child_scale_sum,
-        const std::vector<std::array<MatType, 3>>* P_bridges = nullptr
+        const std::vector<std::array<MatType, 3>>* P_bridges = nullptr,
+        double* out_node_boost = nullptr
     ) const {
+        const double SCALER_THRESH = 1e-150;
+        const double SCALER_UP = 1e150;
+        const double LOG_SCALER = 345.38776394910684;
+
+        int boost_count = 0;
+        double boost_mult = 1.0;
+
         int32_t b_idx = bridge_index(nid);
         if (b_idx >= 0) {
             const auto& wb = bridges[static_cast<size_t>(b_idx)];
@@ -131,21 +139,27 @@ public:
             for (int32_t cid : nodes[nid].children) {
                 out_L.array() *= (P_branches[cid] * node_L[cid]).array();
                 out_child_scale_sum += node_log_scale[cid];
+                double cur_max = out_L.maxCoeff();
+                while (cur_max < SCALER_THRESH && cur_max > 0.0) {
+                    out_L *= SCALER_UP;
+                    cur_max *= SCALER_UP;
+                    boost_mult *= SCALER_UP;
+                    boost_count++;
+                }
             }
         }
 
-        const double SCALER_THRESH = 1e-150;
-        const double SCALER_UP = 1e150;
-        const double LOG_SCALER = 345.38776394910684;
-
         double max_val = out_L.maxCoeff();
-        int boost_count = 0;
         while (max_val < SCALER_THRESH && max_val > 0.0) {
             out_L *= SCALER_UP;
             max_val *= SCALER_UP;
+            boost_mult *= SCALER_UP;
             boost_count++;
         }
         out_child_scale_sum -= boost_count * LOG_SCALER;
+        if (out_node_boost != nullptr) {
+            *out_node_boost = boost_mult;
+        }
     }
 
     template <typename VecType, typename MatType, typename ModelType>
@@ -157,8 +171,16 @@ public:
         const std::vector<double>& node_log_scale,
         VecType& out_L,
         double& out_child_scale_sum,
-        Scalar branch_scale = 1.0
+        Scalar branch_scale = 1.0,
+        double* out_node_boost = nullptr
     ) const {
+        const double SCALER_THRESH = 1e-150;
+        const double SCALER_UP = 1e150;
+        const double LOG_SCALER = 345.38776394910684;
+
+        int boost_count = 0;
+        double boost_mult = 1.0;
+
         int32_t b_idx = bridge_index(nid);
         if (b_idx >= 0) {
             const auto& wb = bridges[static_cast<size_t>(b_idx)];
@@ -196,21 +218,27 @@ public:
             for (int32_t cid : nodes[nid].children) {
                 out_L.array() *= (P_branches[cid] * node_L[cid]).array();
                 out_child_scale_sum += node_log_scale[cid];
+                double cur_max = out_L.maxCoeff();
+                while (cur_max < SCALER_THRESH && cur_max > 0.0) {
+                    out_L *= SCALER_UP;
+                    cur_max *= SCALER_UP;
+                    boost_mult *= SCALER_UP;
+                    boost_count++;
+                }
             }
         }
 
-        const double SCALER_THRESH = 1e-150;
-        const double SCALER_UP = 1e150;
-        const double LOG_SCALER = 345.38776394910684;
-
         double max_val = out_L.maxCoeff();
-        int boost_count = 0;
         while (max_val < SCALER_THRESH && max_val > 0.0) {
             out_L *= SCALER_UP;
             max_val *= SCALER_UP;
+            boost_mult *= SCALER_UP;
             boost_count++;
         }
         out_child_scale_sum -= boost_count * LOG_SCALER;
+        if (out_node_boost != nullptr) {
+            *out_node_boost = boost_mult;
+        }
     }
 
     static Tree from_newick_file(const std::string& filepath) {
@@ -335,21 +363,34 @@ public:
         }
 
         // The root is the node with parent_id == INVALID_INDEX
-        // Auto-names for unnamed nodes must skip labels already present in the
-        // Newick (explicit "NodeN" internal labels are common) or the JSON
-        // phylogeny block would collide on the generated name.
+        // Auto-names for unnamed nodes (and any colliding internal labels from
+        // stitched subtrees) must be strictly unique so the JSON phylogeny
+        // block never encounters duplicate node keys.
         std::unordered_set<std::string> used_names;
-        used_names.reserve(tree.nodes.size());
-        for (const auto& node : tree.nodes) used_names.insert(node.name);
+        used_names.reserve(tree.nodes.size() * 2);
+        for (const auto& node : tree.nodes) {
+            if (node.is_leaf && !node.name.empty()) {
+                used_names.insert(node.name);
+            }
+        }
         int node_counter = 1;
         for (auto& node : tree.nodes) {
             if (node.parent_id == INVALID_INDEX) {
                 tree.root_id = node.id;
             }
-            if (node.name.empty()) {
+            if (!node.is_leaf) {
+                if (node.name.empty() || used_names.count(node.name)) {
+                    std::string candidate;
+                    do {
+                        candidate = "Node" + std::to_string(node_counter++);
+                    } while (used_names.count(candidate));
+                    node.name = candidate;
+                }
+                used_names.insert(node.name);
+            } else if (node.name.empty()) {
                 std::string candidate;
                 do {
-                    candidate = "Node" + std::to_string(node_counter++);
+                    candidate = "Leaf" + std::to_string(node_counter++);
                 } while (used_names.count(candidate));
                 node.name = candidate;
                 used_names.insert(node.name);
@@ -397,6 +438,100 @@ public:
                 std::ostringstream ss;
                 ss << ":" << std::setprecision(8) << node.branch_length;
                 res += ss.str();
+            }
+            return res;
+        };
+        return write_node(write_node, root_id) + ";";
+    }
+
+    /**
+     * @brief Serialize tree/network to Cardona et al. (2008) Extended Newick (eNewick) with NHX annotations.
+     *
+     * For every active Wheatstone bridge at a 3-child hub u with children {A, B, C} and Ohmic weights
+     * {w_1, w_2, w_3} (where w_1 pairs (A,B), w_2 shunts (A,C) with inheritance probability gamma = w_2/(w_1+w_2)):
+     *   - Clade A is wrapped in a hybrid reticulation node `#H<k>` whose primary parent is the (A,B) bridge
+     *     with weight `w_1` and whose secondary shunt parent is the (C, #H<k>) bridge with weight `w_2`.
+     *   - Polytomy busbar nodes (>2 children without a bridge) are annotated with `[&&NHX:ohmic_busbar=true:degree=K]`.
+     */
+    std::string to_extended_newick(bool include_branch_lengths = true, bool include_nhx = true) const {
+        if (root_id == INVALID_INDEX || nodes.empty()) return "";
+        auto fmt_num = [](Scalar v, int prec = 6) {
+            std::ostringstream ss;
+            ss << std::fixed << std::setprecision(prec) << v;
+            return ss.str();
+        };
+
+        auto write_node = [&](auto& self, int32_t nid) -> std::string {
+            const auto& node = nodes[nid];
+            int32_t b_idx = bridge_index(nid);
+
+            // Case 1: Active 4-Way Wheatstone Bridge Hub
+            if (b_idx >= 0 && static_cast<size_t>(b_idx) < bridges.size()) {
+                const auto& wb = bridges[static_cast<size_t>(b_idx)];
+                int32_t id_A = wb.children[0];
+                int32_t id_B = wb.children[1];
+                int32_t id_C = wb.children[2];
+                if (id_A >= 0 && id_B >= 0 && id_C >= 0 &&
+                    static_cast<size_t>(id_A) < nodes.size() &&
+                    static_cast<size_t>(id_B) < nodes.size() &&
+                    static_cast<size_t>(id_C) < nodes.size()) {
+
+                    std::string sub_A = self(self, id_A);
+                    std::string sub_B = self(self, id_B);
+                    std::string sub_C = self(self, id_C);
+
+                    Scalar w1 = wb.weights[0];
+                    Scalar w2 = wb.weights[1];
+                    Scalar w3 = wb.weights[2];
+                    Scalar w_tot = std::max<Scalar>(1e-12, w1 + w2);
+                    Scalar gamma1 = w1 / w_tot;
+                    Scalar gamma2 = w2 / w_tot;
+                    Scalar t1 = std::max<Scalar>(1e-5, wb.branch_lengths[0]);
+                    Scalar t2 = std::max<Scalar>(1e-5, wb.branch_lengths[1]);
+
+                    std::string h_tag = "#H" + std::to_string(b_idx + 1);
+                    std::string res;
+                    if (w2 >= 0.01) {
+                        // Explicit eNewick hybrid reticulation: clade A is reached via primary (A,B) bridge (gamma1)
+                        // and secondary Wheatstone shunt (C, #H) bridge (gamma2)
+                        res = "((" + sub_A + ")" + h_tag + ":0.0::" + fmt_num(gamma1, 4) + "," + sub_B + ")Bridge_" +
+                              std::to_string(b_idx + 1) + "_AB:" + fmt_num(t1) + ",(" + sub_C + "," + h_tag +
+                              ":0.0::" + fmt_num(gamma2, 4) + ")Bridge_" + std::to_string(b_idx + 1) + "_Shunt:" + fmt_num(t2) + ")";
+                    } else {
+                        res = "((" + sub_A + "," + sub_B + "):" + fmt_num(t1) + "," + sub_C + ")";
+                    }
+                    res += node.name;
+                    if (include_nhx) {
+                        res += "[&&NHX:wheatstone_hub=true:ohmic_support=" + fmt_num(wb.ohmic_support, 4) +
+                               ":shunt_stress=" + fmt_num(wb.shunt_stress, 4) +
+                               ":w1=" + fmt_num(w1, 4) + ":w2=" + fmt_num(w2, 4) + ":w3=" + fmt_num(w3, 4) + "]";
+                    }
+                    if (include_branch_lengths && nid != root_id) {
+                        res += ":" + fmt_num(node.branch_length, 8);
+                    }
+                    return res;
+                }
+            }
+
+            // Case 2: Standard Tree Node or Polytomy Busbar
+            std::string res;
+            if (!node.children.empty()) {
+                res += "(";
+                for (size_t i = 0; i < node.children.size(); ++i) {
+                    if (i > 0) res += ",";
+                    res += self(self, node.children[i]);
+                }
+                res += ")";
+            }
+            res += node.name;
+            if (!node.model_tag.empty()) {
+                res += "{" + node.model_tag + "}";
+            }
+            if (include_branch_lengths && nid != root_id) {
+                res += ":" + fmt_num(node.branch_length, 8);
+            }
+            if (include_nhx && !node.is_leaf && node.children.size() > 2 && nid != root_id) {
+                res += "[&&NHX:ohmic_busbar=true:degree=" + std::to_string(node.children.size()) + "]";
             }
             return res;
         };

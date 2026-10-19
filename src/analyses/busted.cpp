@@ -143,6 +143,9 @@ nlohmann::json BUSTEDAnalyzer::to_legacy_json(const BUSTEDResult& res) const {
         if (res.unconstrained.has_background_distribution) {
             unc_rates["Background"] = format_distro(res.unconstrained.background_distribution);
         }
+        if (res.unconstrained.has_unclassified_distribution) {
+            unc_rates["Unclassified"] = format_distro(res.unconstrained.unclassified_distribution);
+        }
         if (!res.unconstrained.test_distribution.syn_rates.empty() && res.unconstrained.test_distribution.syn_rates.size() > 1) {
             unc_rates["Synonymous site-to-site rates"] = format_srv_distro(res.unconstrained.test_distribution);
         }
@@ -164,6 +167,9 @@ nlohmann::json BUSTEDAnalyzer::to_legacy_json(const BUSTEDResult& res) const {
         nlohmann::json con_rates = {{"Test", format_distro(res.constrained.test_distribution)}};
         if (res.constrained.has_background_distribution) {
             con_rates["Background"] = format_distro(res.constrained.background_distribution);
+        }
+        if (res.constrained.has_unclassified_distribution) {
+            con_rates["Unclassified"] = format_distro(res.constrained.unclassified_distribution);
         }
         if (!res.constrained.test_distribution.syn_rates.empty() && res.constrained.test_distribution.syn_rates.size() > 1) {
             con_rates["Synonymous site-to-site rates"] = format_srv_distro(res.constrained.test_distribution);
@@ -188,6 +194,9 @@ nlohmann::json BUSTEDAnalyzer::to_legacy_json(const BUSTEDResult& res) const {
                 {"Test", format_distro(res.constrained_background.test_distribution)},
                 {"Background", format_distro(res.constrained_background.background_distribution)}
             };
+            if (res.constrained_background.has_unclassified_distribution) {
+                con_bg_rates["Unclassified"] = format_distro(res.constrained_background.unclassified_distribution);
+            }
             fits["Constrained model (background)"] = {
                 {"AIC-c", res.constrained_background.aicc},
                 {"Log Likelihood", res.constrained_background.log_likelihood},
@@ -199,6 +208,9 @@ nlohmann::json BUSTEDAnalyzer::to_legacy_json(const BUSTEDResult& res) const {
                 {"Test", format_distro(res.shared_distributions.test_distribution)},
                 {"Background", format_distro(res.shared_distributions.background_distribution)}
             };
+            if (res.shared_distributions.has_unclassified_distribution) {
+                shared_rates["Unclassified"] = format_distro(res.shared_distributions.unclassified_distribution);
+            }
             fits["Unconstrained model with shared distributions"] = {
                 {"AIC-c", res.shared_distributions.aicc},
                 {"Log Likelihood", res.shared_distributions.log_likelihood},
@@ -210,6 +222,9 @@ nlohmann::json BUSTEDAnalyzer::to_legacy_json(const BUSTEDResult& res) const {
                 {"Test", format_distro(res.relax_alternative.test_distribution)},
                 {"Background", format_distro(res.relax_alternative.background_distribution)}
             };
+            if (res.relax_alternative.has_unclassified_distribution) {
+                relax_rates["Unclassified"] = format_distro(res.relax_alternative.unclassified_distribution);
+            }
             fits["RELAX alternative (coupled-k)"] = {
                 {"AIC-c", res.relax_alternative.aicc},
                 {"Log Likelihood", res.relax_alternative.log_likelihood},
@@ -402,6 +417,18 @@ nlohmann::json BUSTEDAnalyzer::to_modern_json(const BUSTEDResult& res, const Pro
                     });
                 }
                 f["rate_distributions"]["background"] = bg_dist;
+            }
+
+            if (fit.has_unclassified_distribution && !fit.unclassified_distribution.omegas.empty()) {
+                nlohmann::json unclass_dist = nlohmann::json::array();
+                for (size_t k = 0; k < fit.unclassified_distribution.omegas.size(); ++k) {
+                    unclass_dist.push_back({
+                        {"class", static_cast<int>(k + 1)},
+                        {"omega", finite_or_null(fit.unclassified_distribution.omegas[k])},
+                        {"proportion", finite_or_null(fit.unclassified_distribution.weights[k])}
+                    });
+                }
+                f["rate_distributions"]["unclassified"] = unclass_dist;
             }
 
             if (res.settings.error_sink) {

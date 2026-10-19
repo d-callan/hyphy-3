@@ -41,6 +41,8 @@ struct BUSTEDFit {
     BUSTEDRateDistribution test_distribution;
     bool has_background_distribution = false;
     BUSTEDRateDistribution background_distribution;
+    bool has_unclassified_distribution = false;
+    BUSTEDRateDistribution unclassified_distribution;
     std::vector<Scalar> branch_lengths; // Branch lengths per node id
     std::vector<Scalar> site_log_likelihoods;
     Scalar delta = 0.0;             // Double-hit rate parameter

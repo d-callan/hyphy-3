@@ -139,6 +139,10 @@ int run_busted(int argc, char* argv[]) {
         }
     }
 
+    if (settings.test_branches == "All" && cli.branches != "All") {
+        settings.test_branches = cli.branches;
+    }
+
     if (cli.alignment_file.empty()) {
         std::cerr << "Error: --alignment is required.\n\n";
         print_usage(argv[0], settings.phenotype_mode);
@@ -162,10 +166,14 @@ int run_busted(int argc, char* argv[]) {
     const auto& tree_source = ds.tree_source;
 
     // Validate branch selection upfront before fitting GTR/MG94
-    Tree::BranchSelection branch_sel;
+    size_t n_test_br = 0, n_bg_br = 0, n_unclass_br = 0;
     try {
-        branch_sel = tree.select_branches(settings.test_branches, "", {}, settings.phenotype_mode || settings.relax_mode);
-        if ((settings.phenotype_mode || settings.relax_mode) && branch_sel.num_unselected == 0) {
+        BUSTEDAnalyzer preview(tree, aln);
+        preview.select_branch_partitions(settings.test_branches, settings.comparison_branches, settings.phenotype_mode || settings.relax_mode);
+        n_test_br = preview.num_test_branches;
+        n_bg_br = preview.num_background_branches;
+        n_unclass_br = preview.num_unclassified_branches;
+        if ((settings.phenotype_mode || settings.relax_mode) && n_bg_br == 0) {
             throw std::runtime_error(
                 "BUSTED-PH / RELAX requires a proper subset of foreground/test branches and a non-empty background/reference set. "
                 "Specify foreground branches via --branches <spec> or label branches with {TEST}/{Foreground} in the tree."
@@ -176,13 +184,19 @@ int run_busted(int argc, char* argv[]) {
         return 1;
     }
 
+    std::string branch_summary = settings.test_branches + " (" + std::to_string(n_test_br) + " test, " + std::to_string(n_bg_br) + " background";
+    if (n_unclass_br > 0) {
+        branch_summary += ", " + std::to_string(n_unclass_br) + " unclassified";
+    }
+    branch_summary += ")";
+
     Panel::print_card("Dataset & Model Settings", {
         {"Alignment File", cli.alignment_file},
         {"Sequences / Taxa", std::to_string(aln.num_taxa)},
         {"Codon Sites", std::to_string(aln.num_codons) + " (" + std::to_string(aln.num_codons * 3) + " nt)"},
         {"Unique Patterns", std::to_string(aln.patterns.size())},
         {"Tree Source", tree_source + " (" + std::to_string(tree.num_nodes()) + " nodes, " + std::to_string(tree.num_leaves()) + " leaves)"},
-        {"Tested Branches", settings.test_branches + " (" + std::to_string(branch_sel.num_selected) + " test, " + std::to_string(branch_sel.num_unselected) + " background)"},
+        {"Tested Branches", branch_summary},
         {"Analysis Mode", settings.phenotype_mode ? (settings.include_relax_in_ph ? "BUSTED-PH + RELAX (UIT on FG/Diff + AIC-c BG + Coupled-k RELAX)" : "BUSTED-PH (UIT on FG/Diff + AIC-c BG Screen)") : (settings.relax_mode ? "BUSTED + Coupled-k RELAX" : (settings.full_auto ? "Full-Auto (4-Gate Surprisal & Score Screen)" : "Standard BUSTED"))},
         {"Rate Classes (K)", settings.full_auto ? "Auto (2..3)" : (std::to_string(settings.num_rate_classes) + (settings.auto_select_k ? " (Auto-K enabled)" : ""))},
         {"Synonymous Variation", settings.full_auto ? "Auto" : (settings.srv ? "Enabled (" + std::to_string(settings.num_syn_rate_classes) + " classes)" : "Disabled")},
@@ -296,6 +310,16 @@ int run_busted(int argc, char* argv[]) {
     std::cout << "\n" << Console::bold("  Inferred Rate Distributions:") << "\n\n";
     rate_table.print();
     std::cout << "\n";
+
+    if (res.unconstrained.has_unclassified_distribution && !res.unconstrained.unclassified_distribution.omegas.empty()) {
+        std::cout << Console::bold("  Unclassified / Nuisance Branch Rate Distribution (Unconstrained):") << "\n";
+        for (size_t k = 0; k < res.unconstrained.unclassified_distribution.omegas.size(); ++k) {
+            std::cout << "    omega_" << (k + 1) << " = " << std::fixed << std::setprecision(4)
+                      << res.unconstrained.unclassified_distribution.omegas[k]
+                      << " (weight = " << res.unconstrained.unclassified_distribution.weights[k] << ")\n";
+        }
+        std::cout << "\n";
+    }
 
     if (!res.unconstrained.test_distribution.syn_rates.empty() && res.unconstrained.test_distribution.syn_rates.size() > 1) {
         std::cout << Console::bold("  Synonymous Site-to-Site Rates (SRV):") << "\n";

@@ -203,9 +203,9 @@ public:
                     Vector4 d_vec = Vector4::Ones();
                     for (int32_t cid : node.children) {
                         d_vec.array() *= P_D[cid][p].array();
+                        Scalar mx_c = d_vec.maxCoeff();
+                        if (mx_c > 0.0 && mx_c < 1e-100) d_vec /= mx_c;
                     }
-                    Scalar mx = d_vec.maxCoeff();
-                    if (mx > 0.0 && mx < 1e-100) d_vec /= mx;
                     D[nid][p] = d_vec;
                     if (nid != curr_tree.root_id) {
                         P_D[nid][p] = P_branch[nid] * d_vec;
@@ -257,6 +257,8 @@ public:
                         for (size_t j = 0; j < n_ch; ++j) {
                             if (j != i) {
                                 u_c.array() *= P_D[node.children[j]][p].array();
+                                Scalar mx_j = u_c.maxCoeff();
+                                if (mx_j > 0.0 && mx_j < 1e-100) u_c /= mx_j;
                             }
                         }
                         Scalar mx = u_c.maxCoeff();
@@ -269,9 +271,9 @@ public:
                     Vector4 d_vec = Vector4::Ones();
                     for (int32_t cid : node.children) {
                         d_vec.array() *= P_D[cid][p].array();
+                        Scalar mx_c = d_vec.maxCoeff();
+                        if (mx_c > 0.0 && mx_c < 1e-100) d_vec /= mx_c;
                     }
-                    Scalar mx = d_vec.maxCoeff();
-                    if (mx > 0.0 && mx < 1e-100) d_vec /= mx;
                     D[uid][p] = d_vec;
                     if (uid != curr_tree.root_id) {
                         P_D[uid][p] = P_branch[uid] * d_vec;
@@ -330,9 +332,9 @@ public:
                     Vector4 d_vec = Vector4::Ones();
                     for (int32_t cid : node.children) {
                         d_vec.array() *= P_D[cid][p].array();
+                        Scalar mx_c = d_vec.maxCoeff();
+                        if (mx_c > 0.0 && mx_c < 1e-100) d_vec /= mx_c;
                     }
-                    Scalar mx = d_vec.maxCoeff();
-                    if (mx > 0.0 && mx < 1e-100) d_vec /= mx;
                     D[nid][p] = d_vec;
                     if (nid != curr_tree.root_id) {
                         P_D[nid][p] = P_branch[nid] * d_vec;
@@ -407,6 +409,8 @@ public:
                         for (size_t k = 0; k < n_ch; ++k) {
                             if (k != c_slot && k != sib_slot) {
                                 md.array() *= P_D[curr_tree.nodes[pid].children[k]][p].array();
+                                Scalar mx_k = md.maxCoeff();
+                                if (mx_k > 0.0 && mx_k < 1e-100) md /= mx_k;
                             }
                         }
                         Scalar mx = md.maxCoeff();
@@ -582,6 +586,8 @@ public:
                     for (size_t j = 0; j < n_ch; ++j) {
                         if (j != i) {
                             u_c.array() *= P_D[curr_tree.nodes[pid].children[j]][p].array();
+                            Scalar mx_j = u_c.maxCoeff();
+                            if (mx_j > 0.0 && mx_j < 1e-100) u_c /= mx_j;
                         }
                     }
                     Scalar mx = u_c.maxCoeff();
@@ -598,9 +604,9 @@ public:
                 Vector4 d_vec = Vector4::Ones();
                 for (int32_t cid : curr_tree.nodes[pid].children) {
                     d_vec.array() *= P_D[cid][p].array();
+                    Scalar mx_c = d_vec.maxCoeff();
+                    if (mx_c > 0.0 && mx_c < 1e-100) d_vec /= mx_c;
                 }
-                Scalar mx = d_vec.maxCoeff();
-                if (mx > 0.0 && mx < 1e-100) d_vec /= mx;
                 D[pid][p] = d_vec;
                 if (pid != curr_tree.root_id) {
                     P_D[pid][p] = P_branch[pid] * d_vec;

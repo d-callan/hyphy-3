@@ -634,6 +634,10 @@ public:
             K_rates, std::vector<std::vector<Vector4>>(num_nodes, std::vector<Vector4>(num_patterns, Vector4::Ones())));
         std::vector<std::vector<std::vector<Vector4>>> U(
             K_rates, std::vector<std::vector<Vector4>>(num_nodes, std::vector<Vector4>(num_patterns, Vector4::Ones())));
+        std::vector<std::vector<std::vector<double>>> D_log_scale(
+            K_rates, std::vector<std::vector<double>>(num_nodes, std::vector<double>(num_patterns, 0.0)));
+        std::vector<std::vector<std::vector<double>>> U_log_scale(
+            K_rates, std::vector<std::vector<double>>(num_nodes, std::vector<double>(num_patterns, 0.0)));
         std::vector<std::vector<Matrix4>> P_branch(
             K_rates, std::vector<Matrix4>(num_nodes, Matrix4::Identity()));
 
@@ -659,6 +663,7 @@ public:
                         } else {
                             D[k][nid][p].setOnes();
                         }
+                        D_log_scale[k][nid][p] = 0.0;
                         if (nid != curr_tree.root_id) {
                             P_D[k][nid][p] = P_branch[k][nid] * D[k][nid][p];
                         }
@@ -666,12 +671,18 @@ public:
                 } else {
                     for (size_t p = 0; p < num_patterns; ++p) {
                         Vector4 d_vec = Vector4::Ones();
+                        double sc = 0.0;
                         for (int32_t cid : node.children) {
                             d_vec.array() *= P_D[k][cid][p].array();
+                            sc += D_log_scale[k][cid][p];
+                            Scalar mx = d_vec.maxCoeff();
+                            if (mx > 0.0 && mx < 1e-100) {
+                                d_vec /= mx;
+                                sc += std::log(mx);
+                            }
                         }
-                        Scalar mx = d_vec.maxCoeff();
-                        if (mx > 0.0 && mx < 1e-100) d_vec /= mx;
                         D[k][nid][p] = d_vec;
+                        D_log_scale[k][nid][p] = sc;
                         if (nid != curr_tree.root_id) {
                             P_D[k][nid][p] = P_branch[k][nid] * d_vec;
                         }
@@ -680,20 +691,27 @@ public:
             }
             for (size_t p = 0; p < num_patterns; ++p) {
                 U[k][curr_tree.root_id][p] = gtr.pi;
+                U_log_scale[k][curr_tree.root_id][p] = 0.0;
             }
         }
 
         std::vector<std::vector<Vector4>> c_spec(K_rates, std::vector<Vector4>(num_patterns));
+        std::vector<std::vector<double>> c_log_scale(K_rates, std::vector<double>(num_patterns, 0.0));
+        std::vector<double> max_c_scale(num_patterns, 0.0);
 
         std::function<void(int32_t)> dfs = [&](int32_t uid) {
             const auto& node = curr_tree.nodes[uid];
             if (uid != curr_tree.root_id && (node.is_leaf || !node.children.empty())) {
-                for (size_t k = 0; k < K_rates; ++k) {
-                    for (size_t p = 0; p < num_patterns; ++p) {
+                for (size_t p = 0; p < num_patterns; ++p) {
+                    double mx_sc = -1e300;
+                    for (size_t k = 0; k < K_rates; ++k) {
                         Vector4 u_hat = gtr.U_pi.transpose() * U[k][uid][p];
                         Vector4 d_hat = gtr.V_pi * D[k][uid][p];
                         c_spec[k][p] = u_hat.cwiseProduct(d_hat);
+                        c_log_scale[k][p] = U_log_scale[k][uid][p] + D_log_scale[k][uid][p];
+                        if (c_log_scale[k][p] > mx_sc) mx_sc = c_log_scale[k][p];
                     }
+                    max_c_scale[p] = mx_sc;
                 }
                 Scalar init_bl = curr_tree.nodes[uid].branch_length;
                 auto bl_obj = [&](Scalar bl) -> Scalar {
@@ -703,14 +721,15 @@ public:
                     }
                     Scalar lnl = 0.0;
                     for (size_t p = 0; p < num_patterns; ++p) {
+                        double ref_sc = max_c_scale[p];
                         Scalar pat_lk = 0.0;
                         for (size_t k = 0; k < K_rates; ++k) {
                             Scalar cond_lk = c_spec[k][p].dot(exp_lam[k]);
                             if (cond_lk > 0.0) {
-                                pat_lk += effective_weights[k] * cond_lk;
+                                pat_lk += effective_weights[k] * cond_lk * std::exp(c_log_scale[k][p] - ref_sc);
                             }
                         }
-                        lnl += nuc_aln.patterns[p].weight * ((pat_lk > 1e-300) ? std::log(pat_lk) : -690.7755);
+                        lnl += nuc_aln.patterns[p].weight * ((pat_lk > 1e-300) ? (ref_sc + std::log(pat_lk)) : -1e20);
                     }
                     return -lnl;
                 };
@@ -735,17 +754,49 @@ public:
                             Vector4 u_c = (uid == curr_tree.root_id)
                                 ? gtr.pi
                                 : (P_branch[k][uid].transpose() * U[k][uid][p]);
+                            double sc = (uid == curr_tree.root_id) ? 0.0 : U_log_scale[k][uid][p];
                             for (size_t j = 0; j < n_ch; ++j) {
                                 if (j != i) {
-                                    u_c.array() *= P_D[k][node.children[j]][p].array();
+                                    int32_t sib = node.children[j];
+                                    u_c.array() *= P_D[k][sib][p].array();
+                                    sc += D_log_scale[k][sib][p];
+                                    Scalar mx_j = u_c.maxCoeff();
+                                    if (mx_j > 0.0 && mx_j < 1e-100) {
+                                        u_c /= mx_j;
+                                        sc += std::log(mx_j);
+                                    }
                                 }
                             }
                             Scalar mx = u_c.maxCoeff();
-                            if (mx > 0.0 && mx < 1e-100) u_c /= mx;
+                            if (mx > 0.0 && mx < 1e-100) {
+                                u_c /= mx;
+                                sc += std::log(mx);
+                            }
                             U[k][cid][p] = u_c;
+                            U_log_scale[k][cid][p] = sc;
                         }
                     }
                     dfs(cid);
+                }
+                for (size_t k = 0; k < K_rates; ++k) {
+                    for (size_t p = 0; p < num_patterns; ++p) {
+                        Vector4 d_vec = Vector4::Ones();
+                        double sc = 0.0;
+                        for (int32_t cid : node.children) {
+                            d_vec.array() *= P_D[k][cid][p].array();
+                            sc += D_log_scale[k][cid][p];
+                            Scalar mx_c = d_vec.maxCoeff();
+                            if (mx_c > 0.0 && mx_c < 1e-100) {
+                                d_vec /= mx_c;
+                                sc += std::log(mx_c);
+                            }
+                        }
+                        D[k][uid][p] = d_vec;
+                        D_log_scale[k][uid][p] = sc;
+                        if (uid != curr_tree.root_id) {
+                            P_D[k][uid][p] = P_branch[k][uid] * d_vec;
+                        }
+                    }
                 }
             }
         };

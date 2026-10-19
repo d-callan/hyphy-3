@@ -161,10 +161,6 @@ public:
             ? *custom_leaf_to_taxon
             : (local_map = build_leaf_to_taxon_map(tree, aln));
 
-        const double SCALER_THRESH = 1e-150;
-        const double SCALER_UP = 1e150;
-        const double LOG_SCALER = std::log(SCALER_UP);
-
         Scalar total_log_l = 0.0;
 
         #pragma omp parallel
@@ -196,15 +192,7 @@ public:
                     } else {
                         double child_scale_sum = 0.0;
                         tree.eval_internal_node(node_id, P_branches, node_L, node_log_scale, node_L[node_id], child_scale_sum);
-
-                        double max_val = node_L[node_id].maxCoeff();
-                        int boost_count = 0;
-                        while (max_val < SCALER_THRESH && max_val > 0.0) {
-                            node_L[node_id] *= SCALER_UP;
-                            max_val *= SCALER_UP;
-                            boost_count++;
-                        }
-                        node_log_scale[node_id] = child_scale_sum - boost_count * LOG_SCALER;
+                        node_log_scale[node_id] = child_scale_sum;
                     }
                 }
 
@@ -245,10 +233,6 @@ public:
         std::vector<double> B(num_nodes, 1.0);
         std::vector<double> node_log_scale(num_nodes, 0.0);
 
-        const double SCALER_THRESH = 1e-150;
-        const double SCALER_UP = 1e150;
-        const double LOG_SCALER = std::log(SCALER_UP);
-
         // 1. Post-order (bottom-up) pass to compute D and cache P_D
         for (int32_t nid : tree.post_order) {
             const auto& node = tree.nodes[nid];
@@ -272,19 +256,11 @@ public:
                 for (int32_t cid : node.children) {
                     P_D[cid] = P_branches[cid] * res.D[cid];
                 }
-                tree.eval_internal_node(nid, P_branches, res.D, node_log_scale, res.D[nid], child_scale_sum);
-
-                double max_val = res.D[nid].maxCoeff();
-                int boost_count = 0;
                 double boost_mult = 1.0;
-                while (max_val < SCALER_THRESH && max_val > 0.0) {
-                    res.D[nid] *= SCALER_UP;
-                    max_val *= SCALER_UP;
-                    boost_mult *= SCALER_UP;
-                    boost_count++;
-                }
+                const std::vector<std::array<Matrix, 3>>* no_bridges = nullptr;
+                tree.eval_internal_node(nid, P_branches, res.D, node_log_scale, res.D[nid], child_scale_sum, no_bridges, &boost_mult);
                 B[nid] = boost_mult;
-                node_log_scale[nid] = child_scale_sum - boost_count * LOG_SCALER;
+                node_log_scale[nid] = child_scale_sum;
             }
         }
 

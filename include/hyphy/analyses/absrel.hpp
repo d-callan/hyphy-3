@@ -465,7 +465,8 @@ public:
         bool constrain_null = false,
         Scalar override_alpha = -1.0,
         const std::vector<Scalar>* override_omegas = nullptr,
-        const std::vector<Scalar>* override_weights = nullptr
+        const std::vector<Scalar>* override_weights = nullptr,
+        Scalar log_scale_offset = 0.0
     ) const {
         size_t num_patterns = aln.patterns.size();
         Scalar cur_alpha = (override_alpha > 0.0) ? override_alpha : std::max(1e-5, branch_alpha[bid]);
@@ -479,7 +480,7 @@ public:
                 MG94Matrix mat = build_q_matrix(w);
                 Matrix P_b = mat.transition_matrix(a);
 
-                Scalar ll = 0.0;
+                Scalar ll = log_scale_offset;
                 for (size_t p = 0; p < num_patterns; ++p) {
                     Scalar Lp = V_patterns[p].dot(P_b * D_patterns[p]);
                     if (Lp > 0.0) {
@@ -542,7 +543,7 @@ public:
                     MG94Matrix mat2 = build_q_matrix(w2);
                     Matrix P_mix = p1 * mat1.transition_matrix(a) + p2 * mat2.transition_matrix(a);
 
-                    Scalar ll = 0.0;
+                    Scalar ll = log_scale_offset;
                     for (size_t p = 0; p < num_patterns; ++p) {
                         Scalar Lp = V_patterns[p].dot(P_mix * D_patterns[p]);
                         if (Lp > 0.0) {
@@ -610,7 +611,7 @@ public:
                     MG94Matrix mat2 = build_q_matrix(w2);
                     Matrix P_mix = p1 * mat1.transition_matrix(a) + p2 * mat2.transition_matrix(a);
 
-                    Scalar ll = 0.0;
+                    Scalar ll = log_scale_offset;
                     for (size_t p = 0; p < num_patterns; ++p) {
                         Scalar Lp = V_patterns[p].dot(P_mix * D_patterns[p]);
                         if (Lp > 0.0) {
@@ -761,7 +762,8 @@ public:
             // Compute local (V, D) context for branch bid
             std::vector<Vector> V_patterns(num_patterns);
             std::vector<Vector> D_patterns(num_patterns);
-            #pragma omp parallel for schedule(dynamic)
+            Scalar log_scale_offset = 0.0;
+            #pragma omp parallel for reduction(+:log_scale_offset) schedule(dynamic)
             for (size_t p = 0; p < num_patterns; ++p) {
                 const auto& pattern = aln.patterns[p];
                 auto io = LikelihoodEngine::compute_inside_outside(
@@ -769,6 +771,9 @@ public:
                 );
                 V_patterns[p] = io.V[bid];
                 D_patterns[p] = io.D[bid];
+                if (io.likelihood > 0.0) {
+                    log_scale_offset += pattern.weight * (io.log_likelihood - std::log(io.likelihood));
+                }
             }
 
             int current_classes = 1;
@@ -781,7 +786,7 @@ public:
                 if (pbar_p3) {
                     pbar_p3->set_status(bname + ": evaluating M=" + std::to_string(M) + " rate classes...");
                 }
-                LocalBranchFit cand_fit = optimize_branch_mixture(bid, M, V_patterns, D_patterns, false);
+                LocalBranchFit cand_fit = optimize_branch_mixture(bid, M, V_patterns, D_patterns, false, -1.0, nullptr, nullptr, log_scale_offset);
                 size_t cand_params = current_params + 2;
                 Scalar cand_aicc = compute_aicc(cand_fit.log_l, cand_params);
 
@@ -895,7 +900,7 @@ public:
                             );
                             Scalar L = io.likelihood;
                             if (L > 0.0) {
-                                local_ll += pattern.weight * std::log(L);
+                                local_ll += pattern.weight * io.log_likelihood;
                                 Scalar inv_L = pattern.weight / L;
                                 for (int32_t bid : nodes) {
                                     Scalar term = io.V[bid].dot(dP_branches[bid] * io.D[bid]);
@@ -981,7 +986,8 @@ public:
                 int M = branch_omegas[bid].size();
                 std::vector<Vector> V_patterns(num_patterns);
                 std::vector<Vector> D_patterns(num_patterns);
-                #pragma omp parallel for schedule(dynamic)
+                Scalar log_scale_offset = 0.0;
+                #pragma omp parallel for reduction(+:log_scale_offset) schedule(dynamic)
                 for (size_t p = 0; p < num_patterns; ++p) {
                     const auto& pattern = aln.patterns[p];
                     auto io = LikelihoodEngine::compute_inside_outside(
@@ -989,9 +995,12 @@ public:
                     );
                     V_patterns[p] = io.V[bid];
                     D_patterns[p] = io.D[bid];
+                    if (io.likelihood > 0.0) {
+                        log_scale_offset += pattern.weight * (io.log_likelihood - std::log(io.likelihood));
+                    }
                 }
 
-                auto refined_fit = optimize_branch_mixture(bid, M, V_patterns, D_patterns, false);
+                auto refined_fit = optimize_branch_mixture(bid, M, V_patterns, D_patterns, false, -1.0, nullptr, nullptr, log_scale_offset);
                 branch_alpha[bid] = refined_fit.alpha;
                 branch_omegas[bid] = refined_fit.omegas;
                 branch_weights[bid] = refined_fit.weights;
@@ -1172,7 +1181,8 @@ public:
 
                     std::vector<Vector> V_null(num_patterns);
                     std::vector<Vector> D_null(num_patterns);
-                    #pragma omp parallel for schedule(dynamic)
+                    Scalar null_scale_offset = 0.0;
+                    #pragma omp parallel for reduction(+:null_scale_offset) schedule(dynamic)
                     for (size_t p = 0; p < num_patterns; ++p) {
                         const auto& pattern = aln.patterns[p];
                         auto io = LikelihoodEngine::compute_inside_outside(
@@ -1180,11 +1190,14 @@ public:
                         );
                         V_null[p] = io.V[bid];
                         D_null[p] = io.D[bid];
+                        if (io.likelihood > 0.0) {
+                            null_scale_offset += pattern.weight * (io.log_likelihood - std::log(io.likelihood));
+                        }
                     }
 
                     LocalBranchFit fit = optimize_branch_mixture(
                         bid, bres.rate_classes, V_null, D_null, true,
-                        null_alpha[bid], &null_omegas[bid], &null_weights[bid]
+                        null_alpha[bid], &null_omegas[bid], &null_weights[bid], null_scale_offset
                     );
                     null_alpha[bid] = fit.alpha;
                     null_omegas[bid] = fit.omegas;

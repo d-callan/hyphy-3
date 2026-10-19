@@ -117,8 +117,18 @@ inline ViterbiReconstructionResult reconstruct_viterbi_states(
             }
 
             int32_t parent_id = node.parent_id;
+            Scalar p_max = 0.0;
             for (int p_st = 0; p_st < num_states; ++p_st) {
                 M_node[parent_id][p_st] *= val_node[nid][p_st];
+                if (M_node[parent_id][p_st] > p_max) {
+                    p_max = M_node[parent_id][p_st];
+                }
+            }
+            if (p_max > 0.0 && p_max < 1e-100) {
+                Scalar p_scale = 1.0 / p_max;
+                for (int p_st = 0; p_st < num_states; ++p_st) {
+                    M_node[parent_id][p_st] *= p_scale;
+                }
             }
         }
     }

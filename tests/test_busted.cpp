@@ -490,6 +490,45 @@ TEST_CASE("BUSTED-PH: Phenotype-Associated Selection (4-Model Workflow)") {
     CHECK(j_mod["statistical_tests"].contains("relaxation"));
     CHECK(j_mod["statistical_tests"].contains("union_intersection"));
     CHECK(j_mod["statistical_tests"].contains("phenotype_association"));
+
+    // Verify 3-way branch partitioning (Test, Background, Unclassified) via both --comparison and auto-detected {FG}/{BG} tags (Issue #2036)
+    {
+        // 1. Explicit --branches and --comparison leaving remaining branches in Unclassified
+        BUSTEDSettings three_way_settings;
+        three_way_settings.phenotype_mode = true;
+        three_way_settings.test_branches = "Human,Chimp,Baboon,RhMonkey";
+        three_way_settings.comparison_branches = "Mouse,Rat,Horse,Cat";
+        three_way_settings.num_rate_classes = 3;
+
+        auto res_3way = analyzer.run(three_way_settings);
+        CHECK(analyzer.num_test_branches == 4);
+        CHECK(analyzer.num_background_branches == 4);
+        CHECK(analyzer.num_unclassified_branches > 0);
+        CHECK(res_3way.unconstrained.has_unclassified_distribution == true);
+        CHECK(res_3way.unconstrained.unclassified_distribution.omegas.size() == 3);
+        CHECK(res_3way.constrained.has_unclassified_distribution == true);
+        CHECK(res_3way.constrained_background.has_unclassified_distribution == true);
+        CHECK(res_3way.shared_distributions.has_unclassified_distribution == true);
+
+        auto j_leg_3 = analyzer.to_legacy_json(res_3way);
+        CHECK(j_leg_3["fits"]["Unconstrained model"]["Rate Distributions"].contains("Unclassified"));
+        CHECK(j_leg_3["tested"]["0"]["Cow"] == "unclassified");
+
+        auto j_mod_3 = analyzer.to_modern_json(res_3way);
+        CHECK(j_mod_3["model_fits"]["unconstrained"]["rate_distributions"].contains("unclassified"));
+
+        // 2. Auto-detect {FG} and {BG} Newick tags when --branches and --comparison are omitted
+        std::string tagged_nwk =
+            "((((Human{FG}:0.03,Chimp{FG}:0.02)Node3{FG}:0.03,Baboon{FG}:0.05)Node2:0.08,RhMonkey:0.06)Node1:0.12,"
+            "((Mouse{BG}:0.10,Rat{BG}:0.11)Node8{BG}:0.15,(Horse{BG}:0.09,Cat{BG}:0.08)Node11:0.06)Node7:0.05,"
+            "(Cow:0.12,Pig:0.11)Node14:0.07);";
+        auto tagged_tree = Tree::from_newick(tagged_nwk);
+        BUSTEDAnalyzer tagged_analyzer(tagged_tree, aln);
+        tagged_analyzer.select_branch_partitions("All", "", true);
+        CHECK(tagged_analyzer.num_test_branches == 4);
+        CHECK(tagged_analyzer.num_background_branches == 5);
+        CHECK(tagged_analyzer.num_unclassified_branches > 0);
+    }
 }
 
 TEST_CASE("BUSTED: High-Taxon (128 Taxa) Scaling and SRV Underflow Safety") {

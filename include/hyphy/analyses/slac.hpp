@@ -691,8 +691,16 @@ public:
                 }
 
                 int32_t parent_id = node.parent_id;
+                Scalar p_max = 0.0;
                 for (int p_state = 0; p_state < S; ++p_state) {
                     M[parent_id][p_state] *= val[p_state];
+                    if (M[parent_id][p_state] > p_max) p_max = M[parent_id][p_state];
+                }
+                if (p_max > 0.0 && p_max < 1e-100) {
+                    Scalar p_scale = 1.0 / p_max;
+                    for (int p_state = 0; p_state < S; ++p_state) {
+                        M[parent_id][p_state] *= p_scale;
+                    }
                 }
             }
         }
@@ -1231,8 +1239,16 @@ public:
                         }
 
                         int32_t parent_id = node.parent_id;
+                        Scalar p_max = 0.0;
                         for (int p_state = 0; p_state < S; ++p_state) {
                             pattern_L[p][parent_id][p_state] *= val[p_state];
+                            if (pattern_L[p][parent_id][p_state] > p_max) p_max = pattern_L[p][parent_id][p_state];
+                        }
+                        if (p_max > 0.0 && p_max < 1e-100) {
+                            Scalar p_scale = 1.0 / p_max;
+                            for (int p_state = 0; p_state < S; ++p_state) {
+                                pattern_L[p][parent_id][p_state] *= p_scale;
+                            }
                         }
                     }
                 }

@@ -102,6 +102,31 @@ public:
         num_background_branches = 0;
         num_unclassified_branches = 0;
 
+        auto to_lower = [](std::string s) {
+            std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            return s;
+        };
+        auto trim_braces = [](std::string s) {
+            while (!s.empty() && (std::isspace(static_cast<unsigned char>(s.front())) || s.front() == '{')) s.erase(s.begin());
+            while (!s.empty() && (std::isspace(static_cast<unsigned char>(s.back())) || s.back() == '}')) s.pop_back();
+            return s;
+        };
+        auto is_bg_synonym = [](const std::string& tl) {
+            return tl == "r" || tl == "ref" || tl == "reference" || tl == "bg" || tl == "background";
+        };
+
+        bool has_tagged_bg = false;
+        if (comp_spec.empty() && auto_detect_tags) {
+            for (const auto& node : tree.nodes) {
+                if (node.id != tree.root_id && !is_test_branch[node.id] && !node.model_tag.empty()) {
+                    if (is_bg_synonym(to_lower(trim_braces(node.model_tag)))) {
+                        has_tagged_bg = true;
+                        break;
+                    }
+                }
+            }
+        }
+
         if (!comp_spec.empty()) {
             auto sel_comp = tree.select_branches(comp_spec, "", {}, false);
             for (const auto& node : tree.nodes) {
@@ -119,6 +144,20 @@ public:
             }
             if (num_background_branches == 0) {
                 throw std::runtime_error("No non-test branches matched '--comparison " + comp_spec + "'.");
+            }
+        } else if (has_tagged_bg) {
+            for (const auto& node : tree.nodes) {
+                if (node.id == tree.root_id) continue;
+                int nid = node.id;
+                if (is_test_branch[nid]) {
+                    branch_partition[nid] = 0;
+                } else if (is_bg_synonym(to_lower(trim_braces(node.model_tag)))) {
+                    branch_partition[nid] = 1;
+                    num_background_branches++;
+                } else {
+                    branch_partition[nid] = 2;
+                    num_unclassified_branches++;
+                }
             }
         } else {
             for (const auto& node : tree.nodes) {
@@ -2073,7 +2112,7 @@ public:
         return {optimal_k, null_fits};
     }
 
-    // Two-set likelihood evaluation for BUSTED with separate Test (partition 0) and Background/Comparison (partition 1) K-class distributions
+    // Two-set likelihood evaluation for BUSTED with separate Test (partition 0), Background/Comparison (partition 1), and optional Unclassified/Nuisance (partition 2) K-class distributions
     Scalar evaluate_two_set_log_l(
         Scalar s,
         const std::vector<Scalar>& omegas_test,
@@ -2087,7 +2126,9 @@ public:
         Scalar delta = 0.0,
         Scalar psi = 0.0,
         Scalar eps_sink_test = 0.0,
-        Scalar eps_sink_bg = 0.0
+        Scalar eps_sink_bg = 0.0,
+        const std::vector<Scalar>* omegas_unclass = nullptr,
+        const std::vector<Scalar>* weights_unclass = nullptr
     ) const {
         size_t num_nodes = tree.num_nodes();
         size_t num_patterns = aln.patterns.size();
@@ -2118,8 +2159,20 @@ public:
             mg_b[k].update(p, aln.pos_nuc_frequencies, aln.codon_frequencies_f3x4, *code);
         }
 
+        bool has_unclass_dist = (num_unclassified_branches > 0 && omegas_unclass != nullptr && weights_unclass != nullptr && !omegas_unclass->empty() && omegas_unclass->size() == weights_unclass->size());
+        size_t K_u = has_unclass_dist ? omegas_unclass->size() : 0;
+        std::vector<MG94Matrix> mg_u(K_u);
         MG94Matrix mg_unclass;
-        if (num_unclassified_branches > 0) {
+        if (has_unclass_dist) {
+            for (size_t k = 0; k < K_u; ++k) {
+                MG94Parameters p_u = base_params;
+                p_u.alpha = 1.0;
+                p_u.beta = (*omegas_unclass)[k];
+                p_u.delta = delta;
+                p_u.psi = psi;
+                mg_u[k].update(p_u, aln.pos_nuc_frequencies, aln.codon_frequencies_f3x4, *code);
+            }
+        } else if (num_unclassified_branches > 0) {
             MG94Parameters p_u = base_params;
             p_u.alpha = 1.0;
             p_u.beta = mg94_omega;
@@ -2153,6 +2206,11 @@ public:
                         }
                         if (eps_sink_bg > 0.0) {
                             P_mix[m][nid].noalias() += eps_sink_bg * P_sink;
+                        }
+                    } else if (has_unclass_dist) {
+                        P_mix[m][nid] = Matrix::Zero(S, S);
+                        for (size_t k = 0; k < K_u; ++k) {
+                            P_mix[m][nid] += (*weights_unclass)[k] * mg_u[k].transition_matrix(alpha_m * bl);
                         }
                     } else {
                         P_mix[m][nid] = mg_unclass.transition_matrix(alpha_m * bl);
@@ -2257,7 +2315,7 @@ public:
         return total_log_l;
     }
 
-    // Two-set Expectation Step: simultaneously updates Test (partition 0) and Background (partition 1) mixture weights in one Inside-Outside pass
+    // Two-set Expectation Step: simultaneously updates Test (partition 0), Background (partition 1), and optional Unclassified (partition 2) mixture weights in one Inside-Outside pass
     std::pair<std::vector<Scalar>, std::vector<Scalar>> compute_expected_two_set_weights(
         Scalar s,
         const std::vector<Scalar>& omegas_test,
@@ -2273,10 +2331,15 @@ public:
         Scalar eps_sink_bg = 0.0,
         Scalar* out_new_eps_test = nullptr,
         Scalar* out_new_eps_bg = nullptr,
-        Scalar max_eps_sink = 0.01
+        Scalar max_eps_sink = 0.01,
+        const std::vector<Scalar>* omegas_unclass = nullptr,
+        const std::vector<Scalar>* weights_unclass = nullptr,
+        std::vector<Scalar>* out_new_weights_unclass = nullptr
     ) const {
         size_t K_t = omegas_test.size();
         size_t K_b = omegas_bg.size();
+        bool has_unclass_dist = (num_unclassified_branches > 0 && omegas_unclass != nullptr && weights_unclass != nullptr && !omegas_unclass->empty() && omegas_unclass->size() == weights_unclass->size());
+        size_t K_u = has_unclass_dist ? omegas_unclass->size() : 0;
         size_t M = syn_rates.size();
         size_t num_nodes = tree.num_nodes();
         size_t num_patterns = aln.patterns.size();
@@ -2286,6 +2349,7 @@ public:
 
         std::vector<std::vector<std::vector<Matrix>>> P_comp_t(M, std::vector<std::vector<Matrix>>(K_t, std::vector<Matrix>(num_nodes)));
         std::vector<std::vector<std::vector<Matrix>>> P_comp_b(M, std::vector<std::vector<Matrix>>(K_b, std::vector<Matrix>(num_nodes)));
+        std::vector<std::vector<std::vector<Matrix>>> P_comp_u(has_unclass_dist ? M : 0, std::vector<std::vector<Matrix>>(K_u, std::vector<Matrix>(has_unclass_dist ? num_nodes : 0)));
         std::vector<std::vector<Matrix>> P_mix(M, std::vector<Matrix>(num_nodes));
 
         for (size_t k = 0; k < K_t; ++k) {
@@ -2327,7 +2391,26 @@ public:
         }
 
         MG94Matrix mg_unclass;
-        if (num_unclassified_branches > 0) {
+        if (has_unclass_dist) {
+            for (size_t k = 0; k < K_u; ++k) {
+                MG94Parameters p_u = base_params;
+                p_u.alpha = 1.0;
+                p_u.beta = (*omegas_unclass)[k];
+                p_u.delta = delta;
+                p_u.psi = psi;
+                MG94Matrix mg;
+                mg.update(p_u, aln.pos_nuc_frequencies, aln.codon_frequencies_f3x4, *code);
+                for (size_t m = 0; m < M; ++m) {
+                    Scalar alpha_m = syn_rates[m];
+                    for (const auto& node : tree.nodes) {
+                        if (node.id != tree.root_id && branch_partition[node.id] == 2) {
+                            Scalar bl = custom_branch_lengths ? (*custom_branch_lengths)[node.id] : (s * branch_tau[node.id]);
+                            P_comp_u[m][k][node.id] = mg.transition_matrix(alpha_m * bl);
+                        }
+                    }
+                }
+            }
+        } else if (num_unclassified_branches > 0) {
             MG94Parameters p_u = base_params;
             p_u.alpha = 1.0;
             p_u.beta = mg94_omega;
@@ -2358,6 +2441,11 @@ public:
                         if (out_new_eps_bg != nullptr) {
                             P_mix[m][nid].noalias() += eps_sink_bg * P_sink;
                         }
+                    } else if (has_unclass_dist) {
+                        P_mix[m][nid] = Matrix::Zero(S, S);
+                        for (size_t k = 0; k < K_u; ++k) {
+                            P_mix[m][nid] += (*weights_unclass)[k] * P_comp_u[m][k][nid];
+                        }
                     } else {
                         Scalar bl = custom_branch_lengths ? (*custom_branch_lengths)[nid] : (s * branch_tau[nid]);
                         P_mix[m][nid] = mg_unclass.transition_matrix(alpha_m * bl);
@@ -2368,15 +2456,17 @@ public:
 
         Vector accum_t = Vector::Zero(K_t);
         Vector accum_b = Vector::Zero(K_b);
+        Vector accum_u = Vector::Zero(std::max<size_t>(1, K_u));
         Scalar sink_accum_t = 0.0, sink_accum_b = 0.0;
-        Scalar total_wt_t = 0.0, total_wt_b = 0.0;
+        Scalar total_wt_t = 0.0, total_wt_b = 0.0, total_wt_u = 0.0;
 
         #pragma omp parallel
         {
             Vector local_t = Vector::Zero(K_t);
             Vector local_b = Vector::Zero(K_b);
+            Vector local_u = Vector::Zero(std::max<size_t>(1, K_u));
             Scalar local_sink_t = 0.0, local_sink_b = 0.0;
-            Scalar local_wt_t = 0.0, local_wt_b = 0.0;
+            Scalar local_wt_t = 0.0, local_wt_b = 0.0, local_wt_u = 0.0;
 
             #pragma omp for schedule(dynamic)
             for (size_t p = 0; p < num_patterns; ++p) {
@@ -2451,6 +2541,17 @@ public:
                                         local_sink_b += pattern.weight * eps_sink_bg * sink_ratio;
                                     }
                                     local_wt_b += pattern.weight;
+                                } else if (has_unclass_dist && out_new_weights_unclass != nullptr) {
+                                    for (size_t k = 0; k < K_u; ++k) {
+                                        Scalar ratio_k = 0.0;
+                                        for (size_t m = 0; m < M; ++m) {
+                                            if (post_m[m] > 1e-12 && io_m[m].likelihood > 0.0) {
+                                                ratio_k += post_m[m] * (io_m[m].V[nid].dot(P_comp_u[m][k][nid] * io_m[m].D[nid]) / io_m[m].likelihood);
+                                            }
+                                        }
+                                        local_u(k) += pattern.weight * (*weights_unclass)[k] * ratio_k;
+                                    }
+                                    local_wt_u += pattern.weight;
                                 }
                             }
                         }
@@ -2461,10 +2562,12 @@ public:
             {
                 accum_t += local_t;
                 accum_b += local_b;
+                accum_u += local_u;
                 sink_accum_t += local_sink_t;
                 sink_accum_b += local_sink_b;
                 total_wt_t += local_wt_t;
                 total_wt_b += local_wt_b;
+                total_wt_u += local_wt_u;
             }
         }
 
@@ -2494,6 +2597,18 @@ public:
             }
         }
 
+        if (has_unclass_dist && out_new_weights_unclass != nullptr) {
+            *out_new_weights_unclass = *weights_unclass;
+            if (total_wt_u > 0.0) {
+                Scalar sum_w = 0.0;
+                for (size_t k = 0; k < K_u; ++k) {
+                    (*out_new_weights_unclass)[k] = std::clamp(accum_u(k) / total_wt_u, 1e-6, 1.0 - 1e-6);
+                    sum_w += (*out_new_weights_unclass)[k];
+                }
+                for (size_t k = 0; k < K_u; ++k) (*out_new_weights_unclass)[k] /= sum_w;
+            }
+        }
+
         return {new_wt_t, new_wt_b};
     }
 
@@ -2510,7 +2625,9 @@ public:
         Scalar delta = 0.0,
         Scalar psi = 0.0,
         Scalar eps_sink_test = 0.0,
-        Scalar eps_sink_bg = 0.0
+        Scalar eps_sink_bg = 0.0,
+        const std::vector<Scalar>* omegas_unclass = nullptr,
+        const std::vector<Scalar>* weights_unclass = nullptr
     ) const {
         size_t M = syn_rates.size();
         if (M <= 1) return {1.0};
@@ -2520,10 +2637,12 @@ public:
         int S = code->num_sense_codons;
         size_t K_t = omegas_test.size();
         size_t K_b = omegas_bg.size();
+        bool has_unclass_dist = (num_unclassified_branches > 0 && omegas_unclass != nullptr && weights_unclass != nullptr && !omegas_unclass->empty() && omegas_unclass->size() == weights_unclass->size());
+        size_t K_u = has_unclass_dist ? omegas_unclass->size() : 0;
         Scalar bio_scale_t = 1.0 - eps_sink_test;
         Scalar bio_scale_b = 1.0 - eps_sink_bg;
 
-        std::vector<MG94Matrix> mg_t(K_t), mg_b(K_b);
+        std::vector<MG94Matrix> mg_t(K_t), mg_b(K_b), mg_u(K_u);
         for (size_t k = 0; k < K_t; ++k) {
             MG94Parameters p = base_params;
             p.alpha = 1.0; p.beta = omegas_test[k]; p.delta = delta; p.psi = psi;
@@ -2535,7 +2654,13 @@ public:
             mg_b[k].update(p, aln.pos_nuc_frequencies, aln.codon_frequencies_f3x4, *code);
         }
         MG94Matrix mg_unclass;
-        if (num_unclassified_branches > 0) {
+        if (has_unclass_dist) {
+            for (size_t k = 0; k < K_u; ++k) {
+                MG94Parameters p_u = base_params;
+                p_u.alpha = 1.0; p_u.beta = (*omegas_unclass)[k]; p_u.delta = delta; p_u.psi = psi;
+                mg_u[k].update(p_u, aln.pos_nuc_frequencies, aln.codon_frequencies_f3x4, *code);
+            }
+        } else if (num_unclassified_branches > 0) {
             MG94Parameters p_u = base_params;
             p_u.alpha = 1.0; p_u.beta = mg94_omega; p_u.delta = delta; p_u.psi = psi;
             mg_unclass.update(p_u, aln.pos_nuc_frequencies, aln.codon_frequencies_f3x4, *code);
@@ -2563,6 +2688,11 @@ public:
                             P_mix[m][nid] += (use_bio * weights_bg[k]) * mg_b[k].transition_matrix(alpha_m * bl);
                         }
                         if (eps_sink_bg > 0.0) P_mix[m][nid].noalias() += eps_sink_bg * P_sink;
+                    } else if (has_unclass_dist) {
+                        P_mix[m][nid] = Matrix::Zero(S, S);
+                        for (size_t k = 0; k < K_u; ++k) {
+                            P_mix[m][nid] += (*weights_unclass)[k] * mg_u[k].transition_matrix(alpha_m * bl);
+                        }
                     } else {
                         P_mix[m][nid] = mg_unclass.transition_matrix(alpha_m * bl);
                     }
@@ -2671,18 +2801,22 @@ public:
         Scalar delta = 0.0,
         Scalar psi = 0.0,
         Scalar eps_sink_test = 0.0,
-        Scalar eps_sink_bg = 0.0
+        Scalar eps_sink_bg = 0.0,
+        const std::vector<Scalar>* omegas_unclass = nullptr,
+        const std::vector<Scalar>* weights_unclass = nullptr
     ) const {
         size_t num_nodes = tree.num_nodes();
         size_t num_patterns = aln.patterns.size();
         int S = code->num_sense_codons;
         size_t K_t = omegas_test.size();
         size_t K_b = omegas_bg.size();
+        bool has_unclass_dist = (num_unclassified_branches > 0 && omegas_unclass != nullptr && weights_unclass != nullptr && !omegas_unclass->empty() && omegas_unclass->size() == weights_unclass->size());
+        size_t K_u = has_unclass_dist ? omegas_unclass->size() : 0;
         size_t M = syn_rates.size();
         Scalar bio_scale_t = 1.0 - eps_sink_test;
         Scalar bio_scale_b = 1.0 - eps_sink_bg;
 
-        std::vector<MG94Matrix> mg_t(K_t), mg_b(K_b);
+        std::vector<MG94Matrix> mg_t(K_t), mg_b(K_b), mg_u(K_u);
         for (size_t k = 0; k < K_t; ++k) {
             MG94Parameters p = base_params;
             p.alpha = 1.0; p.beta = omegas_test[k]; p.delta = delta; p.psi = psi;
@@ -2694,7 +2828,13 @@ public:
             mg_b[k].update(p, aln.pos_nuc_frequencies, aln.codon_frequencies_f3x4, *code);
         }
         MG94Matrix mg_unclass;
-        if (num_unclassified_branches > 0) {
+        if (has_unclass_dist) {
+            for (size_t k = 0; k < K_u; ++k) {
+                MG94Parameters p_u = base_params;
+                p_u.alpha = 1.0; p_u.beta = (*omegas_unclass)[k]; p_u.delta = delta; p_u.psi = psi;
+                mg_u[k].update(p_u, aln.pos_nuc_frequencies, aln.codon_frequencies_f3x4, *code);
+            }
+        } else if (num_unclassified_branches > 0) {
             MG94Parameters p_u = base_params;
             p_u.alpha = 1.0; p_u.beta = mg94_omega; p_u.delta = delta; p_u.psi = psi;
             mg_unclass.update(p_u, aln.pos_nuc_frequencies, aln.codon_frequencies_f3x4, *code);
@@ -2729,6 +2869,14 @@ public:
                             dP_mix[m][nid] += (use_bio * weights_bg[k]) * alpha_m * (mg_b[k].Q * P_k);
                         }
                         if (eps_sink_bg > 0.0) P_mix[m][nid].noalias() += eps_sink_bg * P_sink;
+                    } else if (has_unclass_dist) {
+                        P_mix[m][nid] = Matrix::Zero(S, S);
+                        dP_mix[m][nid] = Matrix::Zero(S, S);
+                        for (size_t k = 0; k < K_u; ++k) {
+                            Matrix P_k = mg_u[k].transition_matrix(alpha_m * bl);
+                            P_mix[m][nid] += (*weights_unclass)[k] * P_k;
+                            dP_mix[m][nid] += (*weights_unclass)[k] * alpha_m * (mg_u[k].Q * P_k);
+                        }
                     } else {
                         Matrix P_u = mg_unclass.transition_matrix(alpha_m * bl);
                         P_mix[m][nid] = P_u;
@@ -2835,7 +2983,9 @@ public:
         Scalar psi = 0.0,
         int max_iters = 10,
         Scalar eps_sink_test = 0.0,
-        Scalar eps_sink_bg = 0.0
+        Scalar eps_sink_bg = 0.0,
+        const std::vector<Scalar>* omegas_unclass = nullptr,
+        const std::vector<Scalar>* weights_unclass = nullptr
     ) const {
         size_t num_nodes = tree.num_nodes();
         std::vector<Scalar> bl = init_bl;
@@ -2859,7 +3009,7 @@ public:
                 }
             }
             auto [ll, grad_t] = compute_two_set_branch_gradients(
-                cur_bl, omegas_test, weights_test, omegas_bg, weights_bg, syn_rates, syn_weights, delta, psi, eps_sink_test, eps_sink_bg
+                cur_bl, omegas_test, weights_test, omegas_bg, weights_bg, syn_rates, syn_weights, delta, psi, eps_sink_test, eps_sink_bg, omegas_unclass, weights_unclass
             );
             std::vector<Scalar> grad_y(num_nodes, 0.0);
             for (size_t i = 0; i < num_nodes; ++i) {
@@ -2987,7 +3137,8 @@ public:
         return best_bl;
     }
 
-    // Fits two-set BUSTED / BUSTED-PH model with independent K-class omega distributions on Test and Background branches
+    // Fits two-set (or three-set when num_unclassified_branches > 0) BUSTED / BUSTED-PH model
+    // with independent K-class omega distributions on Test, Background, and (if present) Unclassified branches.
     BUSTEDFit fit_two_set_model(
         bool constrain_test,
         bool constrain_bg,
@@ -3001,11 +3152,14 @@ public:
         bool use_error_sink = false,
         Scalar max_eps_sink = 0.01,
         const BUSTEDRateDistribution* init_test_dist = nullptr,
-        const BUSTEDRateDistribution* init_bg_dist = nullptr
+        const BUSTEDRateDistribution* init_bg_dist = nullptr,
+        const BUSTEDRateDistribution* init_unclass_dist = nullptr
     ) const {
         BUSTEDFit fit;
         fit.num_rate_classes = K;
         fit.has_background_distribution = true;
+        bool has_u = (num_unclassified_branches > 0);
+        fit.has_unclassified_distribution = has_u;
         Scalar s = 1.0;
 
         bool allow_double = (multiple_hits == "Double" || multiple_hits == "Double+Triple");
@@ -3046,9 +3200,14 @@ public:
             }
         };
 
-        std::vector<Scalar> omegas_t, weights_t, omegas_b, weights_b;
+        std::vector<Scalar> omegas_t, weights_t, omegas_b, weights_b, omegas_u, weights_u;
         init_dist(constrain_test, init_test_dist, omegas_t, weights_t);
         init_dist(constrain_bg, init_bg_dist, omegas_b, weights_b);
+        if (has_u) {
+            init_dist(false, init_unclass_dist, omegas_u, weights_u);
+        }
+        const std::vector<Scalar>* p_omegas_u = has_u ? &omegas_u : nullptr;
+        const std::vector<Scalar>* p_weights_u = has_u ? &weights_u : nullptr;
 
         size_t M = srv ? num_syn_rates : 1;
         std::vector<Scalar> syn_rates(M, 1.0);
@@ -3067,7 +3226,7 @@ public:
             std::vector<Scalar> p_cands = allow_triple ? std::vector<Scalar>{0.0, 0.02, 0.05} : std::vector<Scalar>{0.0};
             for (Scalar d_c : d_cands) {
                 for (Scalar p_c : p_cands) {
-                    Scalar cand_ll = evaluate_two_set_log_l(s, omegas_t, weights_t, omegas_b, weights_b, syn_rates, syn_weights, nullptr, nullptr, d_c, p_c, eps_sink_t, eps_sink_b);
+                    Scalar cand_ll = evaluate_two_set_log_l(s, omegas_t, weights_t, omegas_b, weights_b, syn_rates, syn_weights, nullptr, nullptr, d_c, p_c, eps_sink_t, eps_sink_b, p_omegas_u, p_weights_u);
                     if (cand_ll > best_grid_ll) {
                         best_grid_ll = cand_ll;
                         delta = d_c;
@@ -3080,21 +3239,26 @@ public:
         int max_ecm = (K == 1 && !srv && !allow_double && !use_error_sink) ? 1 : 6;
         for (int ecm_iter = 0; ecm_iter < max_ecm; ++ecm_iter) {
             for (int em = 0; em < 2; ++em) {
+                std::vector<Scalar> wt_u;
                 auto [wt_t, wt_b] = compute_expected_two_set_weights(
                     s, omegas_t, weights_t, omegas_b, weights_b, syn_rates, syn_weights, nullptr, delta, psi,
                     eps_sink_t, eps_sink_b,
                     use_error_sink ? &eps_sink_t : nullptr,
                     use_error_sink ? &eps_sink_b : nullptr,
-                    max_eps_sink
+                    max_eps_sink,
+                    p_omegas_u, p_weights_u, has_u ? &wt_u : nullptr
                 );
                 weights_t = wt_t;
                 weights_b = wt_b;
+                if (has_u && wt_u.size() == K) {
+                    weights_u = wt_u;
+                }
             }
 
             if (srv && M >= 2) {
                 for (int em = 0; em < 2; ++em) {
                     syn_weights = compute_expected_two_set_syn_weights(
-                        s, omegas_t, weights_t, omegas_b, weights_b, syn_rates, syn_weights, nullptr, delta, psi, eps_sink_t, eps_sink_b
+                        s, omegas_t, weights_t, omegas_b, weights_b, syn_rates, syn_weights, nullptr, delta, psi, eps_sink_t, eps_sink_b, p_omegas_u, p_weights_u
                     );
                 }
             }
@@ -3105,36 +3269,36 @@ public:
             if (constrain_test) {
                 if (K == 1) {
                     auto opt = NelderMead2D::minimize([&](Scalar w1, Scalar s_c) {
-                        return -evaluate_two_set_log_l(s_c, {w1}, weights_t, omegas_b, weights_b, syn_rates, syn_weights, nullptr, nullptr, delta, psi, eps_sink_t, eps_sink_b);
+                        return -evaluate_two_set_log_l(s_c, {w1}, weights_t, omegas_b, weights_b, syn_rates, syn_weights, nullptr, nullptr, delta, psi, eps_sink_t, eps_sink_b, p_omegas_u, p_weights_u);
                     }, omegas_t[0], s, 1e-4, 1.0, 1e-4, 35);
                     omegas_t[0] = opt.a; s = opt.b;
                 } else if (K == 2) {
                     auto opt = NelderMead2D::minimize([&](Scalar w1, Scalar s_c) {
-                        return -evaluate_two_set_log_l(s_c, {w1, 1.0}, weights_t, omegas_b, weights_b, syn_rates, syn_weights, nullptr, nullptr, delta, psi, eps_sink_t, eps_sink_b);
+                        return -evaluate_two_set_log_l(s_c, {w1, 1.0}, weights_t, omegas_b, weights_b, syn_rates, syn_weights, nullptr, nullptr, delta, psi, eps_sink_t, eps_sink_b, p_omegas_u, p_weights_u);
                     }, omegas_t[0], s, 1e-4, 1.0, 1e-4, 35);
                     omegas_t[0] = opt.a; omegas_t[1] = 1.0; s = opt.b;
                 } else if (K == 3) {
                     auto opt = NelderMeadND<3>::minimize([&](const std::array<Scalar, 3>& x) {
                         if (x[1] > x[2]) return 1e20;
-                        return -evaluate_two_set_log_l(x[0], {x[1], x[2], 1.0}, weights_t, omegas_b, weights_b, syn_rates, syn_weights, nullptr, nullptr, delta, psi, eps_sink_t, eps_sink_b);
+                        return -evaluate_two_set_log_l(x[0], {x[1], x[2], 1.0}, weights_t, omegas_b, weights_b, syn_rates, syn_weights, nullptr, nullptr, delta, psi, eps_sink_t, eps_sink_b, p_omegas_u, p_weights_u);
                     }, {s, omegas_t[0], omegas_t[1]}, {0.01, 1e-4, 1e-4}, {50.0, 1.0, 1.0}, 1e-4, 35);
                     s = opt.x[0]; omegas_t[0] = opt.x[1]; omegas_t[1] = opt.x[2]; omegas_t[2] = 1.0;
                 }
             } else {
                 if (K == 1) {
                     auto opt = NelderMead2D::minimize([&](Scalar w1, Scalar s_c) {
-                        return -evaluate_two_set_log_l(s_c, {w1}, weights_t, omegas_b, weights_b, syn_rates, syn_weights, nullptr, nullptr, delta, psi, eps_sink_t, eps_sink_b);
+                        return -evaluate_two_set_log_l(s_c, {w1}, weights_t, omegas_b, weights_b, syn_rates, syn_weights, nullptr, nullptr, delta, psi, eps_sink_t, eps_sink_b, p_omegas_u, p_weights_u);
                     }, omegas_t[0], s, 1e-4, max_omega, 1e-4, 35);
                     omegas_t[0] = opt.a; s = opt.b;
                 } else if (K == 2) {
                     auto opt = NelderMeadND<3>::minimize([&](const std::array<Scalar, 3>& x) {
-                        return -evaluate_two_set_log_l(x[0], {x[1], x[2]}, weights_t, omegas_b, weights_b, syn_rates, syn_weights, nullptr, nullptr, delta, psi, eps_sink_t, eps_sink_b);
+                        return -evaluate_two_set_log_l(x[0], {x[1], x[2]}, weights_t, omegas_b, weights_b, syn_rates, syn_weights, nullptr, nullptr, delta, psi, eps_sink_t, eps_sink_b, p_omegas_u, p_weights_u);
                     }, {s, omegas_t[0], omegas_t[1]}, {0.01, 1e-4, 1.0}, {50.0, 1.0, max_omega}, 1e-4, 45);
                     s = opt.x[0]; omegas_t[0] = opt.x[1]; omegas_t[1] = opt.x[2];
                 } else if (K == 3) {
                     auto opt = NelderMeadND<4>::minimize([&](const std::array<Scalar, 4>& x) {
                         if (x[1] > x[2]) return 1e20;
-                        return -evaluate_two_set_log_l(x[0], {x[1], x[2], x[3]}, weights_t, omegas_b, weights_b, syn_rates, syn_weights, nullptr, nullptr, delta, psi, eps_sink_t, eps_sink_b);
+                        return -evaluate_two_set_log_l(x[0], {x[1], x[2], x[3]}, weights_t, omegas_b, weights_b, syn_rates, syn_weights, nullptr, nullptr, delta, psi, eps_sink_t, eps_sink_b, p_omegas_u, p_weights_u);
                     }, {s, omegas_t[0], omegas_t[1], omegas_t[2]}, {0.01, 1e-4, 1e-4, 1.0}, {50.0, 1.0, 1.0, max_omega}, 1e-4, 45);
                     s = opt.x[0]; omegas_t[0] = opt.x[1]; omegas_t[1] = opt.x[2]; omegas_t[2] = opt.x[3];
                 }
@@ -3144,38 +3308,62 @@ public:
             if (constrain_bg) {
                 if (K == 1) {
                     auto opt = NelderMead2D::minimize([&](Scalar w1, Scalar s_c) {
-                        return -evaluate_two_set_log_l(s_c, omegas_t, weights_t, {w1}, weights_b, syn_rates, syn_weights, nullptr, nullptr, delta, psi, eps_sink_t, eps_sink_b);
+                        return -evaluate_two_set_log_l(s_c, omegas_t, weights_t, {w1}, weights_b, syn_rates, syn_weights, nullptr, nullptr, delta, psi, eps_sink_t, eps_sink_b, p_omegas_u, p_weights_u);
                     }, omegas_b[0], s, 1e-4, 1.0, 1e-4, 35);
                     omegas_b[0] = opt.a; s = opt.b;
                 } else if (K == 2) {
                     auto opt = NelderMead2D::minimize([&](Scalar w1, Scalar s_c) {
-                        return -evaluate_two_set_log_l(s_c, omegas_t, weights_t, {w1, 1.0}, weights_b, syn_rates, syn_weights, nullptr, nullptr, delta, psi, eps_sink_t, eps_sink_b);
+                        return -evaluate_two_set_log_l(s_c, omegas_t, weights_t, {w1, 1.0}, weights_b, syn_rates, syn_weights, nullptr, nullptr, delta, psi, eps_sink_t, eps_sink_b, p_omegas_u, p_weights_u);
                     }, omegas_b[0], s, 1e-4, 1.0, 1e-4, 35);
                     omegas_b[0] = opt.a; omegas_b[1] = 1.0; s = opt.b;
                 } else if (K == 3) {
                     auto opt = NelderMeadND<3>::minimize([&](const std::array<Scalar, 3>& x) {
                         if (x[1] > x[2]) return 1e20;
-                        return -evaluate_two_set_log_l(x[0], omegas_t, weights_t, {x[1], x[2], 1.0}, weights_b, syn_rates, syn_weights, nullptr, nullptr, delta, psi, eps_sink_t, eps_sink_b);
+                        return -evaluate_two_set_log_l(x[0], omegas_t, weights_t, {x[1], x[2], 1.0}, weights_b, syn_rates, syn_weights, nullptr, nullptr, delta, psi, eps_sink_t, eps_sink_b, p_omegas_u, p_weights_u);
                     }, {s, omegas_b[0], omegas_b[1]}, {0.01, 1e-4, 1e-4}, {50.0, 1.0, 1.0}, 1e-4, 35);
                     s = opt.x[0]; omegas_b[0] = opt.x[1]; omegas_b[1] = opt.x[2]; omegas_b[2] = 1.0;
                 }
             } else {
                 if (K == 1) {
                     auto opt = NelderMead2D::minimize([&](Scalar w1, Scalar s_c) {
-                        return -evaluate_two_set_log_l(s_c, omegas_t, weights_t, {w1}, weights_b, syn_rates, syn_weights, nullptr, nullptr, delta, psi, eps_sink_t, eps_sink_b);
+                        return -evaluate_two_set_log_l(s_c, omegas_t, weights_t, {w1}, weights_b, syn_rates, syn_weights, nullptr, nullptr, delta, psi, eps_sink_t, eps_sink_b, p_omegas_u, p_weights_u);
                     }, omegas_b[0], s, 1e-4, max_omega, 1e-4, 35);
                     omegas_b[0] = opt.a; s = opt.b;
                 } else if (K == 2) {
                     auto opt = NelderMeadND<3>::minimize([&](const std::array<Scalar, 3>& x) {
-                        return -evaluate_two_set_log_l(x[0], omegas_t, weights_t, {x[1], x[2]}, weights_b, syn_rates, syn_weights, nullptr, nullptr, delta, psi, eps_sink_t, eps_sink_b);
+                        return -evaluate_two_set_log_l(x[0], omegas_t, weights_t, {x[1], x[2]}, weights_b, syn_rates, syn_weights, nullptr, nullptr, delta, psi, eps_sink_t, eps_sink_b, p_omegas_u, p_weights_u);
                     }, {s, omegas_b[0], omegas_b[1]}, {0.01, 1e-4, 1.0}, {50.0, 1.0, max_omega}, 1e-4, 45);
                     s = opt.x[0]; omegas_b[0] = opt.x[1]; omegas_b[1] = opt.x[2];
                 } else if (K == 3) {
                     auto opt = NelderMeadND<4>::minimize([&](const std::array<Scalar, 4>& x) {
                         if (x[1] > x[2]) return 1e20;
-                        return -evaluate_two_set_log_l(x[0], omegas_t, weights_t, {x[1], x[2], x[3]}, weights_b, syn_rates, syn_weights, nullptr, nullptr, delta, psi, eps_sink_t, eps_sink_b);
+                        return -evaluate_two_set_log_l(x[0], omegas_t, weights_t, {x[1], x[2], x[3]}, weights_b, syn_rates, syn_weights, nullptr, nullptr, delta, psi, eps_sink_t, eps_sink_b, p_omegas_u, p_weights_u);
                     }, {s, omegas_b[0], omegas_b[1], omegas_b[2]}, {0.01, 1e-4, 1e-4, 1.0}, {50.0, 1.0, 1.0, max_omega}, 1e-4, 45);
                     s = opt.x[0]; omegas_b[0] = opt.x[1]; omegas_b[1] = opt.x[2]; omegas_b[2] = opt.x[3];
+                }
+            }
+
+            // Optimize Unclassified omegas (unconstrained K-class nuisance distribution)
+            if (has_u) {
+                if (K == 1) {
+                    auto opt = NelderMead2D::minimize([&](Scalar w1, Scalar s_c) {
+                        std::vector<Scalar> cand_u = {w1};
+                        return -evaluate_two_set_log_l(s_c, omegas_t, weights_t, omegas_b, weights_b, syn_rates, syn_weights, nullptr, nullptr, delta, psi, eps_sink_t, eps_sink_b, &cand_u, p_weights_u);
+                    }, omegas_u[0], s, 1e-4, max_omega, 1e-4, 30);
+                    omegas_u[0] = opt.a; s = opt.b;
+                } else if (K == 2) {
+                    auto opt = NelderMeadND<3>::minimize([&](const std::array<Scalar, 3>& x) {
+                        std::vector<Scalar> cand_u = {x[1], x[2]};
+                        return -evaluate_two_set_log_l(x[0], omegas_t, weights_t, omegas_b, weights_b, syn_rates, syn_weights, nullptr, nullptr, delta, psi, eps_sink_t, eps_sink_b, &cand_u, p_weights_u);
+                    }, {s, omegas_u[0], omegas_u[1]}, {0.01, 1e-4, 1.0}, {50.0, 1.0, max_omega}, 1e-4, 35);
+                    s = opt.x[0]; omegas_u[0] = opt.x[1]; omegas_u[1] = opt.x[2];
+                } else if (K == 3) {
+                    auto opt = NelderMeadND<4>::minimize([&](const std::array<Scalar, 4>& x) {
+                        if (x[1] > x[2]) return 1e20;
+                        std::vector<Scalar> cand_u = {x[1], x[2], x[3]};
+                        return -evaluate_two_set_log_l(x[0], omegas_t, weights_t, omegas_b, weights_b, syn_rates, syn_weights, nullptr, nullptr, delta, psi, eps_sink_t, eps_sink_b, &cand_u, p_weights_u);
+                    }, {s, omegas_u[0], omegas_u[1], omegas_u[2]}, {0.01, 1e-4, 1e-4, 1.0}, {50.0, 1.0, 1.0, max_omega}, 1e-4, 35);
+                    s = opt.x[0]; omegas_u[0] = opt.x[1]; omegas_u[1] = opt.x[2]; omegas_u[2] = opt.x[3];
                 }
             }
 
@@ -3184,7 +3372,7 @@ public:
                     Scalar q1 = syn_weights[0], q2 = syn_weights[1];
                     Scalar a2 = (1.0 - q1 * a1) / q2;
                     if (a1 < 0.01 || a2 < a1 || a2 > 50.0) return 1e20;
-                    return -evaluate_two_set_log_l(s, omegas_t, weights_t, omegas_b, weights_b, {a1, a2}, syn_weights, nullptr, nullptr, delta, psi, eps_sink_t, eps_sink_b);
+                    return -evaluate_two_set_log_l(s, omegas_t, weights_t, omegas_b, weights_b, {a1, a2}, syn_weights, nullptr, nullptr, delta, psi, eps_sink_t, eps_sink_b, p_omegas_u, p_weights_u);
                 }, syn_rates[0], 0.0, 0.01, 2.0, 1e-3, 25);
                 Scalar a1 = syn_opt.a;
                 Scalar a2 = (1.0 - syn_weights[0] * a1) / syn_weights[1];
@@ -3196,7 +3384,7 @@ public:
                     Scalar q1 = syn_weights[0], q2 = syn_weights[1], q3 = syn_weights[2];
                     Scalar a3 = (1.0 - q1 * a1 - q2 * a2) / q3;
                     if (a1 < 0.01 || a2 < a1 || a3 < a2 || a3 > 50.0) return 1e20;
-                    return -evaluate_two_set_log_l(s, omegas_t, weights_t, omegas_b, weights_b, {a1, a2, a3}, syn_weights, nullptr, nullptr, delta, psi, eps_sink_t, eps_sink_b);
+                    return -evaluate_two_set_log_l(s, omegas_t, weights_t, omegas_b, weights_b, {a1, a2, a3}, syn_weights, nullptr, nullptr, delta, psi, eps_sink_t, eps_sink_b, p_omegas_u, p_weights_u);
                 }, syn_rates[0], syn_rates[1], 0.01, 5.0, 1e-3, 30);
                 Scalar a1 = syn_opt.a, a2 = syn_opt.b;
                 Scalar a3 = (1.0 - syn_weights[0] * a1 - syn_weights[1] * a2) / syn_weights[2];
@@ -3208,13 +3396,13 @@ public:
             if (allow_triple) {
                 auto mh_opt = NelderMead2D::minimize([&](Scalar d, Scalar p) {
                     if (d < 0.0 || d > 10.0 || p < 0.0 || p > 10.0) return 1e20;
-                    return -evaluate_two_set_log_l(s, omegas_t, weights_t, omegas_b, weights_b, syn_rates, syn_weights, nullptr, nullptr, d, p, eps_sink_t, eps_sink_b);
+                    return -evaluate_two_set_log_l(s, omegas_t, weights_t, omegas_b, weights_b, syn_rates, syn_weights, nullptr, nullptr, d, p, eps_sink_t, eps_sink_b, p_omegas_u, p_weights_u);
                 }, delta, psi, 0.0, 10.0, 1e-4, 25);
                 delta = std::max(0.0, mh_opt.a); psi = std::max(0.0, mh_opt.b);
             } else if (allow_double) {
                 auto d_opt = NelderMead2D::minimize([&](Scalar d, Scalar /*unused*/) {
                     if (d < 0.0 || d > 10.0) return 1e20;
-                    return -evaluate_two_set_log_l(s, omegas_t, weights_t, omegas_b, weights_b, syn_rates, syn_weights, nullptr, nullptr, d, 0.0, eps_sink_t, eps_sink_b);
+                    return -evaluate_two_set_log_l(s, omegas_t, weights_t, omegas_b, weights_b, syn_rates, syn_weights, nullptr, nullptr, d, 0.0, eps_sink_t, eps_sink_b, p_omegas_u, p_weights_u);
                 }, delta, 0.0, 0.0, 10.0, 1e-4, 25);
                 delta = std::max(0.0, d_opt.a);
             }
@@ -3223,7 +3411,7 @@ public:
                 std::ostringstream ss;
                 ss << model_desc << " (ECM " << (ecm_iter + 1) << "/" << max_ecm << "): lnL = "
                    << std::fixed << std::setprecision(2)
-                   << evaluate_two_set_log_l(s, omegas_t, weights_t, omegas_b, weights_b, syn_rates, syn_weights, nullptr, nullptr, delta, psi, eps_sink_t, eps_sink_b);
+                   << evaluate_two_set_log_l(s, omegas_t, weights_t, omegas_b, weights_b, syn_rates, syn_weights, nullptr, nullptr, delta, psi, eps_sink_t, eps_sink_b, p_omegas_u, p_weights_u);
                 pbar->set_status(ss.str());
                 pbar->tick();
             }
@@ -3237,7 +3425,7 @@ public:
         }
 
         if (refine_branches) {
-            bl = refine_two_set_branch_lengths(bl, omegas_t, weights_t, omegas_b, weights_b, syn_rates, syn_weights, delta, psi, 1, eps_sink_t, eps_sink_b);
+            bl = refine_two_set_branch_lengths(bl, omegas_t, weights_t, omegas_b, weights_b, syn_rates, syn_weights, delta, psi, 1, eps_sink_t, eps_sink_b, p_omegas_u, p_weights_u);
             if (pbar) {
                 std::ostringstream ss;
                 ss << model_desc << ": Branch lengths refined";
@@ -3245,29 +3433,34 @@ public:
                 pbar->tick();
             }
             if (K >= 2 || use_error_sink) {
+                std::vector<Scalar> wt_u;
                 auto [wt_t, wt_b] = compute_expected_two_set_weights(
                     1.0, omegas_t, weights_t, omegas_b, weights_b, syn_rates, syn_weights, &bl, delta, psi,
                     eps_sink_t, eps_sink_b,
                     use_error_sink ? &eps_sink_t : nullptr,
                     use_error_sink ? &eps_sink_b : nullptr,
-                    max_eps_sink
+                    max_eps_sink,
+                    p_omegas_u, p_weights_u, has_u ? &wt_u : nullptr
                 );
                 weights_t = wt_t;
                 weights_b = wt_b;
+                if (has_u && wt_u.size() == K) {
+                    weights_u = wt_u;
+                }
             }
             if (srv && M >= 2) {
-                syn_weights = compute_expected_two_set_syn_weights(1.0, omegas_t, weights_t, omegas_b, weights_b, syn_rates, syn_weights, &bl, delta, psi, eps_sink_t, eps_sink_b);
+                syn_weights = compute_expected_two_set_syn_weights(1.0, omegas_t, weights_t, omegas_b, weights_b, syn_rates, syn_weights, &bl, delta, psi, eps_sink_t, eps_sink_b, p_omegas_u, p_weights_u);
             }
             if (allow_triple) {
                 auto mh_polish = NelderMead2D::minimize([&](Scalar d, Scalar p) {
                     if (d < 0.0 || d > 10.0 || p < 0.0 || p > 10.0) return 1e20;
-                    return -evaluate_two_set_log_l(1.0, omegas_t, weights_t, omegas_b, weights_b, syn_rates, syn_weights, &bl, nullptr, d, p, eps_sink_t, eps_sink_b);
+                    return -evaluate_two_set_log_l(1.0, omegas_t, weights_t, omegas_b, weights_b, syn_rates, syn_weights, &bl, nullptr, d, p, eps_sink_t, eps_sink_b, p_omegas_u, p_weights_u);
                 }, delta, psi, 0.0, 10.0, 1e-4, 25);
                 delta = std::max(0.0, mh_polish.a); psi = std::max(0.0, mh_polish.b);
             } else if (allow_double) {
                 auto d_polish = NelderMead2D::minimize([&](Scalar d, Scalar /*unused*/) {
                     if (d < 0.0 || d > 10.0) return 1e20;
-                    return -evaluate_two_set_log_l(1.0, omegas_t, weights_t, omegas_b, weights_b, syn_rates, syn_weights, &bl, nullptr, d, 0.0, eps_sink_t, eps_sink_b);
+                    return -evaluate_two_set_log_l(1.0, omegas_t, weights_t, omegas_b, weights_b, syn_rates, syn_weights, &bl, nullptr, d, 0.0, eps_sink_t, eps_sink_b, p_omegas_u, p_weights_u);
                 }, delta, 0.0, 0.0, 10.0, 1e-4, 25);
                 delta = std::max(0.0, d_polish.a);
             }
@@ -3277,7 +3470,7 @@ public:
         }
 
         Scalar best_lnL = evaluate_two_set_log_l(
-            1.0, omegas_t, weights_t, omegas_b, weights_b, syn_rates, syn_weights, &bl, &fit.site_log_likelihoods, delta, psi, eps_sink_t, eps_sink_b
+            1.0, omegas_t, weights_t, omegas_b, weights_b, syn_rates, syn_weights, &bl, &fit.site_log_likelihoods, delta, psi, eps_sink_t, eps_sink_b, p_omegas_u, p_weights_u
         );
         fit.log_likelihood = best_lnL;
         fit.tree_scale = s;
@@ -3292,16 +3485,28 @@ public:
         fit.background_distribution.omegas = omegas_b;
         fit.background_distribution.weights = weights_b;
         fit.background_distribution.error_sink_weight = eps_sink_b;
+        if (has_u) {
+            fit.unclassified_distribution.omegas = omegas_u;
+            fit.unclassified_distribution.weights = weights_u;
+            fit.unclassified_distribution.error_sink_weight = 0.0;
+        }
         if (srv) {
             fit.test_distribution.syn_rates = syn_rates;
             fit.test_distribution.syn_weights = syn_weights;
             fit.background_distribution.syn_rates = syn_rates;
             fit.background_distribution.syn_weights = syn_weights;
+            if (has_u) {
+                fit.unclassified_distribution.syn_rates = syn_rates;
+                fit.unclassified_distribution.syn_weights = syn_weights;
+            }
         }
 
         size_t N_codons = aln.num_codons;
         size_t num_branches = tree.num_nodes() - 1;
-        size_t num_mixture_params = (2 * K - 1 - (constrain_test ? 1 : 0)) + (2 * K - 1 - (constrain_bg ? 1 : 0)) + (use_error_sink ? 2 : 0);
+        size_t num_mixture_params = (2 * K - 1 - (constrain_test ? 1 : 0))
+                                  + (2 * K - 1 - (constrain_bg ? 1 : 0))
+                                  + (has_u ? (2 * K - 1) : 0)
+                                  + (use_error_sink ? 2 : 0);
         size_t num_syn_params = srv ? 2 * (M - 1) : 0;
         size_t num_mh_params = (allow_double ? 1 : 0) + (allow_triple ? 1 : 0);
         size_t K_params = 5 + (refine_branches ? num_branches : 1) + num_mixture_params + num_syn_params + num_mh_params;
@@ -3313,6 +3518,7 @@ public:
     // Fits coupled-k RELAX two-set model:
     //   Reference (Background, partition 1): K-class distribution (omegas_b[c], weights[c])
     //   Test (Foreground, partition 0):      K-class distribution (omegas_t[c] = (omegas_b[c])^k, weights[c])
+    //   Unclassified (partition 2, if any):  Unconstrained K-class distribution (omegas_u[c], weights_u[c])
     // Warm-started from shared_null_fit (the exact k = 1 RELAX Null model), guaranteeing lnL_RELAX >= lnL_shared.
     BUSTEDFit fit_relax_coupled_model(
         const BUSTEDFit& shared_null_fit,
@@ -3330,6 +3536,8 @@ public:
         BUSTEDFit fit = shared_null_fit;
         fit.num_rate_classes = K;
         fit.has_background_distribution = true;
+        bool has_u = (num_unclassified_branches > 0);
+        fit.has_unclassified_distribution = has_u;
 
         bool allow_double = (multiple_hits == "Double" || multiple_hits == "Double+Triple");
         bool allow_triple = (multiple_hits == "Double+Triple");
@@ -3341,6 +3549,21 @@ public:
             omegas_b.resize(K, 1.0);
             weights.assign(K, 1.0 / static_cast<Scalar>(K));
         }
+
+        std::vector<Scalar> omegas_u, weights_u;
+        if (has_u) {
+            if (shared_null_fit.has_unclassified_distribution &&
+                shared_null_fit.unclassified_distribution.omegas.size() == K &&
+                shared_null_fit.unclassified_distribution.weights.size() == K) {
+                omegas_u = shared_null_fit.unclassified_distribution.omegas;
+                weights_u = shared_null_fit.unclassified_distribution.weights;
+            } else {
+                omegas_u = omegas_b;
+                weights_u = weights;
+            }
+        }
+        const std::vector<Scalar>* p_omegas_u = has_u ? &omegas_u : nullptr;
+        const std::vector<Scalar>* p_weights_u = has_u ? &weights_u : nullptr;
 
         size_t M = srv ? num_syn_rates : 1;
         std::vector<Scalar> syn_rates = (srv && shared_null_fit.test_distribution.syn_rates.size() == M)
@@ -3391,7 +3614,7 @@ public:
         std::vector<Scalar> omegas_t = couple_omegas(omegas_b, k_relax);
 
         Scalar best_tracked_ll = evaluate_two_set_log_l(
-            1.0, omegas_t, weights, omegas_b, weights, syn_rates, syn_weights, get_scaled_bl(s), nullptr, delta, psi, eps_sink_t, eps_sink_b
+            1.0, omegas_t, weights, omegas_b, weights, syn_rates, syn_weights, get_scaled_bl(s), nullptr, delta, psi, eps_sink_t, eps_sink_b, p_omegas_u, p_weights_u
         );
 
         // Initial 1D search on k_relax holding shared distribution fixed
@@ -3401,7 +3624,7 @@ public:
             for (Scalar kc : k_grid) {
                 auto wt_c = couple_omegas(omegas_b, kc);
                 Scalar ll_c = evaluate_two_set_log_l(
-                    1.0, wt_c, weights, omegas_b, weights, syn_rates, syn_weights, get_scaled_bl(s), nullptr, delta, psi, eps_sink_t, eps_sink_b
+                    1.0, wt_c, weights, omegas_b, weights, syn_rates, syn_weights, get_scaled_bl(s), nullptr, delta, psi, eps_sink_t, eps_sink_b, p_omegas_u, p_weights_u
                 );
                 if (ll_c > best_tracked_ll) {
                     best_tracked_ll = ll_c;
@@ -3412,7 +3635,7 @@ public:
                 Scalar kc_clamped = std::clamp(kc, 0.0, 50.0);
                 auto wt_c = couple_omegas(omegas_b, kc_clamped);
                 return -evaluate_two_set_log_l(
-                    1.0, wt_c, weights, omegas_b, weights, syn_rates, syn_weights, get_scaled_bl(s), nullptr, delta, psi, eps_sink_t, eps_sink_b
+                    1.0, wt_c, weights, omegas_b, weights, syn_rates, syn_weights, get_scaled_bl(s), nullptr, delta, psi, eps_sink_t, eps_sink_b, p_omegas_u, p_weights_u
                 );
             }, std::max(0.0, best_k * 0.25), best_k, std::min(50.0, std::max(2.0, best_k * 2.5)), 1e-4, 35);
             if (-brent_nll >= best_tracked_ll) {
@@ -3434,12 +3657,14 @@ public:
             // 1. Shared weights E-step
             if (K >= 2 || use_error_sink) {
                 Scalar cand_eps_t = eps_sink_t, cand_eps_b = eps_sink_b;
+                std::vector<Scalar> wt_u_cand;
                 auto [wt_t, wt_b] = compute_expected_two_set_weights(
                     1.0, omegas_t, weights, omegas_b, weights, syn_rates, syn_weights, get_scaled_bl(s), delta, psi,
                     eps_sink_t, eps_sink_b,
                     use_error_sink ? &cand_eps_t : nullptr,
                     use_error_sink ? &cand_eps_b : nullptr,
-                    max_eps_sink
+                    max_eps_sink,
+                    p_omegas_u, p_weights_u, has_u ? &wt_u_cand : nullptr
                 );
                 std::vector<Scalar> w_cand(K);
                 Scalar sum_w = 0.0;
@@ -3449,11 +3674,15 @@ public:
                 }
                 for (size_t c = 0; c < K; ++c) w_cand[c] /= sum_w;
                 Scalar cand_eps = frac_t * cand_eps_t + frac_b * cand_eps_b;
+                const std::vector<Scalar>* p_wu_cand = (has_u && wt_u_cand.size() == K) ? &wt_u_cand : p_weights_u;
                 Scalar cand_ll = evaluate_two_set_log_l(
-                    1.0, omegas_t, w_cand, omegas_b, w_cand, syn_rates, syn_weights, get_scaled_bl(s), nullptr, delta, psi, cand_eps, cand_eps
+                    1.0, omegas_t, w_cand, omegas_b, w_cand, syn_rates, syn_weights, get_scaled_bl(s), nullptr, delta, psi, cand_eps, cand_eps, p_omegas_u, p_wu_cand
                 );
                 if (cand_ll >= best_tracked_ll - 1e-9) {
                     weights = w_cand;
+                    if (has_u && wt_u_cand.size() == K) {
+                        weights_u = wt_u_cand;
+                    }
                     eps_sink_t = cand_eps;
                     eps_sink_b = cand_eps;
                     best_tracked_ll = std::max(best_tracked_ll, cand_ll);
@@ -3463,10 +3692,10 @@ public:
             // 2. SRV weights E-step
             if (srv && M >= 2) {
                 auto q_cand = compute_expected_two_set_syn_weights(
-                    1.0, omegas_t, weights, omegas_b, weights, syn_rates, syn_weights, get_scaled_bl(s), delta, psi, eps_sink_t, eps_sink_b
+                    1.0, omegas_t, weights, omegas_b, weights, syn_rates, syn_weights, get_scaled_bl(s), delta, psi, eps_sink_t, eps_sink_b, p_omegas_u, p_weights_u
                 );
                 Scalar cand_ll = evaluate_two_set_log_l(
-                    1.0, omegas_t, weights, omegas_b, weights, syn_rates, q_cand, get_scaled_bl(s), nullptr, delta, psi, eps_sink_t, eps_sink_b
+                    1.0, omegas_t, weights, omegas_b, weights, syn_rates, q_cand, get_scaled_bl(s), nullptr, delta, psi, eps_sink_t, eps_sink_b, p_omegas_u, p_weights_u
                 );
                 if (cand_ll >= best_tracked_ll - 1e-9) {
                     syn_weights = q_cand;
@@ -3479,7 +3708,7 @@ public:
                 auto opt = NelderMeadND<3>::minimize([&](const std::array<Scalar, 3>& x) {
                     std::vector<Scalar> wb = {x[1]};
                     auto wt = couple_omegas(wb, x[2]);
-                    return -evaluate_two_set_log_l(1.0, wt, weights, wb, weights, syn_rates, syn_weights, get_scaled_bl(x[0]), nullptr, delta, psi, eps_sink_t, eps_sink_b);
+                    return -evaluate_two_set_log_l(1.0, wt, weights, wb, weights, syn_rates, syn_weights, get_scaled_bl(x[0]), nullptr, delta, psi, eps_sink_t, eps_sink_b, p_omegas_u, p_weights_u);
                 }, {s, omegas_b[0], k_relax}, {0.05, 1e-4, 0.0}, {20.0, max_omega, 50.0}, 1e-4, 40);
                 if (-opt.f >= best_tracked_ll) {
                     s = opt.x[0]; omegas_b[0] = opt.x[1]; k_relax = opt.x[2];
@@ -3497,7 +3726,7 @@ public:
                 auto opt = NelderMeadND<4>::minimize([&](const std::array<Scalar, 4>& x) {
                     std::vector<Scalar> wb = {x[1], x[2]};
                     auto wt = couple_omegas(wb, x[3]);
-                    return -evaluate_two_set_log_l(1.0, wt, weights, wb, weights, syn_rates, syn_weights, get_scaled_bl(x[0]), nullptr, delta, psi, eps_sink_t, eps_sink_b);
+                    return -evaluate_two_set_log_l(1.0, wt, weights, wb, weights, syn_rates, syn_weights, get_scaled_bl(x[0]), nullptr, delta, psi, eps_sink_t, eps_sink_b, p_omegas_u, p_weights_u);
                 }, {s, omegas_b[0], omegas_b[1], k_relax}, {0.05, 1e-4, 1.0, 0.0}, {20.0, 1.0, max_omega, 50.0}, 1e-4, 45, extra_grid);
                 if (-opt.f >= best_tracked_ll) {
                     s = opt.x[0]; omegas_b[0] = opt.x[1]; omegas_b[1] = opt.x[2]; k_relax = opt.x[3];
@@ -3516,7 +3745,7 @@ public:
                     if (x[1] > x[2]) return 1e20;
                     std::vector<Scalar> wb = {x[1], x[2], x[3]};
                     auto wt = couple_omegas(wb, x[4]);
-                    return -evaluate_two_set_log_l(1.0, wt, weights, wb, weights, syn_rates, syn_weights, get_scaled_bl(x[0]), nullptr, delta, psi, eps_sink_t, eps_sink_b);
+                    return -evaluate_two_set_log_l(1.0, wt, weights, wb, weights, syn_rates, syn_weights, get_scaled_bl(x[0]), nullptr, delta, psi, eps_sink_t, eps_sink_b, p_omegas_u, p_weights_u);
                 }, {s, omegas_b[0], omegas_b[1], omegas_b[2], k_relax}, {0.05, 1e-4, 1e-4, 1.0, 0.0}, {20.0, 1.0, 1.0, max_omega, 50.0}, 1e-4, 50, extra_grid);
                 if (-opt.f >= best_tracked_ll) {
                     s = opt.x[0]; omegas_b[0] = opt.x[1]; omegas_b[1] = opt.x[2]; omegas_b[2] = opt.x[3]; k_relax = opt.x[4];
@@ -3538,10 +3767,10 @@ public:
 
         if (refine_branches) {
             auto cand_bl = refine_two_set_branch_lengths(
-                bl, omegas_t, weights, omegas_b, weights, syn_rates, syn_weights, delta, psi, 1, eps_sink_t, eps_sink_b
+                bl, omegas_t, weights, omegas_b, weights, syn_rates, syn_weights, delta, psi, 1, eps_sink_t, eps_sink_b, p_omegas_u, p_weights_u
             );
             Scalar cand_bl_ll = evaluate_two_set_log_l(
-                1.0, omegas_t, weights, omegas_b, weights, syn_rates, syn_weights, &cand_bl, nullptr, delta, psi, eps_sink_t, eps_sink_b
+                1.0, omegas_t, weights, omegas_b, weights, syn_rates, syn_weights, &cand_bl, nullptr, delta, psi, eps_sink_t, eps_sink_b, p_omegas_u, p_weights_u
             );
             if (cand_bl_ll >= best_tracked_ll) {
                 bl = cand_bl;
@@ -3559,7 +3788,7 @@ public:
                 Scalar kc_clamped = std::clamp(kc, 0.0, 50.0);
                 auto wt_c = couple_omegas(omegas_b, kc_clamped);
                 return -evaluate_two_set_log_l(
-                    1.0, wt_c, weights, omegas_b, weights, syn_rates, syn_weights, &bl, nullptr, delta, psi, eps_sink_t, eps_sink_b
+                    1.0, wt_c, weights, omegas_b, weights, syn_rates, syn_weights, &bl, nullptr, delta, psi, eps_sink_t, eps_sink_b, p_omegas_u, p_weights_u
                 );
             }, std::max(0.0, k_relax * 0.5), k_relax, std::min(50.0, std::max(1.5, k_relax * 1.5)), 1e-4, 30);
             if (-brent_nll >= best_tracked_ll) {
@@ -3573,7 +3802,7 @@ public:
         }
 
         Scalar best_lnL = evaluate_two_set_log_l(
-            1.0, omegas_t, weights, omegas_b, weights, syn_rates, syn_weights, &bl, &fit.site_log_likelihoods, delta, psi, eps_sink_t, eps_sink_b
+            1.0, omegas_t, weights, omegas_b, weights, syn_rates, syn_weights, &bl, &fit.site_log_likelihoods, delta, psi, eps_sink_t, eps_sink_b, p_omegas_u, p_weights_u
         );
         if (best_lnL < shared_null_fit.log_likelihood) {
             fit = shared_null_fit;
@@ -3592,11 +3821,20 @@ public:
             fit.background_distribution.omegas = omegas_b;
             fit.background_distribution.weights = weights;
             fit.background_distribution.error_sink_weight = eps_sink_b;
+            if (has_u) {
+                fit.unclassified_distribution.omegas = omegas_u;
+                fit.unclassified_distribution.weights = weights_u;
+                fit.unclassified_distribution.error_sink_weight = 0.0;
+            }
             if (srv) {
                 fit.test_distribution.syn_rates = syn_rates;
                 fit.test_distribution.syn_weights = syn_weights;
                 fit.background_distribution.syn_rates = syn_rates;
                 fit.background_distribution.syn_weights = syn_weights;
+                if (has_u) {
+                    fit.unclassified_distribution.syn_rates = syn_rates;
+                    fit.unclassified_distribution.syn_weights = syn_weights;
+                }
             }
         }
 
@@ -3604,12 +3842,75 @@ public:
 
         size_t N_codons = aln.num_codons;
         size_t num_branches = tree.num_nodes() - 1;
-        size_t num_mixture_params = (2 * K - 1) + 1 + (use_error_sink ? 1 : 0); // shared weights + BG omegas + k_relax
+        size_t num_mixture_params = (2 * K - 1) + 1 + (has_u ? (2 * K - 1) : 0) + (use_error_sink ? 1 : 0); // shared weights + BG omegas + k_relax
         size_t num_syn_params = srv ? 2 * (M - 1) : 0;
         size_t num_mh_params = (allow_double ? 1 : 0) + (allow_triple ? 1 : 0);
         size_t K_params = 5 + (refine_branches ? num_branches : 1) + num_mixture_params + num_syn_params + num_mh_params;
         fit.aicc = -2.0 * fit.log_likelihood + 2.0 * K_params * N_codons / std::max(1.0, static_cast<double>(N_codons) - static_cast<double>(K_params) - 1.0);
 
+        return fit;
+    }
+
+    // Fits Shared Distribution model (D_T == D_B on Test U Background; independent K-class on Unclassified if present)
+    BUSTEDFit fit_shared_distribution_model(
+        size_t K,
+        const BUSTEDSettings& settings,
+        ProgressBar* pbar,
+        const std::string& model_desc
+    ) const {
+        if (num_unclassified_branches == 0) {
+            auto saved_is_test = is_test_branch;
+            auto saved_num_test = num_test_branches;
+            num_test_branches = 0;
+            for (const auto& node : tree.nodes) {
+                if (node.id != tree.root_id) {
+                    bool in_shared = (branch_partition[node.id] <= 1);
+                    is_test_branch[node.id] = in_shared;
+                    if (in_shared) num_test_branches++;
+                }
+            }
+            BUSTEDFit fit = fit_model(
+                false, K, settings.refine_branch_lengths, settings.srv, settings.num_syn_rate_classes,
+                settings.multiple_hits, pbar, model_desc,
+                settings.error_sink, settings.error_sink_max_weight
+            );
+            fit.has_background_distribution = true;
+            fit.background_distribution = fit.test_distribution;
+            is_test_branch = saved_is_test;
+            num_test_branches = saved_num_test;
+            return fit;
+        }
+
+        // When num_unclassified_branches > 0, (Test U Background) shares one K-class distribution (partition 0)
+        // and Unclassified has its own unconstrained K-class distribution (partition 1).
+        auto saved_part = branch_partition;
+        auto saved_nt = num_test_branches;
+        auto saved_nb = num_background_branches;
+        auto saved_nu = num_unclassified_branches;
+
+        num_test_branches = saved_nt + saved_nb;
+        num_background_branches = saved_nu;
+        num_unclassified_branches = 0;
+        for (const auto& node : tree.nodes) {
+            if (node.id != tree.root_id) {
+                branch_partition[node.id] = (saved_part[node.id] <= 1) ? 0 : 1;
+            }
+        }
+
+        BUSTEDFit fit = fit_two_set_model(
+            false, false, K, settings.refine_branch_lengths, settings.srv, settings.num_syn_rate_classes,
+            settings.multiple_hits, pbar, model_desc,
+            settings.error_sink, settings.error_sink_max_weight
+        );
+        fit.has_unclassified_distribution = true;
+        fit.unclassified_distribution = fit.background_distribution;
+        fit.has_background_distribution = true;
+        fit.background_distribution = fit.test_distribution;
+
+        branch_partition = saved_part;
+        num_test_branches = saved_nt;
+        num_background_branches = saved_nb;
+        num_unclassified_branches = saved_nu;
         return fit;
     }
 
@@ -3680,27 +3981,11 @@ public:
             res.shared_df = static_cast<int>(2 * K - 1);
 
             // 1. Fit Shared Distributions Model (M_shared: D_T == D_B on Test U Background; also exact RELAX Null k = 1)
-            {
-                auto saved_is_test = is_test_branch;
-                auto saved_num_test = num_test_branches;
-                num_test_branches = 0;
-                for (const auto& node : tree.nodes) {
-                    if (node.id != tree.root_id) {
-                        bool in_shared = (branch_partition[node.id] <= 1);
-                        is_test_branch[node.id] = in_shared;
-                        if (in_shared) num_test_branches++;
-                    }
-                }
-                res.shared_distributions = fit_model(
-                    false, K, settings.refine_branch_lengths, settings.srv, settings.num_syn_rate_classes,
-                    settings.multiple_hits, pbar.get(), "Shared Dist (RELAX Null k=1) K=" + std::to_string(K),
-                    settings.error_sink, settings.error_sink_max_weight
-                );
-                res.shared_distributions.has_background_distribution = true;
-                res.shared_distributions.background_distribution = res.shared_distributions.test_distribution;
-                is_test_branch = saved_is_test;
-                num_test_branches = saved_num_test;
-            }
+            res.shared_distributions = fit_shared_distribution_model(
+                K, settings, pbar.get(), "Shared Dist (RELAX Null k=1) K=" + std::to_string(K)
+            );
+            const BUSTEDRateDistribution* warm_u = res.shared_distributions.has_unclassified_distribution
+                ? &res.shared_distributions.unclassified_distribution : nullptr;
 
             // 1b. Fit Coupled-k RELAX Alternative Model (M_RELAX: omega_FG = omega_BG^k, shared weights)
             if (run_relax_in_ph) {
@@ -3724,7 +4009,7 @@ public:
                 true, false, K, settings.refine_branch_lengths, settings.srv, settings.num_syn_rate_classes,
                 settings.multiple_hits, pbar.get(), "Constrained Test K=" + std::to_string(K),
                 settings.error_sink, settings.error_sink_max_weight,
-                &res.shared_distributions.test_distribution, &res.shared_distributions.test_distribution
+                &res.shared_distributions.test_distribution, &res.shared_distributions.test_distribution, warm_u
             );
 
             // 3. Fit Constrained Background Model (M_null_B: omega_K^(T) >= 1, omega_K^(B) = 1)
@@ -3732,7 +4017,7 @@ public:
                 false, true, K, settings.refine_branch_lengths, settings.srv, settings.num_syn_rate_classes,
                 settings.multiple_hits, pbar.get(), "Constrained Background K=" + std::to_string(K),
                 settings.error_sink, settings.error_sink_max_weight,
-                &res.shared_distributions.test_distribution, &res.shared_distributions.test_distribution
+                &res.shared_distributions.test_distribution, &res.shared_distributions.test_distribution, warm_u
             );
 
             // 4. Fit Unconstrained Two-Set Model (M_unconstrained: omega_K^(T) >= 1, omega_K^(B) >= 1)
@@ -3743,12 +4028,15 @@ public:
                 res.relax_alternative.log_likelihood > res.constrained.log_likelihood) {
                 warm_t = &res.relax_alternative.test_distribution;
                 warm_b = &res.relax_alternative.background_distribution;
+                if (res.relax_alternative.has_unclassified_distribution) {
+                    warm_u = &res.relax_alternative.unclassified_distribution;
+                }
             }
             res.unconstrained = fit_two_set_model(
                 false, false, K, settings.refine_branch_lengths, settings.srv, settings.num_syn_rate_classes,
                 settings.multiple_hits, pbar.get(), "Unconstrained Two-Set K=" + std::to_string(K),
                 settings.error_sink, settings.error_sink_max_weight,
-                warm_t, warm_b
+                warm_t, warm_b, warm_u
             );
 
             // Ensure proper nesting of log-likelihoods (M_shared c M_RELAX c M_unconstrained)
@@ -3904,27 +4192,9 @@ public:
             if (settings.relax_mode && !res.is_failed) {
                 size_t K = res.optimal_k;
                 res.has_relax_test = true;
-                {
-                    auto saved_is_test = is_test_branch;
-                    auto saved_num_test = num_test_branches;
-                    num_test_branches = 0;
-                    for (const auto& node : tree.nodes) {
-                        if (node.id != tree.root_id) {
-                            bool in_shared = (branch_partition[node.id] <= 1);
-                            is_test_branch[node.id] = in_shared;
-                            if (in_shared) num_test_branches++;
-                        }
-                    }
-                    res.shared_distributions = fit_model(
-                        false, K, settings.refine_branch_lengths, settings.srv, settings.num_syn_rate_classes,
-                        settings.multiple_hits, pbar.get(), "RELAX Null (k=1) K=" + std::to_string(K),
-                        settings.error_sink, settings.error_sink_max_weight
-                    );
-                    res.shared_distributions.has_background_distribution = true;
-                    res.shared_distributions.background_distribution = res.shared_distributions.test_distribution;
-                    is_test_branch = saved_is_test;
-                    num_test_branches = saved_num_test;
-                }
+                res.shared_distributions = fit_shared_distribution_model(
+                    K, settings, pbar.get(), "RELAX Null (k=1) K=" + std::to_string(K)
+                );
                 res.relax_alternative = fit_relax_coupled_model(
                     res.shared_distributions, K, settings.refine_branch_lengths, settings.srv, settings.num_syn_rate_classes,
                     settings.multiple_hits, pbar.get(), "RELAX Coupled-k K=" + std::to_string(K),
