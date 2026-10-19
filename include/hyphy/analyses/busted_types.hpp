@@ -101,6 +101,16 @@ struct BUSTEDSettings {
     bool relax_mode = false;               // Fit coupled-k RELAX model (omega_FG = omega_BG^k, shared weights) vs shared_distributions (k = 1)
     bool include_relax_in_ph = true;       // Automatically run coupled-k RELAX fit inside BUSTED-PH workflow
     std::string comparison_branches = "";  // Optional comparison/background branch set for BUSTED-PH (default: complement of test_branches)
+    std::string mss_type = "";             // Optional MSS synonymous rate partition ("SynREV", "SynREVCodon", "SynREV2", "SynREV2g", or TSV path)
+    std::string mss_neutral = "";          // Optional MSS neutral reference class name
+    std::string mss_normalization = "flux"; // "flux", "unweighted", or "neutral_ref"
+};
+
+struct BUSTEDMSSClassRate {
+    std::string class_name;
+    Scalar rate = 1.0;
+    size_t num_pairs = 0;
+    bool is_reference = false;
 };
 
 struct BUSTEDResult {
@@ -135,6 +145,7 @@ struct BUSTEDResult {
     std::string relax_direction = "None"; // "Intensification", "Relaxation", or "None"
     BUSTEDFit relax_alternative;
 
+    std::vector<BUSTEDMSSClassRate> mss_rates; // Populated when BUSTED-MSS (--mss) is enabled
     std::vector<Scalar> evidence_ratios; // Bayes factors per site for omega_K > 1
     std::vector<Scalar> site_error_bfs;  // Max error sink Bayes factor across branches per site
     std::vector<BUSTEDErrorEvent> flagged_error_events; // Branch-site pairs with BF_sink >= threshold

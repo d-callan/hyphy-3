@@ -124,6 +124,11 @@ target_include_directories(hyphy3_report INTERFACE ${HYPHY3_GENERATED_DIR})
 target_link_libraries(hyphy3_report INTERFACE hyphy3_core)
 add_dependencies(hyphy3_report hyphy3_viewer_assets)
 
+# Also expose generated viewer_assets.hpp on hyphy3_core so any target including
+# hyphy/core/cli_common.hpp -> hyphy/report/html_report.hpp finds it cleanly.
+target_include_directories(hyphy3_core INTERFACE ${HYPHY3_GENERATED_DIR})
+add_dependencies(hyphy3_core hyphy3_viewer_assets)
+
 # Out-of-line JSON emitters (src/analyses/*.cpp). The emitter bodies live in
 # this one static library instead of the analysis headers so that editing an
 # emitter recompiles a single TU rather than all ~45 consumers.
@@ -136,6 +141,7 @@ add_library(hyphy3_emitters STATIC
     src/analyses/fubar.cpp
     src/analyses/gard.cpp
     src/analyses/meme.cpp
+    src/analyses/mss.cpp
     src/analyses/ohmic.cpp
     src/analyses/prime.cpp
     src/analyses/relax.cpp
@@ -214,6 +220,10 @@ add_executable(hyphy_dfel_test tests/test_dfel.cpp)
 target_link_libraries(hyphy_dfel_test PRIVATE hyphy3_core)
 add_test(NAME DirectionalFELTest COMMAND hyphy_dfel_test)
 
+add_executable(hyphy_mss_test tests/test_mss.cpp)
+target_link_libraries(hyphy_mss_test PRIVATE hyphy3_core)
+add_test(NAME MSSTest COMMAND hyphy_mss_test)
+
 add_executable(hyphy_ohmic_test tests/test_ohmic.cpp)
 target_link_libraries(hyphy_ohmic_test PRIVATE hyphy3_core)
 add_test(NAME OhmicTest COMMAND hyphy_ohmic_test)
@@ -257,6 +267,7 @@ add_executable(hyphy3
     src/apps/hyphy_gard.cpp
     src/apps/hyphy_slac.cpp
     src/apps/hyphy_dfel.cpp
+    src/apps/hyphy_mss.cpp
     src/apps/hyphy_ohmic.cpp
     src/apps/hyphy_tree.cpp
     src/apps/hyphy_report.cpp
@@ -298,6 +309,9 @@ target_link_libraries(hyphy3-slac PRIVATE hyphy3_report)
 add_executable(hyphy3-dfel src/apps/hyphy_dfel.cpp)
 target_link_libraries(hyphy3-dfel PRIVATE hyphy3_report)
 
+add_executable(hyphy3-mss src/apps/hyphy_mss.cpp)
+target_link_libraries(hyphy3-mss PRIVATE hyphy3_report)
+
 add_executable(hyphy3-ohmic src/apps/hyphy_ohmic.cpp)
 target_link_libraries(hyphy3-ohmic PRIVATE hyphy3_report)
 
@@ -316,6 +330,7 @@ add_executable(hyphy-prime ALIAS hyphy3-prime)
 add_executable(hyphy-gard ALIAS hyphy3-gard)
 add_executable(hyphy-slac ALIAS hyphy3-slac)
 add_executable(hyphy-dfel ALIAS hyphy3-dfel)
+add_executable(hyphy-mss ALIAS hyphy3-mss)
 add_executable(hyphy-ohmic ALIAS hyphy3-ohmic)
 add_executable(hyphy-tree ALIAS hyphy3-tree)
 

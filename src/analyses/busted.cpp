@@ -28,12 +28,20 @@ nlohmann::json BUSTEDAnalyzer::to_legacy_json(const BUSTEDResult& res) const {
             {"version", "4.7-next"},
             {"settings", {
                 {"error-sink", res.settings.error_sink ? 1 : 0},
-                {"mss", "No"},
+                {"mss", res.settings.mss_type.empty() ? "No" : res.settings.mss_type},
                 {"multiple-hit", res.settings.multiple_hits},
                 {"srv", (!res.unconstrained.test_distribution.syn_rates.empty() && res.unconstrained.test_distribution.syn_rates.size() > 1) ? "Yes" : "No"},
                 {"optimal_k", res.optimal_k}
             }}
         };
+        if (!res.mss_rates.empty()) {
+            nlohmann::json mss_block = nlohmann::json::object();
+            for (const auto& r : res.mss_rates) {
+                mss_block[r.class_name] = r.rate;
+            }
+            j["analysis"]["settings"]["mss_rates"] = mss_block;
+            j["analysis"]["settings"]["mss_normalization"] = res.settings.mss_normalization;
+        }
 
         j["test results"] = {
             {"LRT", res.lrt},
@@ -312,6 +320,11 @@ nlohmann::json BUSTEDAnalyzer::to_modern_json(const BUSTEDResult& res, const Pro
         if (res.settings.error_sink) {
             json_settings["error_sink_max_weight"] = res.settings.error_sink_max_weight;
             json_settings["error_sink_bf_threshold"] = res.settings.error_sink_bf_threshold;
+        }
+        if (!res.settings.mss_type.empty()) {
+            json_settings["mss_type"] = res.settings.mss_type;
+            json_settings["mss_neutral"] = res.settings.mss_neutral;
+            json_settings["mss_normalization"] = res.settings.mss_normalization;
         }
 
         AnalysisMetadata meta{
@@ -622,6 +635,19 @@ nlohmann::json BUSTEDAnalyzer::to_modern_json(const BUSTEDResult& res, const Pro
                 {"flagged_branch_sites_count", static_cast<int>(res.flagged_error_events.size())},
                 {"flagged_branch_sites", flagged}
             };
+        }
+
+        if (!res.mss_rates.empty()) {
+            nlohmann::json mss_arr = nlohmann::json::array();
+            for (const auto& r : res.mss_rates) {
+                mss_arr.push_back({
+                    {"name", r.class_name},
+                    {"rate", finite_or_null(r.rate)},
+                    {"pair_count", static_cast<int>(r.num_pairs)},
+                    {"is_reference", r.is_reference}
+                });
+            }
+            j["mss_rates"] = mss_arr;
         }
 
         // Site results (columnar; ColumnarResults enforces equal-length)

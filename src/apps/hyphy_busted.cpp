@@ -55,6 +55,9 @@ static void print_usage(const char* prog, bool ph_mode = false) {
               << "  " << Console::brand("--rates") << " <N>          Number of omega rate categories (default: 3)\n"
               << "  " << Console::brand("--srv") << "                Enable synonymous rate variation across sites (BUSTED-S)\n"
               << "  " << Console::brand("--syn-rates") << " <N>      Number of synonymous rate categories (default: 3)\n"
+              << "  " << Console::brand("--mss") << " <type|tsv>     Multi-class Synonymous Substitutions: SynREV, SynREVCodon, SynREV2, SynREV2g, or TSV path\n"
+              << "  " << Console::brand("--mss-neutral") << " <cls>  Neutral reference class for MSS (fixed at alpha = 1.0)\n"
+              << "  " << Console::brand("--mss-norm") << " <mode>    MSS normalization: flux (default), unweighted, neutral_ref\n"
               << "  " << Console::brand("--auto-k") << "             Automatically select optimal K via AICc step-up\n"
               << "  " << Console::brand("--multiple-hits") << " <M>  Multi-nucleotide substitutions: None (default), Double, Double+Triple\n"
               << "  " << Console::brand("--error-sink") << "          Enable non-evolutionary saturation error sink class (BUSTED-E)\n"
@@ -112,6 +115,12 @@ int run_busted(int argc, char* argv[]) {
         } else if (arg == "--syn-rates" && i + 1 < argc) {
             settings.srv = true;
             settings.num_syn_rate_classes = std::stoul(argv[++i]);
+        } else if ((arg == "--mss" || arg == "--mss-type" || arg == "--syn-model") && i + 1 < argc) {
+            settings.mss_type = argv[++i];
+        } else if ((arg == "--mss-neutral" || arg == "--neutral") && i + 1 < argc) {
+            settings.mss_neutral = argv[++i];
+        } else if ((arg == "--mss-norm" || arg == "--mss-normalization") && i + 1 < argc) {
+            settings.mss_normalization = argv[++i];
         } else if (arg == "--auto-k") {
             settings.auto_select_k = true;
         } else if (arg == "--multiple-hits" && i + 1 < argc) {
@@ -200,6 +209,7 @@ int run_busted(int argc, char* argv[]) {
         {"Analysis Mode", settings.phenotype_mode ? (settings.include_relax_in_ph ? "BUSTED-PH + RELAX (UIT on FG/Diff + AIC-c BG + Coupled-k RELAX)" : "BUSTED-PH (UIT on FG/Diff + AIC-c BG Screen)") : (settings.relax_mode ? "BUSTED + Coupled-k RELAX" : (settings.full_auto ? "Full-Auto (4-Gate Surprisal & Score Screen)" : "Standard BUSTED"))},
         {"Rate Classes (K)", settings.full_auto ? "Auto (2..3)" : (std::to_string(settings.num_rate_classes) + (settings.auto_select_k ? " (Auto-K enabled)" : ""))},
         {"Synonymous Variation", settings.full_auto ? "Auto" : (settings.srv ? "Enabled (" + std::to_string(settings.num_syn_rate_classes) + " classes)" : "Disabled")},
+        {"Synonymous Classes (MSS)", settings.mss_type.empty() ? "Disabled (standard MG94)" : (settings.mss_type + " [norm=" + settings.mss_normalization + "]")},
         {"Multiple Hits", settings.full_auto ? "Auto" : settings.multiple_hits},
         {"Error Sink (BUSTED-E)", settings.full_auto ? "Auto" : (settings.error_sink ? "Enabled (Saturation Replacement Kernel)" : "Disabled")},
         {"Genetic Code", code->name}
@@ -328,6 +338,27 @@ int run_busted(int argc, char* argv[]) {
                       << res.unconstrained.test_distribution.syn_rates[m]
                       << " (weight = " << res.unconstrained.test_distribution.syn_weights[m] << ")\n";
         }
+        std::cout << "\n";
+    }
+
+    if (!res.mss_rates.empty()) {
+        std::cout << Console::bold("  Multi-class Synonymous Substitution Rates (MSS: " + res.settings.mss_type + "):") << "\n\n";
+        Table mss_table;
+        mss_table.add_column("Synonymous Class", Table::Align::Left, 24);
+        mss_table.add_column("Pairs", Table::Align::Right, 8);
+        mss_table.add_column("Rate (alpha_c)", Table::Align::Right, 16);
+        mss_table.add_column("Role", Table::Align::Left, 16);
+        for (const auto& r : res.mss_rates) {
+            std::ostringstream rate_ss;
+            rate_ss << std::fixed << std::setprecision(4) << r.rate;
+            mss_table.add_row({
+                r.class_name,
+                std::to_string(r.num_pairs),
+                rate_ss.str(),
+                r.is_reference ? "Reference (1.0)" : "MLE"
+            });
+        }
+        mss_table.print();
         std::cout << "\n";
     }
 

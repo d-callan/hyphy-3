@@ -10,6 +10,7 @@
 #include "hyphy/core/json_output.hpp"
 #include "hyphy/core/stats.hpp"
 #include "hyphy/analyses/busted_types.hpp"
+#include "hyphy/analyses/mss.hpp"
 #include "hyphy/analyses/fel.hpp"
 #include "hyphy/core/progress_bar.hpp"
 #include "hyphy/opt/nelder_mead.hpp"
@@ -40,7 +41,8 @@ public:
     Tree tree;
     Alignment aln;
     std::shared_ptr<const GeneticCode> code;
-    MG94Parameters base_params;
+    mutable MG94Parameters base_params;
+    mutable std::vector<Scalar> syn_pair_rates_storage; // Optional S*S flat array for BUSTED-MSS
 
     // Relative branch lengths tau_b (normalized from MG94 baseline)
     std::vector<Scalar> branch_tau;
@@ -4055,6 +4057,55 @@ public:
         }
 
         BUSTEDResult res;
+        if (!settings.mss_type.empty() && MSSPartition::to_upper(settings.mss_type) != "NONE" && MSSPartition::to_upper(settings.mss_type) != "NO") {
+            MSSPartition mss_part = MSSPartition::build(settings.mss_type, *code, settings.mss_neutral);
+            MSSAnalyzer mss_helper(code);
+            MSSAnalyzer::GeneContext gctx;
+            gctx.filepath = "";
+            gctx.aln = aln;
+            gctx.tree = tree;
+            gctx.leaf_to_taxon = leaf_to_taxon;
+            gctx.gtr_params = gtr_rates;
+            gctx.gtr_log_l = gtr_log_l;
+            gctx.mg94_params = base_params;
+            gctx.mg94_params.syn_pair_rates = nullptr;
+            gctx.mg94_log_l = mg94_log_l;
+            gctx.mg94_omega = mg94_omega;
+            gctx.omega = mg94_omega;
+            gctx.tree_scaler = 1.0;
+            gctx.branch_tau = branch_tau;
+            mss_helper.genes.push_back(std::move(gctx));
+
+            MSSNormalization norm = MSSNormalization::Flux;
+            std::string unorm = MSSPartition::to_upper(settings.mss_normalization);
+            if (unorm == "UNWEIGHTED") norm = MSSNormalization::Unweighted;
+            else if (unorm == "NEUTRAL_REF" || unorm == "NEUTRAL" || mss_part.neutral_class_id >= 0) norm = MSSNormalization::NeutralRef;
+
+            std::vector<Scalar> class_rates(mss_part.num_classes(), 1.0);
+            std::vector<Scalar> g_scalers = {1.0};
+            std::vector<Scalar> g_omegas = {mg94_omega};
+            mss_helper.fit_partition(mss_part, norm, class_rates, g_scalers, g_omegas, false, 3);
+
+            syn_pair_rates_storage = mss_part.expand_to_matrix(code->num_sense_codons, class_rates);
+            base_params.syn_pair_rates = &syn_pair_rates_storage;
+
+            std::vector<size_t> pair_counts(mss_part.num_classes(), 0);
+            for (const auto& sp : mss_part.pairs) {
+                if (sp.class_id >= 0 && static_cast<size_t>(sp.class_id) < pair_counts.size()) {
+                    pair_counts[sp.class_id]++;
+                }
+            }
+            for (size_t k = 0; k < mss_part.num_classes(); ++k) {
+                BUSTEDMSSClassRate cr;
+                cr.class_name = mss_part.class_names[k];
+                cr.rate = class_rates[k];
+                cr.num_pairs = pair_counts[k];
+                cr.is_reference = (norm == MSSNormalization::NeutralRef && static_cast<int>(k) == mss_part.neutral_class_id);
+                res.mss_rates.push_back(std::move(cr));
+            }
+        } else {
+            base_params.syn_pair_rates = nullptr;
+        }
         if (settings.full_auto) {
             res.auto_diagnostics = diagnose_and_select_model(settings);
         }

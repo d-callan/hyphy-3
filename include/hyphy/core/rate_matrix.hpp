@@ -112,6 +112,7 @@ struct MG94Parameters {
     // theta_AG = 1.0 reference
     Scalar delta = 0.0; // Double-hit rate parameter (default 0.0 = disabled)
     Scalar psi = 0.0;   // Triple-hit rate parameter (default 0.0 = disabled)
+    const std::vector<Scalar>* syn_pair_rates = nullptr; // Optional S*S flat array of relative synonymous exchangeabilities
 };
 
 class MG94Matrix {
@@ -184,12 +185,18 @@ public:
         Q.resize(S, S);
         Q.setZero();
 
+        const bool has_mss = (params.syn_pair_rates != nullptr &&
+                              params.syn_pair_rates->size() >= static_cast<size_t>(S * S));
+
         for (int i = 0; i < S; ++i) {
             for (int j = 0; j < S; ++j) {
                 if (i == j) continue;
                 const auto& diff = code.diff_matrix[i][j];
                 Scalar rate_modifier = diff.synonymous ? params.alpha : params.beta;
                 if (diff.num_diffs == 1) {
+                    if (diff.synonymous && has_mss) {
+                        rate_modifier *= (*params.syn_pair_rates)[i * S + j];
+                    }
                     Scalar nuc_rate = r_nuc[diff.diff_from[0]][diff.diff_to[0]];
                     Scalar target_nuc_freq = pos_nuc_freqs(diff.diff_pos[0], diff.diff_to[0]);
                     Q(i, j) = rate_modifier * nuc_rate * target_nuc_freq;
