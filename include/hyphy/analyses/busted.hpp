@@ -180,9 +180,8 @@ public:
         base_p.theta_GT = gtr_res.params.theta_GT;
 
         MG94Fitter mg_fitter(gtr_res.tree, aln);
-        auto mg_res = mg_fitter.fit_omega_and_scale(1.0, base_p);
-        base_p.alpha = 1.0;
-        base_p.beta = mg_res.x_opt(0);
+        auto mg_res = mg_fitter.fit_full_model(1.0, base_p, nullptr, 35, 1e-4);
+        base_p = mg_res.params;
 
         BUSTEDAnalyzer analyzer(mg_res.tree, std::move(aln), base_p);
         analyzer.has_gtr_fit = true;
@@ -196,7 +195,7 @@ public:
         }
 
         analyzer.mg94_log_l = mg_res.log_likelihood;
-        analyzer.mg94_omega = mg_res.x_opt(0);
+        analyzer.mg94_omega = mg_res.params.beta;
         return analyzer;
     }
 
@@ -447,36 +446,56 @@ public:
             #pragma omp for schedule(dynamic)
             for (size_t p = 0; p < num_patterns; ++p) {
                 const auto& pattern = aln.patterns[p];
-                Scalar pat_L = 0.0;
                 std::vector<LikelihoodEngine::InsideOutsideResult> io_m(M);
-
+                Scalar max_ll = -std::numeric_limits<Scalar>::infinity();
                 for (size_t m = 0; m < M; ++m) {
+                    if (syn_weights[m] <= 1e-12) continue;
                     io_m[m] = LikelihoodEngine::compute_inside_outside(
                         tree, pattern, leaf_to_taxon, P_mix[m], aln.codon_frequencies_f3x4, S
                     );
-                    pat_L += syn_weights[m] * io_m[m].likelihood;
+                    if (io_m[m].likelihood > 0.0) {
+                        Scalar term = std::log(syn_weights[m]) + io_m[m].log_likelihood;
+                        if (term > max_ll) max_ll = term;
+                    }
                 }
 
-                if (pat_L > 0.0) {
-                    Scalar inv_L = pattern.weight / pat_L;
-                    for (const auto& node : tree.nodes) {
-                        if (node.id != tree.root_id && is_test_branch[node.id]) {
-                            int nid = node.id;
-                            for (size_t k = 0; k < K; ++k) {
-                                Scalar num = 0.0;
-                                for (size_t m = 0; m < M; ++m) {
-                                    num += syn_weights[m] * io_m[m].V[nid].dot(P_comp[m][k][nid] * io_m[m].D[nid]);
+                if (max_ll > -1e19) {
+                    Scalar sum_exp = 0.0;
+                    std::vector<Scalar> post_m(M, 0.0);
+                    for (size_t m = 0; m < M; ++m) {
+                        if (syn_weights[m] > 1e-12 && io_m[m].likelihood > 0.0) {
+                            Scalar e = std::exp(std::log(syn_weights[m]) + io_m[m].log_likelihood - max_ll);
+                            post_m[m] = e;
+                            sum_exp += e;
+                        }
+                    }
+                    if (sum_exp > 0.0) {
+                        Scalar inv_sum = 1.0 / sum_exp;
+                        for (size_t m = 0; m < M; ++m) post_m[m] *= inv_sum;
+
+                        for (const auto& node : tree.nodes) {
+                            if (node.id != tree.root_id && is_test_branch[node.id]) {
+                                int nid = node.id;
+                                for (size_t k = 0; k < K; ++k) {
+                                    Scalar ratio_k = 0.0;
+                                    for (size_t m = 0; m < M; ++m) {
+                                        if (post_m[m] > 1e-12 && io_m[m].likelihood > 0.0) {
+                                            ratio_k += post_m[m] * (io_m[m].V[nid].dot(P_comp[m][k][nid] * io_m[m].D[nid]) / io_m[m].likelihood);
+                                        }
+                                    }
+                                    local_accum(k) += pattern.weight * (bio_scale * weights[k]) * ratio_k;
                                 }
-                                local_accum(k) += (bio_scale * weights[k]) * inv_L * num;
-                            }
-                            if (out_new_eps_sink != nullptr) {
-                                Scalar sink_num = 0.0;
-                                for (size_t m = 0; m < M; ++m) {
-                                    sink_num += syn_weights[m] * eval_sink_bilinear(io_m[m].V[nid], io_m[m].D[nid]);
+                                if (out_new_eps_sink != nullptr) {
+                                    Scalar sink_ratio = 0.0;
+                                    for (size_t m = 0; m < M; ++m) {
+                                        if (post_m[m] > 1e-12 && io_m[m].likelihood > 0.0) {
+                                            sink_ratio += post_m[m] * (eval_sink_bilinear(io_m[m].V[nid], io_m[m].D[nid]) / io_m[m].likelihood);
+                                        }
+                                    }
+                                    local_sink_accum += pattern.weight * eps_sink * sink_ratio;
                                 }
-                                local_sink_accum += eps_sink * inv_L * sink_num;
+                                local_pat_wt += pattern.weight;
                             }
-                            local_pat_wt += pattern.weight;
                         }
                     }
                 }
@@ -512,7 +531,7 @@ public:
         return new_weights;
     }
 
-    // Expectation Step: Computes new synonymous rate weights via site posteriors
+    // Expectation Step: Computes new synonymous rate weights via site posteriors (with log-underflow scaling)
     std::vector<Scalar> compute_expected_syn_weights(
         Scalar s,
         const std::vector<Scalar>& omegas,
@@ -542,6 +561,16 @@ public:
             p.psi = psi;
             mg[k].update(p, aln.pos_nuc_frequencies, aln.codon_frequencies_f3x4, *code);
         }
+        bool has_bg = (num_test_branches + 1 < num_nodes);
+        MG94Matrix mg_bg;
+        if (has_bg) {
+            MG94Parameters p_bg = base_params;
+            p_bg.alpha = 1.0;
+            p_bg.beta = mg94_omega;
+            p_bg.delta = delta;
+            p_bg.psi = psi;
+            mg_bg.update(p_bg, aln.pos_nuc_frequencies, aln.codon_frequencies_f3x4, *code);
+        }
 
         std::vector<std::vector<Matrix>> P_mix(M, std::vector<Matrix>(num_nodes));
         for (size_t m = 0; m < M; ++m) {
@@ -549,13 +578,17 @@ public:
             for (const auto& node : tree.nodes) {
                 if (node.id != tree.root_id) {
                     Scalar bl = custom_branch_lengths ? (*custom_branch_lengths)[node.id] : (s * branch_tau[node.id]);
-                    P_mix[m][node.id] = Matrix::Zero(S, S);
-                    Scalar use_bio = (eps_sink > 0.0 && is_test_branch[node.id]) ? bio_scale : 1.0;
-                    for (size_t k = 0; k < K; ++k) {
-                        P_mix[m][node.id] += (use_bio * weights[k]) * mg[k].transition_matrix(alpha_m * bl);
-                    }
-                    if (eps_sink > 0.0 && is_test_branch[node.id]) {
-                        P_mix[m][node.id].noalias() += eps_sink * P_sink;
+                    if (is_test_branch[node.id]) {
+                        P_mix[m][node.id] = Matrix::Zero(S, S);
+                        Scalar use_bio = (eps_sink > 0.0) ? bio_scale : 1.0;
+                        for (size_t k = 0; k < K; ++k) {
+                            P_mix[m][node.id] += (use_bio * weights[k]) * mg[k].transition_matrix(alpha_m * bl);
+                        }
+                        if (eps_sink > 0.0) {
+                            P_mix[m][node.id].noalias() += eps_sink * P_sink;
+                        }
+                    } else {
+                        P_mix[m][node.id] = mg_bg.transition_matrix(alpha_m * bl);
                     }
                 }
             }
@@ -569,14 +602,17 @@ public:
             Vector local_accum = Vector::Zero(M);
             Scalar local_pat_wt = 0.0;
             std::vector<Vector> node_L(num_nodes, Vector::Zero(S));
+            std::vector<double> node_log_scale(num_nodes, 0.0);
 
             #pragma omp for schedule(dynamic)
             for (size_t p = 0; p < num_patterns; ++p) {
                 const auto& pattern = aln.patterns[p];
-                Scalar pat_L = 0.0;
-                std::vector<Scalar> cond_L(M, 0.0);
+                Scalar max_term = -std::numeric_limits<Scalar>::infinity();
+                std::vector<Scalar> terms(M, -std::numeric_limits<Scalar>::infinity());
+                std::vector<bool> valid(M, false);
 
                 for (size_t m = 0; m < M; ++m) {
+                    if (syn_weights[m] <= 1e-12) continue;
                     for (int32_t node_id : tree.post_order) {
                         const auto& node = tree.nodes[node_id];
                         if (node.is_leaf) {
@@ -592,24 +628,37 @@ public:
                             } else {
                                 node_L[node_id].setOnes();
                             }
+                            node_log_scale[node_id] = 0.0;
                         } else {
-                            node_L[node_id].setOnes();
-                            for (int32_t child_id : node.children) {
-                                Vector child_msg = P_mix[m][child_id] * node_L[child_id];
-                                node_L[node_id] = node_L[node_id].cwiseProduct(child_msg);
-                            }
+                            double child_scale_sum = 0.0;
+                            tree.eval_internal_node(node_id, P_mix[m], node_L, node_log_scale, node_L[node_id], child_scale_sum);
+                            node_log_scale[node_id] = child_scale_sum;
                         }
                     }
-                    cond_L[m] = aln.codon_frequencies_f3x4.dot(node_L[tree.root_id]);
-                    pat_L += syn_weights[m] * cond_L[m];
+                    Scalar cond_L = aln.codon_frequencies_f3x4.dot(node_L[tree.root_id]);
+                    if (cond_L > 0.0) {
+                        Scalar term = std::log(syn_weights[m]) + std::log(cond_L) + node_log_scale[tree.root_id];
+                        terms[m] = term;
+                        valid[m] = true;
+                        if (term > max_term) max_term = term;
+                    }
                 }
 
-                if (pat_L > 0.0) {
+                if (max_term > -1e19) {
+                    Scalar sum_exp = 0.0;
+                    std::vector<Scalar> rho(M, 0.0);
                     for (size_t m = 0; m < M; ++m) {
-                        Scalar rho_m = (syn_weights[m] * cond_L[m]) / pat_L;
-                        local_accum(m) += pattern.weight * rho_m;
+                        if (valid[m]) {
+                            rho[m] = std::exp(terms[m] - max_term);
+                            sum_exp += rho[m];
+                        }
                     }
-                    local_pat_wt += pattern.weight;
+                    if (sum_exp > 0.0) {
+                        for (size_t m = 0; m < M; ++m) {
+                            local_accum(m) += pattern.weight * (rho[m] / sum_exp);
+                        }
+                        local_pat_wt += pattern.weight;
+                    }
                 }
             }
 
@@ -793,7 +842,7 @@ public:
         return {total_log_l, grad_b};
     }
 
-    // High-performance joint branch length refinement via exact Inside-Outside adjoint gradients and L-BFGS
+    // High-performance joint branch length refinement via exact Inside-Outside adjoint gradients and L-BFGS in log-branch-length space
     std::vector<Scalar> refine_branch_lengths(
         const std::vector<Scalar>& init_bl,
         const std::vector<Scalar>& omegas,
@@ -802,37 +851,57 @@ public:
         const std::vector<Scalar>& syn_weights = {1.0},
         Scalar delta = 0.0,
         Scalar psi = 0.0,
-        int max_iters = 10,
+        int max_iters = 25,
         Scalar eps_sink = 0.0
     ) const {
         size_t num_nodes = tree.num_nodes();
         std::vector<Scalar> bl = init_bl;
+        std::vector<Scalar> log_bl(num_nodes, 0.0);
         for (size_t i = 0; i < num_nodes; ++i) {
             if (i != static_cast<size_t>(tree.root_id)) {
-                bl[i] = std::clamp(bl[i], 1e-4, 10.0);
+                bl[i] = std::clamp(bl[i], 1e-8, 10.0);
+                log_bl[i] = std::log(bl[i]);
             }
         }
 
-        // L-BFGS state
-        const size_t m_history = 5;
+        // L-BFGS state in log-branch-length space y_i = log(t_i), where d ln L / d y_i = t_i * (d ln L / d t_i)
+        const size_t m_history = 8;
         std::vector<std::vector<Scalar>> s_hist;
         std::vector<std::vector<Scalar>> y_hist;
         std::vector<Scalar> rho_hist;
 
-        auto [curr_ll, curr_grad] = compute_busted_branch_gradients(bl, omegas, weights, syn_rates, syn_weights, delta, psi, eps_sink);
+        auto eval_log_space = [&](const std::vector<Scalar>& y_vec) -> std::tuple<Scalar, std::vector<Scalar>, std::vector<Scalar>> {
+            std::vector<Scalar> cur_bl(num_nodes, 0.0);
+            for (size_t i = 0; i < num_nodes; ++i) {
+                if (i != static_cast<size_t>(tree.root_id)) {
+                    cur_bl[i] = std::exp(std::clamp(y_vec[i], -18.420680744, 2.302585093));
+                }
+            }
+            auto [ll, grad_t] = compute_busted_branch_gradients(cur_bl, omegas, weights, syn_rates, syn_weights, delta, psi, eps_sink);
+            std::vector<Scalar> grad_y(num_nodes, 0.0);
+            for (size_t i = 0; i < num_nodes; ++i) {
+                if (i != static_cast<size_t>(tree.root_id)) {
+                    grad_y[i] = cur_bl[i] * grad_t[i];
+                }
+            }
+            return {ll, grad_y, cur_bl};
+        };
+
+        auto [curr_ll, curr_grad, curr_bl] = eval_log_space(log_bl);
+        bl = curr_bl;
 
         Scalar best_ll = curr_ll;
         std::vector<Scalar> best_bl = bl;
 
         for (int iter = 0; iter < max_iters; ++iter) {
-            // Check convergence
+            // Check convergence in log-space gradient
             Scalar max_g = 0.0;
             for (size_t i = 0; i < num_nodes; ++i) {
                 if (i != static_cast<size_t>(tree.root_id)) {
                     max_g = std::max(max_g, std::abs(curr_grad[i]));
                 }
             }
-            if (max_g < 1e-3) break;
+            if (max_g < 1e-4) break;
 
             // Two-loop L-BFGS recursion to compute search direction d = H * grad
             std::vector<Scalar> q = curr_grad;
@@ -850,7 +919,7 @@ public:
             }
 
             // Initial Hessian scaling H0 = gamma * I
-            Scalar gamma = 1.0;
+            Scalar gamma = 0.25;
             if (!s_hist.empty()) {
                 Scalar s_dot_y = 0.0;
                 Scalar y_dot_y = 0.0;
@@ -861,7 +930,7 @@ public:
                     y_dot_y += y_last[i] * y_last[i];
                 }
                 if (y_dot_y > 1e-12) {
-                    gamma = std::clamp(s_dot_y / y_dot_y, 1e-4, 10.0);
+                    gamma = std::clamp(s_dot_y / y_dot_y, 1e-3, 5.0);
                 }
             }
 
@@ -906,31 +975,39 @@ public:
                 rho_hist.clear();
             }
 
-            // Backtracking Armijo line search with initial step size scaling
-            Scalar max_step = 0.0;
+            // Clamp per-branch log-step to [-1.2, +1.2] (at most ~3.3x multiplier per step) without throttling other branches!
             for (size_t i = 0; i < num_nodes; ++i) {
                 if (i != static_cast<size_t>(tree.root_id)) {
-                    max_step = std::max(max_step, std::abs(d[i]));
+                    d[i] = std::clamp(d[i], -1.2, 1.2);
                 }
             }
-            Scalar step_size = (max_step > 0.2) ? (0.2 / max_step) : 1.0;
-            std::vector<Scalar> new_bl(num_nodes);
+            dir_dot_grad = 0.0;
+            for (size_t i = 0; i < num_nodes; ++i) {
+                if (i != static_cast<size_t>(tree.root_id)) {
+                    dir_dot_grad += d[i] * curr_grad[i];
+                }
+            }
+
+            Scalar step_size = 1.0;
+            std::vector<Scalar> new_log_bl(num_nodes, 0.0);
+            std::vector<Scalar> new_bl(num_nodes, 0.0);
             Scalar new_ll = curr_ll;
             std::vector<Scalar> new_grad;
 
             bool line_search_ok = false;
-            for (int ls = 0; ls < 15; ++ls) {
+            for (int ls = 0; ls < 12; ++ls) {
                 for (size_t i = 0; i < num_nodes; ++i) {
                     if (i != static_cast<size_t>(tree.root_id)) {
-                        new_bl[i] = std::clamp(bl[i] + step_size * d[i], 1e-4, 10.0);
+                        new_log_bl[i] = std::clamp(log_bl[i] + step_size * d[i], -18.420680744, 2.302585093);
                     } else {
-                        new_bl[i] = 0.0;
+                        new_log_bl[i] = 0.0;
                     }
                 }
-                auto [test_ll, test_grad] = compute_busted_branch_gradients(new_bl, omegas, weights, syn_rates, syn_weights, delta, psi, eps_sink);
+                auto [test_ll, test_grad, test_bl] = eval_log_space(new_log_bl);
                 if (test_ll > curr_ll + 1e-4 * step_size * dir_dot_grad || (test_ll > curr_ll + 1e-5 && ls >= 3)) {
                     new_ll = test_ll;
                     new_grad = test_grad;
+                    new_bl = test_bl;
                     line_search_ok = true;
                     break;
                 }
@@ -941,12 +1018,12 @@ public:
                 break;
             }
 
-            // Update L-BFGS history
+            // Update L-BFGS history in log-branch-length space
             std::vector<Scalar> s_k(num_nodes);
             std::vector<Scalar> y_k(num_nodes);
             Scalar s_dot_y = 0.0;
             for (size_t i = 0; i < num_nodes; ++i) {
-                s_k[i] = new_bl[i] - bl[i];
+                s_k[i] = new_log_bl[i] - log_bl[i];
                 y_k[i] = curr_grad[i] - new_grad[i]; // for maximization
                 s_dot_y += s_k[i] * y_k[i];
             }
@@ -962,6 +1039,7 @@ public:
                 rho_hist.push_back(1.0 / s_dot_y);
             }
 
+            log_bl = new_log_bl;
             bl = new_bl;
             curr_ll = new_ll;
             curr_grad = new_grad;
@@ -986,7 +1064,8 @@ public:
         ProgressBar* pbar = nullptr,
         const std::string& model_desc = "",
         bool use_error_sink = false,
-        Scalar max_eps_sink = 0.01
+        Scalar max_eps_sink = 0.01,
+        const BUSTEDFit* warm_start_fit = nullptr
     ) const {
         BUSTEDFit fit;
         fit.num_rate_classes = K;
@@ -1007,8 +1086,19 @@ public:
             syn_rates = {0.35, 1.65};
             syn_weights = {0.50, 0.50};
         } else if (srv && M == 3) {
-            syn_rates = {0.20, 0.60, 2.20};
-            syn_weights = {1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0};
+            syn_rates = {0.30, 1.00, 3.10};
+            syn_weights = {0.30, 0.60, 0.10};
+        }
+        if (warm_start_fit && srv && warm_start_fit->test_distribution.syn_rates.size() == M &&
+            warm_start_fit->test_distribution.syn_weights.size() == M) {
+            syn_rates = warm_start_fit->test_distribution.syn_rates;
+            syn_weights = warm_start_fit->test_distribution.syn_weights;
+        }
+
+        const std::vector<Scalar>* ecm_bl_ptr = nullptr;
+        if (warm_start_fit && !warm_start_fit->branch_lengths.empty()) {
+            ecm_bl_ptr = &warm_start_fit->branch_lengths;
+            s = 1.0;
         }
 
         // Initialize rates and weights
@@ -1019,11 +1109,34 @@ public:
             weights[0] = 1.0;
             omegas[0] = is_constrained ? std::min(0.5, mg94_omega) : mg94_omega;
         } else if (K == 2) {
-            weights = {0.75, 0.25};
+            std::vector<std::pair<std::vector<Scalar>, std::vector<Scalar>>> candidates;
             if (is_constrained) {
-                omegas = {0.10, 1.0};
+                candidates = {
+                    {{0.10, 1.0}, {0.75, 0.25}},
+                    {{0.02, 1.0}, {0.85, 0.15}},
+                    {{0.25, 1.0}, {0.60, 0.40}}
+                };
             } else {
-                omegas = {0.10, 3.0};
+                candidates = {
+                    {{0.10, 3.0}, {0.75, 0.25}},
+                    {{0.02, 4.5}, {0.90, 0.10}},
+                    {{0.05, 2.0}, {0.80, 0.20}}
+                };
+                if (warm_start_fit && warm_start_fit->test_distribution.omegas.size() == 2) {
+                    Scalar w0 = warm_start_fit->test_distribution.omegas[0];
+                    Scalar p0 = std::clamp(warm_start_fit->test_distribution.weights[0], 0.05, 0.95);
+                    candidates.push_back({{w0, 2.5}, {p0, 1.0 - p0}});
+                    candidates.push_back({{w0, 5.0}, {std::max(0.5, p0), 1.0 - std::max(0.5, p0)}});
+                }
+            }
+            Scalar best_start_ll = -1e20;
+            for (const auto& [cand_o, cand_w] : candidates) {
+                Scalar ll = evaluate_log_l(s, cand_o, cand_w, syn_rates, syn_weights, ecm_bl_ptr, nullptr, delta, psi, eps_sink);
+                if (ll > best_start_ll) {
+                    best_start_ll = ll;
+                    omegas = cand_o;
+                    weights = cand_w;
+                }
             }
         } else {
             // Default K = 3: evaluate grid of candidate distributions to seed ECM in best global basin
@@ -1036,7 +1149,7 @@ public:
                 };
                 Scalar best_start_ll = -1e20;
                 for (const auto& [cand_o, cand_w] : candidates) {
-                    Scalar ll = evaluate_log_l(s, cand_o, cand_w, syn_rates, syn_weights, nullptr, nullptr, delta, psi, eps_sink);
+                    Scalar ll = evaluate_log_l(s, cand_o, cand_w, syn_rates, syn_weights, ecm_bl_ptr, nullptr, delta, psi, eps_sink);
                     if (ll > best_start_ll) {
                         best_start_ll = ll;
                         omegas = cand_o;
@@ -1052,9 +1165,19 @@ public:
                     {{0.10, 0.90, 5.0}, {0.30, 0.40, 0.30}},
                     {{0.005, 0.10, 1.8}, {0.45, 0.15, 0.40}}
                 };
+                if (warm_start_fit && warm_start_fit->test_distribution.omegas.size() == 3) {
+                    const auto& co = warm_start_fit->test_distribution.omegas;
+                    const auto& cw = warm_start_fit->test_distribution.weights;
+                    Scalar p2 = std::max(0.05, cw[2] * 0.5);
+                    Scalar p0 = std::clamp(cw[0], 0.02, 0.90);
+                    Scalar p1 = std::max(0.02, 1.0 - p0 - p2);
+                    Scalar sum_p = p0 + p1 + p2;
+                    candidates.push_back({{co[0], std::min(0.95, std::max(co[0] + 0.01, co[1])), 2.0}, {p0 / sum_p, p1 / sum_p, p2 / sum_p}});
+                    candidates.push_back({{co[0], 1.0, 2.5}, {p0 / sum_p, p1 / sum_p, p2 / sum_p}});
+                }
                 Scalar best_start_ll = -1e20;
                 for (const auto& [cand_o, cand_w] : candidates) {
-                    Scalar ll = evaluate_log_l(s, cand_o, cand_w, syn_rates, syn_weights, nullptr, nullptr, delta, psi, eps_sink);
+                    Scalar ll = evaluate_log_l(s, cand_o, cand_w, syn_rates, syn_weights, ecm_bl_ptr, nullptr, delta, psi, eps_sink);
                     if (ll > best_start_ll) {
                         best_start_ll = ll;
                         omegas = cand_o;
@@ -1070,7 +1193,7 @@ public:
             std::vector<Scalar> p_cands = allow_triple ? std::vector<Scalar>{0.0, 0.02, 0.05} : std::vector<Scalar>{0.0};
             for (Scalar d_c : d_cands) {
                 for (Scalar p_c : p_cands) {
-                    Scalar cand_ll = evaluate_log_l(s, omegas, weights, syn_rates, syn_weights, nullptr, nullptr, d_c, p_c, eps_sink);
+                    Scalar cand_ll = evaluate_log_l(s, omegas, weights, syn_rates, syn_weights, ecm_bl_ptr, nullptr, d_c, p_c, eps_sink);
                     if (cand_ll > best_grid_ll) {
                         best_grid_ll = cand_ll;
                         delta = d_c;
@@ -1087,15 +1210,15 @@ public:
 
             // Block 1: SQUAREM acceleration for omega weights (and penalized EM update for eps_sink)
             if (K == 1 && use_error_sink) {
-                weights = compute_expected_weights(s, omegas, weights, syn_rates, syn_weights, nullptr, delta, psi, eps_sink, eps_ptr, max_eps_sink);
+                weights = compute_expected_weights(s, omegas, weights, syn_rates, syn_weights, ecm_bl_ptr, delta, psi, eps_sink, eps_ptr, max_eps_sink);
             } else if (K == 2) {
                 for (int sq = 0; sq < 2; ++sq) {
                     Scalar eps0 = eps_sink;
                     auto w0 = weights;
                     Scalar eps1 = eps0;
-                    auto w1 = compute_expected_weights(s, omegas, w0, syn_rates, syn_weights, nullptr, delta, psi, eps0, use_error_sink ? &eps1 : nullptr, max_eps_sink);
+                    auto w1 = compute_expected_weights(s, omegas, w0, syn_rates, syn_weights, ecm_bl_ptr, delta, psi, eps0, use_error_sink ? &eps1 : nullptr, max_eps_sink);
                     Scalar eps2 = eps1;
-                    auto w2 = compute_expected_weights(s, omegas, w1, syn_rates, syn_weights, nullptr, delta, psi, eps1, use_error_sink ? &eps2 : nullptr, max_eps_sink);
+                    auto w2 = compute_expected_weights(s, omegas, w1, syn_rates, syn_weights, ecm_bl_ptr, delta, psi, eps1, use_error_sink ? &eps2 : nullptr, max_eps_sink);
                     eps_sink = eps2;
                     Scalar r = w1[0] - w0[0];
                     Scalar v = (w2[0] - w1[0]) - r;
@@ -1104,9 +1227,9 @@ public:
                         Scalar p_acc = std::clamp(w0[0] - 2.0 * step * r + step * step * v, 1e-5, 1.0 - 1e-5);
                         std::vector<Scalar> w_acc = {p_acc, 1.0 - p_acc};
                         Scalar eps_stab = eps_sink;
-                        auto w_stab = compute_expected_weights(s, omegas, w_acc, syn_rates, syn_weights, nullptr, delta, psi, eps_sink, use_error_sink ? &eps_stab : nullptr, max_eps_sink);
-                        if (evaluate_log_l(s, omegas, w_stab, syn_rates, syn_weights, nullptr, nullptr, delta, psi, eps_stab) >=
-                            evaluate_log_l(s, omegas, w2, syn_rates, syn_weights, nullptr, nullptr, delta, psi, eps2)) {
+                        auto w_stab = compute_expected_weights(s, omegas, w_acc, syn_rates, syn_weights, ecm_bl_ptr, delta, psi, eps_sink, use_error_sink ? &eps_stab : nullptr, max_eps_sink);
+                        if (evaluate_log_l(s, omegas, w_stab, syn_rates, syn_weights, ecm_bl_ptr, nullptr, delta, psi, eps_stab) >=
+                            evaluate_log_l(s, omegas, w2, syn_rates, syn_weights, ecm_bl_ptr, nullptr, delta, psi, eps2)) {
                             weights = w_stab;
                             eps_sink = eps_stab;
                         } else {
@@ -1121,9 +1244,9 @@ public:
                     Scalar eps0 = eps_sink;
                     auto w0 = weights;
                     Scalar eps1 = eps0;
-                    auto w1 = compute_expected_weights(s, omegas, w0, syn_rates, syn_weights, nullptr, delta, psi, eps0, use_error_sink ? &eps1 : nullptr, max_eps_sink);
+                    auto w1 = compute_expected_weights(s, omegas, w0, syn_rates, syn_weights, ecm_bl_ptr, delta, psi, eps0, use_error_sink ? &eps1 : nullptr, max_eps_sink);
                     Scalar eps2 = eps1;
-                    auto w2 = compute_expected_weights(s, omegas, w1, syn_rates, syn_weights, nullptr, delta, psi, eps1, use_error_sink ? &eps2 : nullptr, max_eps_sink);
+                    auto w2 = compute_expected_weights(s, omegas, w1, syn_rates, syn_weights, ecm_bl_ptr, delta, psi, eps1, use_error_sink ? &eps2 : nullptr, max_eps_sink);
                     eps_sink = eps2;
                     Scalar r0 = w1[0] - w0[0], r1 = w1[1] - w0[1];
                     Scalar v0 = (w2[0] - w1[0]) - r0, v1 = (w2[1] - w1[1]) - r1;
@@ -1141,9 +1264,9 @@ public:
                         Scalar p3_acc = 1.0 - p1_acc - p2_acc;
                         std::vector<Scalar> w_acc = {p1_acc, p2_acc, p3_acc};
                         Scalar eps_stab = eps_sink;
-                        auto w_stab = compute_expected_weights(s, omegas, w_acc, syn_rates, syn_weights, nullptr, delta, psi, eps_sink, use_error_sink ? &eps_stab : nullptr, max_eps_sink);
-                        if (evaluate_log_l(s, omegas, w_stab, syn_rates, syn_weights, nullptr, nullptr, delta, psi, eps_stab) >=
-                            evaluate_log_l(s, omegas, w2, syn_rates, syn_weights, nullptr, nullptr, delta, psi, eps2)) {
+                        auto w_stab = compute_expected_weights(s, omegas, w_acc, syn_rates, syn_weights, ecm_bl_ptr, delta, psi, eps_sink, use_error_sink ? &eps_stab : nullptr, max_eps_sink);
+                        if (evaluate_log_l(s, omegas, w_stab, syn_rates, syn_weights, ecm_bl_ptr, nullptr, delta, psi, eps_stab) >=
+                            evaluate_log_l(s, omegas, w2, syn_rates, syn_weights, ecm_bl_ptr, nullptr, delta, psi, eps2)) {
                             weights = w_stab;
                             eps_sink = eps_stab;
                         } else {
@@ -1159,8 +1282,8 @@ public:
             if (srv && M >= 2) {
                 for (int sq = 0; sq < 2; ++sq) {
                     auto q0 = syn_weights;
-                    auto q1 = compute_expected_syn_weights(s, omegas, weights, syn_rates, q0, nullptr, delta, psi, eps_sink);
-                    auto q2 = compute_expected_syn_weights(s, omegas, weights, syn_rates, q1, nullptr, delta, psi, eps_sink);
+                    auto q1 = compute_expected_syn_weights(s, omegas, weights, syn_rates, q0, ecm_bl_ptr, delta, psi, eps_sink);
+                    auto q2 = compute_expected_syn_weights(s, omegas, weights, syn_rates, q1, ecm_bl_ptr, delta, psi, eps_sink);
                     if (M == 2) {
                         Scalar r = q1[0] - q0[0];
                         Scalar v = (q2[0] - q1[0]) - r;
@@ -1168,9 +1291,9 @@ public:
                             Scalar step = -std::abs(r) / std::abs(v);
                             Scalar q_acc = std::clamp(q0[0] - 2.0 * step * r + step * step * v, 1e-5, 1.0 - 1e-5);
                             std::vector<Scalar> q_cand = {q_acc, 1.0 - q_acc};
-                            auto q_stab = compute_expected_syn_weights(s, omegas, weights, syn_rates, q_cand, nullptr, delta, psi, eps_sink);
-                            if (evaluate_log_l(s, omegas, weights, syn_rates, q_stab, nullptr, nullptr, delta, psi, eps_sink) >=
-                                evaluate_log_l(s, omegas, weights, syn_rates, q2, nullptr, nullptr, delta, psi, eps_sink)) {
+                            auto q_stab = compute_expected_syn_weights(s, omegas, weights, syn_rates, q_cand, ecm_bl_ptr, delta, psi, eps_sink);
+                            if (evaluate_log_l(s, omegas, weights, syn_rates, q_stab, ecm_bl_ptr, nullptr, delta, psi, eps_sink) >=
+                                evaluate_log_l(s, omegas, weights, syn_rates, q2, ecm_bl_ptr, nullptr, delta, psi, eps_sink)) {
                                 syn_weights = q_stab;
                             } else {
                                 syn_weights = q2;
@@ -1194,9 +1317,9 @@ public:
                             }
                             Scalar q3_acc = 1.0 - q1_acc - q2_acc;
                             std::vector<Scalar> q_cand = {q1_acc, q2_acc, q3_acc};
-                            auto q_stab = compute_expected_syn_weights(s, omegas, weights, syn_rates, q_cand, nullptr, delta, psi, eps_sink);
-                            if (evaluate_log_l(s, omegas, weights, syn_rates, q_stab, nullptr, nullptr, delta, psi, eps_sink) >=
-                                evaluate_log_l(s, omegas, weights, syn_rates, q2, nullptr, nullptr, delta, psi, eps_sink)) {
+                            auto q_stab = compute_expected_syn_weights(s, omegas, weights, syn_rates, q_cand, ecm_bl_ptr, delta, psi, eps_sink);
+                            if (evaluate_log_l(s, omegas, weights, syn_rates, q_stab, ecm_bl_ptr, nullptr, delta, psi, eps_sink) >=
+                                evaluate_log_l(s, omegas, weights, syn_rates, q2, ecm_bl_ptr, nullptr, delta, psi, eps_sink)) {
                                 syn_weights = q_stab;
                             } else {
                                 syn_weights = q2;
@@ -1214,22 +1337,22 @@ public:
             if (is_constrained) {
                 if (K == 1) {
                     auto opt = NelderMead2D::minimize([&](Scalar w1, Scalar s_c) {
-                        return -evaluate_log_l(s_c, {w1}, weights, syn_rates, syn_weights, nullptr, nullptr, delta, psi, eps_sink);
-                    }, omegas[0], s, 1e-4, 1.0, 1e-4, 40);
+                        return -evaluate_log_l(s_c, {w1}, weights, syn_rates, syn_weights, ecm_bl_ptr, nullptr, delta, psi, eps_sink);
+                    }, omegas[0], s, 0.0, 1.0, 1e-4, 40);
                     omegas[0] = opt.a;
                     s = opt.b;
                 } else if (K == 2) {
                     auto opt = NelderMead2D::minimize([&](Scalar w1, Scalar s_c) {
-                        return -evaluate_log_l(s_c, {w1, 1.0}, weights, syn_rates, syn_weights, nullptr, nullptr, delta, psi, eps_sink);
-                    }, omegas[0], s, 1e-4, 1.0, 1e-4, 40);
+                        return -evaluate_log_l(s_c, {w1, 1.0}, weights, syn_rates, syn_weights, ecm_bl_ptr, nullptr, delta, psi, eps_sink);
+                    }, omegas[0], s, 0.0, 1.0, 1e-4, 40);
                     omegas[0] = opt.a;
                     omegas[1] = 1.0;
                     s = opt.b;
                 } else if (K == 3) {
                     auto opt = NelderMeadND<3>::minimize([&](const std::array<Scalar, 3>& x) {
                         if (x[1] > x[2]) return 1e20;
-                        return -evaluate_log_l(x[0], {x[1], x[2], 1.0}, weights, syn_rates, syn_weights, nullptr, nullptr, delta, psi, eps_sink);
-                    }, {s, omegas[0], omegas[1]}, {0.01, 1e-4, 1e-4}, {50.0, 1.0, 1.0}, 1e-4, 40);
+                        return -evaluate_log_l(x[0], {x[1], x[2], 1.0}, weights, syn_rates, syn_weights, ecm_bl_ptr, nullptr, delta, psi, eps_sink);
+                    }, {s, omegas[0], omegas[1]}, {0.01, 0.0, 0.0}, {50.0, 1.0, 1.0}, 1e-4, 50);
                     s = opt.x[0];
                     omegas[0] = opt.x[1];
                     omegas[1] = opt.x[2];
@@ -1239,22 +1362,22 @@ public:
                 Scalar max_omega = use_error_sink ? 50.0 : 2000.0;
                 if (K == 1) {
                     auto opt = NelderMead2D::minimize([&](Scalar w1, Scalar s_c) {
-                        return -evaluate_log_l(s_c, {w1}, weights, syn_rates, syn_weights, nullptr, nullptr, delta, psi, eps_sink);
-                    }, omegas[0], s, 1e-4, max_omega, 1e-4, 40);
+                        return -evaluate_log_l(s_c, {w1}, weights, syn_rates, syn_weights, ecm_bl_ptr, nullptr, delta, psi, eps_sink);
+                    }, omegas[0], s, 0.0, max_omega, 1e-4, 40);
                     omegas[0] = opt.a;
                     s = opt.b;
                 } else if (K == 2) {
                     auto opt = NelderMeadND<3>::minimize([&](const std::array<Scalar, 3>& x) {
-                        return -evaluate_log_l(x[0], {x[1], x[2]}, weights, syn_rates, syn_weights, nullptr, nullptr, delta, psi, eps_sink);
-                    }, {s, omegas[0], omegas[1]}, {0.01, 1e-4, 1.0}, {50.0, 1.0, max_omega}, 1e-4, 50);
+                        return -evaluate_log_l(x[0], {x[1], x[2]}, weights, syn_rates, syn_weights, ecm_bl_ptr, nullptr, delta, psi, eps_sink);
+                    }, {s, omegas[0], omegas[1]}, {0.01, 0.0, 1.0}, {50.0, 1.0, max_omega}, 1e-4, 50);
                     s = opt.x[0];
                     omegas[0] = opt.x[1];
                     omegas[1] = opt.x[2];
                 } else if (K == 3) {
                     auto opt = NelderMeadND<4>::minimize([&](const std::array<Scalar, 4>& x) {
                         if (x[1] > x[2] || x[2] > x[3]) return 1e20;
-                        return -evaluate_log_l(x[0], {x[1], x[2], x[3]}, weights, syn_rates, syn_weights, nullptr, nullptr, delta, psi, eps_sink);
-                    }, {s, omegas[0], omegas[1], omegas[2]}, {0.01, 1e-4, 1e-4, 1.0}, {50.0, 1.0, max_omega, max_omega}, 1e-4, 80);
+                        return -evaluate_log_l(x[0], {x[1], x[2], x[3]}, weights, syn_rates, syn_weights, ecm_bl_ptr, nullptr, delta, psi, eps_sink);
+                    }, {s, omegas[0], omegas[1], omegas[2]}, {0.01, 0.0, 0.0, 1.0}, {50.0, 1.0, max_omega, max_omega}, 1e-4, 80);
                     s = opt.x[0];
                     omegas[0] = opt.x[1];
                     omegas[1] = opt.x[2];
@@ -1268,7 +1391,7 @@ public:
                     Scalar q1 = syn_weights[0], q2 = syn_weights[1];
                     Scalar a2 = (1.0 - q1 * a1) / q2;
                     if (a1 < 0.01 || a2 < a1 || a2 > 50.0) return 1e20;
-                    return -evaluate_log_l(s, omegas, weights, {a1, a2}, syn_weights, nullptr, nullptr, delta, psi, eps_sink);
+                    return -evaluate_log_l(s, omegas, weights, {a1, a2}, syn_weights, ecm_bl_ptr, nullptr, delta, psi, eps_sink);
                 }, syn_rates[0], 0.0, 0.01, 2.0, 1e-3, 25);
                 Scalar a1 = syn_opt.a;
                 Scalar a2 = (1.0 - syn_weights[0] * a1) / syn_weights[1];
@@ -1277,15 +1400,16 @@ public:
                     syn_rates[1] = a2;
                 }
             } else if (srv && M == 3) {
-                auto syn_opt = NelderMead2D::minimize([&](Scalar a1, Scalar a2) {
+                auto syn_opt = NelderMeadND<2>::minimize([&](const std::array<Scalar, 2>& x) {
+                    Scalar a1 = x[0], a2 = x[1];
                     Scalar q1 = syn_weights[0], q2 = syn_weights[1], q3 = syn_weights[2];
                     Scalar a3 = (1.0 - q1 * a1 - q2 * a2) / q3;
                     if (a1 < 0.01 || a2 < a1 || a3 < a2 || a3 > 50.0) return 1e20;
-                    return -evaluate_log_l(s, omegas, weights, {a1, a2, a3}, syn_weights, nullptr, nullptr, delta, psi, eps_sink);
-                }, syn_rates[0], syn_rates[1], 0.01, 5.0, 1e-3, 30);
+                    return -evaluate_log_l(s, omegas, weights, {a1, a2, a3}, syn_weights, ecm_bl_ptr, nullptr, delta, psi, eps_sink);
+                }, {syn_rates[0], syn_rates[1]}, {0.01, 0.01}, {5.0, 10.0}, 1e-4, 40);
 
-                Scalar a1 = syn_opt.a;
-                Scalar a2 = syn_opt.b;
+                Scalar a1 = syn_opt.x[0];
+                Scalar a2 = syn_opt.x[1];
                 Scalar a3 = (1.0 - syn_weights[0] * a1 - syn_weights[1] * a2) / syn_weights[2];
                 if (a1 >= 0.01 && a2 >= a1 && a3 >= a2) {
                     syn_rates[0] = a1;
@@ -1298,14 +1422,14 @@ public:
             if (allow_triple) {
                 auto mh_opt = NelderMead2D::minimize([&](Scalar d, Scalar p) {
                     if (d < 0.0 || d > 10.0 || p < 0.0 || p > 10.0) return 1e20;
-                    return -evaluate_log_l(s, omegas, weights, syn_rates, syn_weights, nullptr, nullptr, d, p, eps_sink);
+                    return -evaluate_log_l(s, omegas, weights, syn_rates, syn_weights, ecm_bl_ptr, nullptr, d, p, eps_sink);
                 }, delta, psi, 0.0, 10.0, 1e-4, 30);
                 delta = std::max(0.0, mh_opt.a);
                 psi = std::max(0.0, mh_opt.b);
             } else if (allow_double) {
                 auto d_opt = NelderMead2D::minimize([&](Scalar d, Scalar /*unused*/) {
                     if (d < 0.0 || d > 10.0) return 1e20;
-                    return -evaluate_log_l(s, omegas, weights, syn_rates, syn_weights, nullptr, nullptr, d, 0.0, eps_sink);
+                    return -evaluate_log_l(s, omegas, weights, syn_rates, syn_weights, ecm_bl_ptr, nullptr, d, 0.0, eps_sink);
                 }, delta, 0.0, 0.0, 10.0, 1e-4, 25);
                 delta = std::max(0.0, d_opt.a);
             }
@@ -1313,7 +1437,7 @@ public:
             if (pbar) {
                 std::ostringstream ss;
                 ss << model_desc << " (ECM " << (ecm_iter + 1) << "/" << max_ecm << "): lnL = "
-                   << std::fixed << std::setprecision(2) << evaluate_log_l(s, omegas, weights, syn_rates, syn_weights, nullptr, nullptr, delta, psi, eps_sink);
+                   << std::fixed << std::setprecision(2) << evaluate_log_l(s, omegas, weights, syn_rates, syn_weights, ecm_bl_ptr, nullptr, delta, psi, eps_sink);
                 if (!is_constrained && !omegas.empty()) {
                     ss << ", ω" << K << " = " << std::setprecision(2) << omegas.back();
                 }
@@ -1329,17 +1453,17 @@ public:
         std::vector<Scalar> bl(tree.num_nodes(), 0.0);
         for (const auto& node : tree.nodes) {
             if (node.id != tree.root_id) {
-                bl[node.id] = s * branch_tau[node.id];
+                bl[node.id] = s * (ecm_bl_ptr ? (*ecm_bl_ptr)[node.id] : branch_tau[node.id]);
             }
         }
 
         if (refine_branches) {
-            int num_cycles = (K == 1) ? 2 : 3;
+            int num_cycles = (K == 1) ? 2 : 4;
             for (int cycle = 0; cycle < num_cycles; ++cycle) {
                 bl = refine_branch_lengths(bl, omegas, weights, syn_rates, syn_weights, delta, psi, 25, eps_sink);
 
                 if (K >= 2 || use_error_sink) {
-                    for (int em = 0; em < 3; ++em) {
+                    for (int em = 0; em < 4; ++em) {
                         weights = compute_expected_weights(1.0, omegas, weights, syn_rates, syn_weights, &bl, delta, psi, eps_sink, use_error_sink ? &eps_sink : nullptr, max_eps_sink);
                         if (srv && M >= 2) {
                             syn_weights = compute_expected_syn_weights(1.0, omegas, weights, syn_rates, syn_weights, &bl, delta, psi, eps_sink);
@@ -1352,14 +1476,14 @@ public:
                     if (K == 2) {
                         auto [w1_opt, val] = Brent1D::minimize([&](Scalar w1) {
                             return -evaluate_log_l(1.0, {w1, 1.0}, weights, syn_rates, syn_weights, &bl, nullptr, delta, psi, eps_sink);
-                        }, 1e-4, omegas[0], 1.0, 1e-4, 40);
-                        omegas[0] = std::clamp(w1_opt, 1e-4, 1.0);
+                        }, 0.0, omegas[0], 1.0, 1e-4, 40);
+                        omegas[0] = std::clamp(w1_opt, 0.0, 1.0);
                         omegas[1] = 1.0;
                     } else if (K == 3) {
                         auto opt = NelderMeadND<2>::minimize([&](const std::array<Scalar, 2>& x) {
                             if (x[0] > x[1]) return 1e20;
                             return -evaluate_log_l(1.0, {x[0], x[1], 1.0}, weights, syn_rates, syn_weights, &bl, nullptr, delta, psi, eps_sink);
-                        }, {omegas[0], omegas[1]}, {1e-4, 1e-4}, {1.0, 1.0}, 1e-4, 50);
+                        }, {omegas[0], omegas[1]}, {0.0, 0.0}, {1.0, 1.0}, 1e-4, 50);
                         omegas[0] = opt.x[0];
                         omegas[1] = opt.x[1];
                         omegas[2] = 1.0;
@@ -1369,14 +1493,14 @@ public:
                     if (K == 2) {
                         auto opt = NelderMeadND<2>::minimize([&](const std::array<Scalar, 2>& x) {
                             return -evaluate_log_l(1.0, {x[0], x[1]}, weights, syn_rates, syn_weights, &bl, nullptr, delta, psi, eps_sink);
-                        }, {omegas[0], omegas[1]}, {1e-4, 1.0}, {1.0, max_omega}, 1e-4, 50);
+                        }, {omegas[0], omegas[1]}, {0.0, 1.0}, {1.0, max_omega}, 1e-4, 50);
                         omegas[0] = opt.x[0];
                         omegas[1] = opt.x[1];
                     } else if (K == 3) {
                         auto opt = NelderMeadND<3>::minimize([&](const std::array<Scalar, 3>& x) {
                             if (x[0] > x[1] || x[1] > x[2]) return 1e20;
                             return -evaluate_log_l(1.0, {x[0], x[1], x[2]}, weights, syn_rates, syn_weights, &bl, nullptr, delta, psi, eps_sink);
-                        }, {omegas[0], omegas[1], omegas[2]}, {1e-4, 1e-4, 1.0}, {1.0, max_omega, max_omega}, 1e-4, 80);
+                        }, {omegas[0], omegas[1], omegas[2]}, {0.0, 0.0, 1.0}, {1.0, max_omega, max_omega}, 1e-4, 80);
                         omegas[0] = opt.x[0];
                         omegas[1] = opt.x[1];
                         omegas[2] = opt.x[2];
@@ -1391,16 +1515,16 @@ public:
                         Scalar a3 = (1.0 - q1 * a1 - q2 * a2) / q3;
                         if (a1 < 0.01 || a2 < a1 || a3 < a2 || a3 > 50.0) return 1e20;
                         return -evaluate_log_l(1.0, omegas, weights, {a1, a2, a3}, syn_weights, &bl, nullptr, delta, psi, eps_sink);
-                    }, {syn_rates[0], syn_rates[1]}, {0.01, 0.01}, {5.0, 5.0}, 1e-3, 30);
+                    }, {syn_rates[0], syn_rates[1]}, {0.01, 0.01}, {5.0, 10.0}, 1e-4, 40);
 
-                        Scalar a1 = syn_opt.x[0];
-                        Scalar a2 = syn_opt.x[1];
-                        Scalar a3 = (1.0 - syn_weights[0] * a1 - syn_weights[1] * a2) / syn_weights[2];
-                        if (a1 >= 0.01 && a2 >= a1 && a3 >= a2) {
-                            syn_rates[0] = a1;
-                            syn_rates[1] = a2;
-                            syn_rates[2] = a3;
-                        }
+                    Scalar a1 = syn_opt.x[0];
+                    Scalar a2 = syn_opt.x[1];
+                    Scalar a3 = (1.0 - syn_weights[0] * a1 - syn_weights[1] * a2) / syn_weights[2];
+                    if (a1 >= 0.01 && a2 >= a1 && a3 >= a2) {
+                        syn_rates[0] = a1;
+                        syn_rates[1] = a2;
+                        syn_rates[2] = a3;
+                    }
                 }
             }
 
@@ -1547,29 +1671,47 @@ public:
             }
         }
 
-        // Per-pattern, per-node posterior probability of the saturation sink
+        // Per-pattern, per-node posterior probability of the saturation sink (underflow-safe via log-likelihood)
         std::vector<std::vector<Scalar>> pat_node_post(num_patterns, std::vector<Scalar>(num_nodes, 0.0));
         #pragma omp parallel for schedule(dynamic)
         for (size_t p = 0; p < num_patterns; ++p) {
             const auto& pattern = aln.patterns[p];
-            Scalar pat_L = 0.0;
             std::vector<LikelihoodEngine::InsideOutsideResult> io_m(M);
+            Scalar max_ll = -std::numeric_limits<Scalar>::infinity();
             for (size_t m = 0; m < M; ++m) {
+                if (syn_weights[m] <= 1e-12) continue;
                 io_m[m] = LikelihoodEngine::compute_inside_outside(
                     tree, pattern, leaf_to_taxon, P_mix[m], aln.codon_frequencies_f3x4, S
                 );
-                pat_L += syn_weights[m] * io_m[m].likelihood;
+                if (io_m[m].likelihood > 0.0) {
+                    Scalar term = std::log(syn_weights[m]) + io_m[m].log_likelihood;
+                    if (term > max_ll) max_ll = term;
+                }
             }
-            if (pat_L > 0.0) {
-                for (const auto& node : tree.nodes) {
-                    if (node.id != tree.root_id && is_test_branch[node.id]) {
-                        int nid = node.id;
-                        Scalar sink_num = 0.0;
-                        for (size_t m = 0; m < M; ++m) {
-                            sink_num += syn_weights[m] * eval_sink_bilinear(io_m[m].V[nid], io_m[m].D[nid]);
+            if (max_ll > -1e19) {
+                Scalar sum_exp = 0.0;
+                std::vector<Scalar> post_m(M, 0.0);
+                for (size_t m = 0; m < M; ++m) {
+                    if (syn_weights[m] > 1e-12 && io_m[m].likelihood > 0.0) {
+                        Scalar e = std::exp(std::log(syn_weights[m]) + io_m[m].log_likelihood - max_ll);
+                        post_m[m] = e;
+                        sum_exp += e;
+                    }
+                }
+                if (sum_exp > 0.0) {
+                    for (size_t m = 0; m < M; ++m) post_m[m] /= sum_exp;
+                    for (const auto& node : tree.nodes) {
+                        if (node.id != tree.root_id && is_test_branch[node.id]) {
+                            int nid = node.id;
+                            Scalar sink_ratio = 0.0;
+                            for (size_t m = 0; m < M; ++m) {
+                                if (post_m[m] > 1e-12 && io_m[m].likelihood > 0.0) {
+                                    sink_ratio += post_m[m] * (eval_sink_bilinear(io_m[m].V[nid], io_m[m].D[nid]) / io_m[m].likelihood);
+                                }
+                            }
+                            Scalar post = std::clamp(eps * sink_ratio, 0.0, 1.0 - 1e-9);
+                            pat_node_post[p][nid] = post;
                         }
-                        Scalar post = std::clamp((eps * sink_num) / pat_L, 0.0, 1.0 - 1e-9);
-                        pat_node_post[p][nid] = post;
                     }
                 }
             }
@@ -1606,12 +1748,19 @@ public:
         int S = code->num_sense_codons;
 
         // Step 0: Fast K=2 baseline warm-up (M0: M=1, delta=0, psi=0, eps=0)
-        std::vector<Scalar> omegas0 = {std::min(0.15, 0.5 * mg94_omega), 1.0};
-        std::vector<Scalar> weights0 = {0.75, 0.25};
+        std::vector<Scalar> omegas0 = {std::min(0.05, 0.25 * mg94_omega), 1.0};
+        std::vector<Scalar> weights0 = {0.80, 0.20};
+        Scalar s0 = 1.0;
         for (int it = 0; it < 2; ++it) {
-            weights0 = compute_expected_weights(1.0, omegas0, weights0);
+            weights0 = compute_expected_weights(s0, omegas0, weights0);
+            auto opt0 = NelderMead2D::minimize([&](Scalar w1, Scalar sc) {
+                return -evaluate_log_l(sc, {w1, 1.0}, weights0);
+            }, omegas0[0], s0, 1e-4, 1.0, 1e-3, 20);
+            omegas0[0] = opt0.a;
+            s0 = opt0.b;
         }
-        Scalar base_ll = evaluate_log_l(1.0, omegas0, weights0);
+        weights0 = compute_expected_weights(s0, omegas0, weights0);
+        Scalar base_ll = evaluate_log_l(s0, omegas0, weights0);
         Scalar mean_omega0 = weights0[0] * omegas0[0] + weights0[1] * omegas0[1];
 
         // Build baseline branch transition matrices P0[node_id]
@@ -1625,7 +1774,7 @@ public:
         std::vector<Matrix> P0(num_nodes);
         for (const auto& node : tree.nodes) {
             if (node.id != tree.root_id) {
-                Scalar bl = branch_tau[node.id];
+                Scalar bl = s0 * branch_tau[node.id];
                 P0[node.id] = weights0[0] * mg0[0].transition_matrix(bl) + weights0[1] * mg0[1].transition_matrix(bl);
             }
         }
@@ -1685,7 +1834,7 @@ public:
                 for (const auto& node : tree.nodes) {
                     if (node.id != tree.root_id) {
                         int nid = node.id;
-                        Scalar bl = branch_tau[nid];
+                        Scalar bl = s0 * branch_tau[nid];
                         if (is_test_branch[nid]) {
                             Scalar sink_val = eval_sink_bilinear(io.V[nid], io.D[nid]);
                             pat_R_sink[p][nid] = sink_val * inv_L;
@@ -1704,6 +1853,7 @@ public:
 
         // Gate 1: Evaluate Error Sink Surprisal & Spatial Adjacency
         Scalar max_R_sink = 0.0;
+        int max_sink_nid = -1;
         size_t candidate_count = 0;
         size_t adjacent_clusters = 0;
         Scalar eps_init = 0.002;
@@ -1717,7 +1867,10 @@ public:
                 for (size_t s_idx = 0; s_idx < num_sites; ++s_idx) {
                     size_t p_idx = aln.site_to_pattern[s_idx];
                     Scalar r_val = pat_R_sink[p_idx][nid];
-                    if (r_val > max_R_sink) max_R_sink = r_val;
+                    if (r_val > max_R_sink) {
+                        max_R_sink = r_val;
+                        max_sink_nid = nid;
+                    }
                     Scalar bits = (r_val > 1.0) ? std::log2(r_val) : 0.0;
                     if (bits > 8.0) {
                         candidate_count++;
@@ -1740,9 +1893,31 @@ public:
         diag.sink_adjacent_clusters = adjacent_clusters;
 
         Scalar eps_probe = std::clamp(sink_resp_sum / total_branch_sites, 1e-6, settings.error_sink_max_weight);
-        Scalar sink_probe_ll = (diag.max_sink_surprisal_bits > 6.5)
-            ? evaluate_log_l(1.0, omegas0, weights0, {1.0}, {1.0}, nullptr, nullptr, 0.0, 0.0, eps_probe)
-            : base_ll;
+        Scalar sink_probe_ll = base_ll;
+        if (diag.max_sink_surprisal_bits > 6.5) {
+            sink_probe_ll = evaluate_log_l(s0, omegas0, weights0, {1.0}, {1.0}, nullptr, nullptr, 0.0, 0.0, eps_probe);
+            // If a single branch has extreme surprisal (which inflates its MG94 branch length), also check 1-step branch refinement under sink
+            if (max_sink_nid >= 0 && diag.max_sink_surprisal_bits >= 10.0) {
+                std::vector<Scalar> probe_bl(num_nodes, 0.0);
+                for (const auto& node : tree.nodes) {
+                    if (node.id != tree.root_id) probe_bl[node.id] = s0 * branch_tau[node.id];
+                }
+                auto ref_bl = refine_branch_lengths(probe_bl, omegas0, weights0, {1.0}, {1.0}, 0.0, 0.0, 4, eps_probe);
+                auto base_ref_bl = refine_branch_lengths(probe_bl, omegas0, weights0, {1.0}, {1.0}, 0.0, 0.0, 4, 0.0);
+                Scalar ref_sink_ll = evaluate_log_l(1.0, omegas0, weights0, {1.0}, {1.0}, &ref_bl, nullptr, 0.0, 0.0, eps_probe);
+                Scalar ref_base_ll = evaluate_log_l(1.0, omegas0, weights0, {1.0}, {1.0}, &base_ref_bl, nullptr, 0.0, 0.0, 0.0);
+                if (ref_sink_ll - ref_base_ll > sink_probe_ll - base_ll) {
+                    sink_probe_ll = base_ll + (ref_sink_ll - ref_base_ll);
+                }
+                // Recompute max_R_sink on the un-inflated branch length
+                if (ref_bl[max_sink_nid] < probe_bl[max_sink_nid] * 0.5 && ref_bl[max_sink_nid] > 1e-8) {
+                    Scalar ratio_gain = std::pow(probe_bl[max_sink_nid] / ref_bl[max_sink_nid], 2.0);
+                    max_R_sink *= ratio_gain;
+                    diag.max_sink_bf = max_R_sink;
+                    diag.max_sink_surprisal_bits = (max_R_sink > 1.0) ? std::log2(max_R_sink) : 0.0;
+                }
+            }
+        }
         diag.sink_delta_ll = std::max(0.0, sink_probe_ll - base_ll);
 
         // Activate Error Sink if Delta LL > 2.2 AND either extreme short-branch surprisal (>= 13.0 bits, BF >= 8192) or spatial adjacency cluster
@@ -1772,15 +1947,15 @@ public:
 
         Scalar mh_base_ll = diag.activated_error_sink ? sink_probe_ll : base_ll;
         if (s_delta > 0.15) {
-            Scalar ll_d1 = evaluate_log_l(1.0, omegas0, weights0, {1.0}, {1.0}, nullptr, nullptr, 0.06, 0.0, eps_active);
-            Scalar ll_d2 = evaluate_log_l(1.0, omegas0, weights0, {1.0}, {1.0}, nullptr, nullptr, 0.20, 0.0, eps_active);
+            Scalar ll_d1 = evaluate_log_l(s0, omegas0, weights0, {1.0}, {1.0}, nullptr, nullptr, 0.06, 0.0, eps_active);
+            Scalar ll_d2 = evaluate_log_l(s0, omegas0, weights0, {1.0}, {1.0}, nullptr, nullptr, 0.20, 0.0, eps_active);
             Scalar best_d = (ll_d2 > ll_d1) ? 0.20 : 0.06;
             Scalar best_d_ll = std::max(ll_d1, ll_d2);
             diag.double_hit_delta_ll = std::max(0.0, best_d_ll - mh_base_ll);
 
             // Check if diffuse 2-hit evolution (with eps=0) strictly outperforms an isolated non-clustered error sink
             if (diag.activated_error_sink && diag.sink_adjacent_clusters == 0 && diag.max_sink_surprisal_bits < 16.0) {
-                Scalar pure_d_ll = evaluate_log_l(1.0, omegas0, weights0, {1.0}, {1.0}, nullptr, nullptr, best_d, 0.0, 0.0);
+                Scalar pure_d_ll = evaluate_log_l(s0, omegas0, weights0, {1.0}, {1.0}, nullptr, nullptr, best_d, 0.0, 0.0);
                 if (pure_d_ll > sink_probe_ll + 0.5 && (pure_d_ll - base_ll) > 2.2) {
                     diag.activated_error_sink = false;
                     eps_active = 0.0;
@@ -1793,7 +1968,7 @@ public:
             if (diag.double_hit_delta_ll > 2.2) {
                 diag.selected_multiple_hits = "Double";
                 if (s_psi > 0.05) {
-                    Scalar ll_p = evaluate_log_l(1.0, omegas0, weights0, {1.0}, {1.0}, nullptr, nullptr, best_d, 0.06, eps_active);
+                    Scalar ll_p = evaluate_log_l(s0, omegas0, weights0, {1.0}, {1.0}, nullptr, nullptr, best_d, 0.06, eps_active);
                     diag.triple_hit_delta_ll = std::max(0.0, ll_p - best_d_ll);
                     if (diag.triple_hit_delta_ll > 2.2) {
                         diag.selected_multiple_hits = "Double+Triple";
@@ -1816,14 +1991,14 @@ public:
 
         Scalar active_d = (diag.selected_multiple_hits != "None") ? 0.10 : 0.0;
         Scalar active_p = (diag.selected_multiple_hits == "Double+Triple") ? 0.04 : 0.0;
-        Scalar pre_srv_ll = evaluate_log_l(1.0, omegas0, weights0, {1.0}, {1.0}, nullptr, nullptr, active_d, active_p, eps_active);
+        Scalar pre_srv_ll = evaluate_log_l(s0, omegas0, weights0, {1.0}, {1.0}, nullptr, nullptr, active_d, active_p, eps_active);
 
         std::vector<Scalar> syn_r3 = {0.20, 0.75, 2.05};
         std::vector<Scalar> syn_w3 = {1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0};
         for (int it = 0; it < 2; ++it) {
-            syn_w3 = compute_expected_syn_weights(1.0, omegas0, weights0, syn_r3, syn_w3, nullptr, active_d, active_p, eps_active);
+            syn_w3 = compute_expected_syn_weights(s0, omegas0, weights0, syn_r3, syn_w3, nullptr, active_d, active_p, eps_active);
         }
-        Scalar srv3_ll = evaluate_log_l(1.0, omegas0, weights0, syn_r3, syn_w3, nullptr, nullptr, active_d, active_p, eps_active);
+        Scalar srv3_ll = evaluate_log_l(s0, omegas0, weights0, syn_r3, syn_w3, nullptr, nullptr, active_d, active_p, eps_active);
         diag.srv_delta_ll = std::max(0.0, srv3_ll - pre_srv_ll);
 
         if (diag.srv_delta_ll > 4.5 && syn_w3[0] >= 0.02 && syn_w3[1] >= 0.02 && syn_w3[2] >= 0.02) {
@@ -1832,8 +2007,8 @@ public:
         } else if (diag.srv_delta_ll > 2.2) {
             std::vector<Scalar> syn_r2 = {0.35, 1.65};
             std::vector<Scalar> syn_w2 = {0.50, 0.50};
-            syn_w2 = compute_expected_syn_weights(1.0, omegas0, weights0, syn_r2, syn_w2, nullptr, active_d, active_p, eps_active);
-            Scalar srv2_ll = evaluate_log_l(1.0, omegas0, weights0, syn_r2, syn_w2, nullptr, nullptr, active_d, active_p, eps_active);
+            syn_w2 = compute_expected_syn_weights(s0, omegas0, weights0, syn_r2, syn_w2, nullptr, active_d, active_p, eps_active);
+            Scalar srv2_ll = evaluate_log_l(s0, omegas0, weights0, syn_r2, syn_w2, nullptr, nullptr, active_d, active_p, eps_active);
             if (srv2_ll - pre_srv_ll > 2.2 && syn_w2[0] >= 0.02 && syn_w2[1] >= 0.02) {
                 diag.activated_srv = true;
                 diag.selected_syn_rates = 2;
@@ -2206,54 +2381,77 @@ public:
             #pragma omp for schedule(dynamic)
             for (size_t p = 0; p < num_patterns; ++p) {
                 const auto& pattern = aln.patterns[p];
-                Scalar pat_L = 0.0;
                 std::vector<LikelihoodEngine::InsideOutsideResult> io_m(M);
+                Scalar max_ll = -std::numeric_limits<Scalar>::infinity();
 
                 for (size_t m = 0; m < M; ++m) {
+                    if (syn_weights[m] <= 1e-12) continue;
                     io_m[m] = LikelihoodEngine::compute_inside_outside(
                         tree, pattern, leaf_to_taxon, P_mix[m], aln.codon_frequencies_f3x4, S
                     );
-                    pat_L += syn_weights[m] * io_m[m].likelihood;
+                    if (io_m[m].likelihood > 0.0) {
+                        Scalar term = std::log(syn_weights[m]) + io_m[m].log_likelihood;
+                        if (term > max_ll) max_ll = term;
+                    }
                 }
 
-                if (pat_L > 0.0) {
-                    Scalar inv_L = pattern.weight / pat_L;
-                    for (const auto& node : tree.nodes) {
-                        if (node.id != tree.root_id) {
-                            int nid = node.id;
-                            int part = branch_partition[nid];
-                            if (part == 0) {
-                                for (size_t k = 0; k < K_t; ++k) {
-                                    Scalar num = 0.0;
-                                    for (size_t m = 0; m < M; ++m) {
-                                        num += syn_weights[m] * io_m[m].V[nid].dot(P_comp_t[m][k][nid] * io_m[m].D[nid]);
+                if (max_ll > -1e19) {
+                    Scalar sum_exp = 0.0;
+                    std::vector<Scalar> post_m(M, 0.0);
+                    for (size_t m = 0; m < M; ++m) {
+                        if (syn_weights[m] > 1e-12 && io_m[m].likelihood > 0.0) {
+                            Scalar e = std::exp(std::log(syn_weights[m]) + io_m[m].log_likelihood - max_ll);
+                            post_m[m] = e;
+                            sum_exp += e;
+                        }
+                    }
+                    if (sum_exp > 0.0) {
+                        for (size_t m = 0; m < M; ++m) post_m[m] /= sum_exp;
+                        for (const auto& node : tree.nodes) {
+                            if (node.id != tree.root_id) {
+                                int nid = node.id;
+                                int part = branch_partition[nid];
+                                if (part == 0) {
+                                    for (size_t k = 0; k < K_t; ++k) {
+                                        Scalar ratio_k = 0.0;
+                                        for (size_t m = 0; m < M; ++m) {
+                                            if (post_m[m] > 1e-12 && io_m[m].likelihood > 0.0) {
+                                                ratio_k += post_m[m] * (io_m[m].V[nid].dot(P_comp_t[m][k][nid] * io_m[m].D[nid]) / io_m[m].likelihood);
+                                            }
+                                        }
+                                        local_t(k) += pattern.weight * (bio_scale_t * weights_test[k]) * ratio_k;
                                     }
-                                    local_t(k) += (bio_scale_t * weights_test[k]) * inv_L * num;
-                                }
-                                if (out_new_eps_test != nullptr) {
-                                    Scalar sink_num = 0.0;
-                                    for (size_t m = 0; m < M; ++m) {
-                                        sink_num += syn_weights[m] * eval_sink_bilinear(io_m[m].V[nid], io_m[m].D[nid]);
+                                    if (out_new_eps_test != nullptr) {
+                                        Scalar sink_ratio = 0.0;
+                                        for (size_t m = 0; m < M; ++m) {
+                                            if (post_m[m] > 1e-12 && io_m[m].likelihood > 0.0) {
+                                                sink_ratio += post_m[m] * (eval_sink_bilinear(io_m[m].V[nid], io_m[m].D[nid]) / io_m[m].likelihood);
+                                            }
+                                        }
+                                        local_sink_t += pattern.weight * eps_sink_test * sink_ratio;
                                     }
-                                    local_sink_t += eps_sink_test * inv_L * sink_num;
-                                }
-                                local_wt_t += pattern.weight;
-                            } else if (part == 1) {
-                                for (size_t k = 0; k < K_b; ++k) {
-                                    Scalar num = 0.0;
-                                    for (size_t m = 0; m < M; ++m) {
-                                        num += syn_weights[m] * io_m[m].V[nid].dot(P_comp_b[m][k][nid] * io_m[m].D[nid]);
+                                    local_wt_t += pattern.weight;
+                                } else if (part == 1) {
+                                    for (size_t k = 0; k < K_b; ++k) {
+                                        Scalar ratio_k = 0.0;
+                                        for (size_t m = 0; m < M; ++m) {
+                                            if (post_m[m] > 1e-12 && io_m[m].likelihood > 0.0) {
+                                                ratio_k += post_m[m] * (io_m[m].V[nid].dot(P_comp_b[m][k][nid] * io_m[m].D[nid]) / io_m[m].likelihood);
+                                            }
+                                        }
+                                        local_b(k) += pattern.weight * (bio_scale_b * weights_bg[k]) * ratio_k;
                                     }
-                                    local_b(k) += (bio_scale_b * weights_bg[k]) * inv_L * num;
-                                }
-                                if (out_new_eps_bg != nullptr) {
-                                    Scalar sink_num = 0.0;
-                                    for (size_t m = 0; m < M; ++m) {
-                                        sink_num += syn_weights[m] * eval_sink_bilinear(io_m[m].V[nid], io_m[m].D[nid]);
+                                    if (out_new_eps_bg != nullptr) {
+                                        Scalar sink_ratio = 0.0;
+                                        for (size_t m = 0; m < M; ++m) {
+                                            if (post_m[m] > 1e-12 && io_m[m].likelihood > 0.0) {
+                                                sink_ratio += post_m[m] * (eval_sink_bilinear(io_m[m].V[nid], io_m[m].D[nid]) / io_m[m].likelihood);
+                                            }
+                                        }
+                                        local_sink_b += pattern.weight * eps_sink_bg * sink_ratio;
                                     }
-                                    local_sink_b += eps_sink_bg * inv_L * sink_num;
+                                    local_wt_b += pattern.weight;
                                 }
-                                local_wt_b += pattern.weight;
                             }
                         }
                     }
@@ -2299,7 +2497,7 @@ public:
         return {new_wt_t, new_wt_b};
     }
 
-    // Two-set synonymous rate E-step
+    // Two-set synonymous rate E-step (with log-underflow scaling)
     std::vector<Scalar> compute_expected_two_set_syn_weights(
         Scalar s,
         const std::vector<Scalar>& omegas_test,
@@ -2380,14 +2578,17 @@ public:
             Vector local_accum = Vector::Zero(M);
             Scalar local_pat_wt = 0.0;
             std::vector<Vector> node_L(num_nodes, Vector::Zero(S));
+            std::vector<double> node_log_scale(num_nodes, 0.0);
 
             #pragma omp for schedule(dynamic)
             for (size_t p = 0; p < num_patterns; ++p) {
                 const auto& pattern = aln.patterns[p];
-                Scalar pat_L = 0.0;
-                std::vector<Scalar> cond_L(M, 0.0);
+                Scalar max_term = -std::numeric_limits<Scalar>::infinity();
+                std::vector<Scalar> terms(M, -std::numeric_limits<Scalar>::infinity());
+                std::vector<bool> valid(M, false);
 
                 for (size_t m = 0; m < M; ++m) {
+                    if (syn_weights[m] <= 1e-12) continue;
                     for (int32_t node_id : tree.post_order) {
                         const auto& node = tree.nodes[node_id];
                         if (node.is_leaf) {
@@ -2403,24 +2604,37 @@ public:
                             } else {
                                 node_L[node_id].setOnes();
                             }
+                            node_log_scale[node_id] = 0.0;
                         } else {
-                            node_L[node_id].setOnes();
-                            for (int32_t child_id : node.children) {
-                                Vector child_msg = P_mix[m][child_id] * node_L[child_id];
-                                node_L[node_id] = node_L[node_id].cwiseProduct(child_msg);
-                            }
+                            double child_scale_sum = 0.0;
+                            tree.eval_internal_node(node_id, P_mix[m], node_L, node_log_scale, node_L[node_id], child_scale_sum);
+                            node_log_scale[node_id] = child_scale_sum;
                         }
                     }
-                    cond_L[m] = aln.codon_frequencies_f3x4.dot(node_L[tree.root_id]);
-                    pat_L += syn_weights[m] * cond_L[m];
+                    Scalar cond_L = aln.codon_frequencies_f3x4.dot(node_L[tree.root_id]);
+                    if (cond_L > 0.0) {
+                        Scalar term = std::log(syn_weights[m]) + std::log(cond_L) + node_log_scale[tree.root_id];
+                        terms[m] = term;
+                        valid[m] = true;
+                        if (term > max_term) max_term = term;
+                    }
                 }
 
-                if (pat_L > 0.0) {
+                if (max_term > -1e19) {
+                    Scalar sum_exp = 0.0;
+                    std::vector<Scalar> rho(M, 0.0);
                     for (size_t m = 0; m < M; ++m) {
-                        Scalar rho_m = (syn_weights[m] * cond_L[m]) / pat_L;
-                        local_accum(m) += pattern.weight * rho_m;
+                        if (valid[m]) {
+                            rho[m] = std::exp(terms[m] - max_term);
+                            sum_exp += rho[m];
+                        }
                     }
-                    local_pat_wt += pattern.weight;
+                    if (sum_exp > 0.0) {
+                        for (size_t m = 0; m < M; ++m) {
+                            local_accum(m) += pattern.weight * (rho[m] / sum_exp);
+                        }
+                        local_pat_wt += pattern.weight;
+                    }
                 }
             }
 
@@ -2619,25 +2833,45 @@ public:
         const std::vector<Scalar>& syn_weights = {1.0},
         Scalar delta = 0.0,
         Scalar psi = 0.0,
-        int max_iters = 6,
+        int max_iters = 10,
         Scalar eps_sink_test = 0.0,
         Scalar eps_sink_bg = 0.0
     ) const {
         size_t num_nodes = tree.num_nodes();
         std::vector<Scalar> bl = init_bl;
+        std::vector<Scalar> log_bl(num_nodes, 0.0);
         for (size_t i = 0; i < num_nodes; ++i) {
             if (i != static_cast<size_t>(tree.root_id)) {
-                bl[i] = std::clamp(bl[i], 1e-4, 10.0);
+                bl[i] = std::clamp(bl[i], 1e-8, 10.0);
+                log_bl[i] = std::log(bl[i]);
             }
         }
 
-        const size_t m_history = 5;
+        const size_t m_history = 8;
         std::vector<std::vector<Scalar>> s_hist, y_hist;
         std::vector<Scalar> rho_hist;
 
-        auto [curr_ll, curr_grad] = compute_two_set_branch_gradients(
-            bl, omegas_test, weights_test, omegas_bg, weights_bg, syn_rates, syn_weights, delta, psi, eps_sink_test, eps_sink_bg
-        );
+        auto eval_log_space = [&](const std::vector<Scalar>& y_vec) -> std::tuple<Scalar, std::vector<Scalar>, std::vector<Scalar>> {
+            std::vector<Scalar> cur_bl(num_nodes, 0.0);
+            for (size_t i = 0; i < num_nodes; ++i) {
+                if (i != static_cast<size_t>(tree.root_id)) {
+                    cur_bl[i] = std::exp(std::clamp(y_vec[i], -18.420680744, 2.302585093));
+                }
+            }
+            auto [ll, grad_t] = compute_two_set_branch_gradients(
+                cur_bl, omegas_test, weights_test, omegas_bg, weights_bg, syn_rates, syn_weights, delta, psi, eps_sink_test, eps_sink_bg
+            );
+            std::vector<Scalar> grad_y(num_nodes, 0.0);
+            for (size_t i = 0; i < num_nodes; ++i) {
+                if (i != static_cast<size_t>(tree.root_id)) {
+                    grad_y[i] = cur_bl[i] * grad_t[i];
+                }
+            }
+            return {ll, grad_y, cur_bl};
+        };
+
+        auto [curr_ll, curr_grad, curr_bl] = eval_log_space(log_bl);
+        bl = curr_bl;
         Scalar best_ll = curr_ll;
         std::vector<Scalar> best_bl = bl;
 
@@ -2648,7 +2882,7 @@ public:
                     max_g = std::max(max_g, std::abs(curr_grad[i]));
                 }
             }
-            if (max_g < 1e-3) break;
+            if (max_g < 1e-4) break;
 
             std::vector<Scalar> q = curr_grad;
             std::vector<Scalar> alpha(s_hist.size());
@@ -2659,7 +2893,7 @@ public:
                 for (size_t i = 0; i < num_nodes; ++i) q[i] -= alpha[j] * y_hist[j][i];
             }
 
-            Scalar gamma = 1.0;
+            Scalar gamma = 0.25;
             if (!s_hist.empty()) {
                 Scalar s_dot_y = 0.0, y_dot_y = 0.0;
                 const auto& s_last = s_hist.back();
@@ -2668,7 +2902,7 @@ public:
                     s_dot_y += s_last[i] * y_last[i];
                     y_dot_y += y_last[i] * y_last[i];
                 }
-                if (y_dot_y > 1e-12) gamma = std::clamp(s_dot_y / y_dot_y, 1e-4, 10.0);
+                if (y_dot_y > 1e-12) gamma = std::clamp(s_dot_y / y_dot_y, 1e-3, 5.0);
             }
 
             std::vector<Scalar> r(num_nodes);
@@ -2696,21 +2930,33 @@ public:
                 s_hist.clear(); y_hist.clear(); rho_hist.clear();
             }
 
+            for (size_t i = 0; i < num_nodes; ++i) {
+                if (i != static_cast<size_t>(tree.root_id)) {
+                    d[i] = std::clamp(d[i], -1.2, 1.2);
+                }
+            }
+            dir_dot_grad = 0.0;
+            for (size_t i = 0; i < num_nodes; ++i) {
+                if (i != static_cast<size_t>(tree.root_id)) dir_dot_grad += d[i] * curr_grad[i];
+            }
+
             Scalar step_size = 1.0;
-            std::vector<Scalar> new_bl(num_nodes);
+            std::vector<Scalar> new_log_bl(num_nodes, 0.0);
+            std::vector<Scalar> new_bl(num_nodes, 0.0);
             Scalar new_ll = curr_ll;
             std::vector<Scalar> new_grad;
             bool line_search_ok = false;
-            for (int ls = 0; ls < 8; ++ls) {
+            for (int ls = 0; ls < 10; ++ls) {
                 for (size_t i = 0; i < num_nodes; ++i) {
-                    new_bl[i] = (i != static_cast<size_t>(tree.root_id)) ? std::clamp(bl[i] + step_size * d[i], 1e-4, 10.0) : 0.0;
+                    new_log_bl[i] = (i != static_cast<size_t>(tree.root_id))
+                        ? std::clamp(log_bl[i] + step_size * d[i], -18.420680744, 2.302585093)
+                        : 0.0;
                 }
-                auto [test_ll, test_grad] = compute_two_set_branch_gradients(
-                    new_bl, omegas_test, weights_test, omegas_bg, weights_bg, syn_rates, syn_weights, delta, psi, eps_sink_test, eps_sink_bg
-                );
-                if (test_ll > curr_ll + 1e-4 * step_size * dir_dot_grad) {
+                auto [test_ll, test_grad, test_bl] = eval_log_space(new_log_bl);
+                if (test_ll > curr_ll + 1e-4 * step_size * dir_dot_grad || (test_ll > curr_ll + 1e-5 && ls >= 3)) {
                     new_ll = test_ll;
                     new_grad = test_grad;
+                    new_bl = test_bl;
                     line_search_ok = true;
                     break;
                 }
@@ -2721,7 +2967,7 @@ public:
             std::vector<Scalar> s_k(num_nodes), y_k(num_nodes);
             Scalar s_dot_y = 0.0;
             for (size_t i = 0; i < num_nodes; ++i) {
-                s_k[i] = new_bl[i] - bl[i];
+                s_k[i] = new_log_bl[i] - log_bl[i];
                 y_k[i] = curr_grad[i] - new_grad[i];
                 s_dot_y += s_k[i] * y_k[i];
             }
@@ -2732,6 +2978,7 @@ public:
                 s_hist.push_back(s_k); y_hist.push_back(y_k); rho_hist.push_back(1.0 / s_dot_y);
             }
 
+            log_bl = new_log_bl;
             bl = new_bl; curr_ll = new_ll; curr_grad = new_grad;
             if (curr_ll > best_ll) {
                 best_ll = curr_ll; best_bl = bl;
@@ -3603,22 +3850,11 @@ public:
                 pbar.get(),
                 "Unconstrained K=" + std::to_string(opt_k),
                 settings.error_sink,
-                settings.error_sink_max_weight
+                settings.error_sink_max_weight,
+                &res.constrained
             );
         } else {
             res.optimal_k = settings.num_rate_classes;
-            res.unconstrained = fit_model(
-                false,
-                settings.num_rate_classes,
-                settings.refine_branch_lengths,
-                settings.srv,
-                settings.num_syn_rate_classes,
-                settings.multiple_hits,
-                pbar.get(),
-                "Unconstrained K=" + std::to_string(settings.num_rate_classes),
-                settings.error_sink,
-                settings.error_sink_max_weight
-            );
             res.constrained = fit_model(
                 true,
                 settings.num_rate_classes,
@@ -3630,6 +3866,19 @@ public:
                 "Constrained K=" + std::to_string(settings.num_rate_classes),
                 settings.error_sink,
                 settings.error_sink_max_weight
+            );
+            res.unconstrained = fit_model(
+                false,
+                settings.num_rate_classes,
+                settings.refine_branch_lengths,
+                settings.srv,
+                settings.num_syn_rate_classes,
+                settings.multiple_hits,
+                pbar.get(),
+                "Unconstrained K=" + std::to_string(settings.num_rate_classes),
+                settings.error_sink,
+                settings.error_sink_max_weight,
+                &res.constrained
             );
         }
 
@@ -3745,6 +3994,9 @@ public:
                 res.site_error_bfs,
                 res.flagged_error_events
             );
+            if (!settings.output_filtered_alignment.empty()) {
+                write_filtered_alignment(settings.output_filtered_alignment, res);
+            }
         } else {
             res.site_error_bfs.assign(num_sites, 0.0);
         }
@@ -3752,6 +4004,78 @@ public:
         auto t1 = std::chrono::high_resolution_clock::now();
         res.runtime_seconds = std::chrono::duration<double>(t1 - t0).count();
         return res;
+    }
+
+    // Masks branch-site error events flagged by BUSTED-E (BF >= error_sink_bf_threshold)
+    // as "---" in all descendant leaf sequences of the flagged branch at that codon site,
+    // matching HyPhy 2.5's error-filter.bf workflow.
+    Alignment filter_alignment_by_error_sink(const BUSTEDResult& res) const {
+        Alignment filtered;
+        filtered.code = aln.code;
+        filtered.embedded_tree_newick = aln.embedded_tree_newick;
+        for (const auto& seq : aln.sequences) {
+            filtered.add_sequence(seq.name, seq.raw_seq);
+        }
+
+        if (res.flagged_error_events.empty()) {
+            filtered.finalize();
+            return filtered;
+        }
+
+        // Precompute descendant leaf taxon indices for each tree node
+        size_t num_nodes = tree.num_nodes();
+        std::vector<std::vector<size_t>> node_descendant_taxa(num_nodes);
+        for (int32_t nid : tree.post_order) {
+            const auto& node = tree.nodes[nid];
+            if (node.is_leaf) {
+                size_t t_idx = leaf_to_taxon[nid];
+                if (t_idx != static_cast<size_t>(-1) && t_idx < filtered.sequences.size()) {
+                    node_descendant_taxa[nid].push_back(t_idx);
+                }
+            } else {
+                for (int32_t cid : node.children) {
+                    const auto& child_taxa = node_descendant_taxa[cid];
+                    node_descendant_taxa[nid].insert(node_descendant_taxa[nid].end(), child_taxa.begin(), child_taxa.end());
+                }
+            }
+        }
+
+        std::unordered_map<std::string, int32_t> name_to_nid;
+        for (const auto& node : tree.nodes) {
+            if (!node.name.empty()) {
+                name_to_nid[node.name] = node.id;
+            }
+        }
+
+        for (const auto& ev : res.flagged_error_events) {
+            if (ev.site == 0 || ev.site > aln.num_codons) continue;
+            size_t codon_idx = ev.site - 1;
+            size_t nt_offset = codon_idx * 3;
+            auto it = name_to_nid.find(ev.branch_name);
+            if (it != name_to_nid.end()) {
+                int32_t nid = it->second;
+                for (size_t t_idx : node_descendant_taxa[nid]) {
+                    if (nt_offset + 3 <= filtered.sequences[t_idx].raw_seq.size()) {
+                        filtered.sequences[t_idx].raw_seq.replace(nt_offset, 3, "---");
+                    }
+                }
+            }
+        }
+
+        filtered.finalize();
+        return filtered;
+    }
+
+    // Writes the BUSTED-E error-filtered codon alignment to a FASTA file
+    void write_filtered_alignment(const std::string& filepath, const BUSTEDResult& res) const {
+        Alignment filtered = filter_alignment_by_error_sink(res);
+        std::ofstream out(filepath);
+        if (!out.is_open()) {
+            throw std::runtime_error("Could not open filtered alignment file for writing: " + filepath);
+        }
+        for (const auto& seq : filtered.sequences) {
+            out << ">" << seq.name << "\n" << seq.raw_seq << "\n";
+        }
     }
 
 nlohmann::json to_legacy_json(const BUSTEDResult& res) const;

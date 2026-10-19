@@ -91,6 +91,7 @@ struct BUSTEDSettings {
     bool error_sink = false;               // Enable Option A saturation/replacement error sink
     Scalar error_sink_max_weight = 0.01;   // Upper bound on contamination proportion epsilon
     Scalar error_sink_bf_threshold = 100.0; // Bayes factor cutoff to flag branch-site errors
+    std::string output_filtered_alignment = ""; // Optional output FASTA path with error-sink flagged branch-sites masked as ---
     std::string test_branches = "All";     // "All", "Internal", "Leaves", "Unlabeled", or tag/comma-separated names
     bool phenotype_mode = false;           // Run BUSTED-PH (Test selection, Background selection, and Shared distribution LRTs)
     bool relax_mode = false;               // Fit coupled-k RELAX model (omega_FG = omega_BG^k, shared weights) vs shared_distributions (k = 1)

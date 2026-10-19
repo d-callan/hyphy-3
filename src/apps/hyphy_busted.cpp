@@ -60,6 +60,7 @@ static void print_usage(const char* prog, bool ph_mode = false) {
               << "  " << Console::brand("--error-sink") << "          Enable non-evolutionary saturation error sink class (BUSTED-E)\n"
               << "  " << Console::brand("--error-sink-weight") << " <W> Maximum allowed error sink mixture weight (default: 0.05)\n"
               << "  " << Console::brand("--error-sink-bf") << " <BF>  Empirical Bayes Factor threshold to flag artifact branch-sites (default: 100)\n"
+              << "  " << Console::brand("--output-filtered-alignment") << " <file> Write FASTA with BUSTED-E artifact branch-sites masked as ---\n"
               << "  " << Console::brand("--no-branch-opt") << "      Disable individual branch length refinement (use proportional scaling)\n"
               << "  " << Console::brand("--threads") << " <N>        Number of OpenMP worker threads\n"
               << "  " << Console::brand("--output") << " <file>      Path to output JSON file (default: <alignment>.BUSTED[-PH].json)\n"
@@ -106,6 +107,8 @@ int run_busted(int argc, char* argv[]) {
             settings.num_rate_classes = std::stoul(argv[++i]);
         } else if (arg == "--srv") {
             settings.srv = true;
+        } else if (arg == "--no-srv") {
+            settings.srv = false;
         } else if (arg == "--syn-rates" && i + 1 < argc) {
             settings.srv = true;
             settings.num_syn_rate_classes = std::stoul(argv[++i]);
@@ -121,6 +124,9 @@ int run_busted(int argc, char* argv[]) {
         } else if (arg == "--error-sink-bf" && i + 1 < argc) {
             settings.error_sink = true;
             settings.error_sink_bf_threshold = std::stod(argv[++i]);
+        } else if ((arg == "--output-filtered-alignment" || arg == "--error-filter" || arg == "--filtered-alignment") && i + 1 < argc) {
+            settings.error_sink = true;
+            settings.output_filtered_alignment = argv[++i];
         } else if (arg == "--no-branch-opt") {
             settings.refine_branch_lengths = false;
         } else if (arg == "--help" || arg == "-h") {
@@ -425,6 +431,11 @@ int run_busted(int argc, char* argv[]) {
         std::string fmt_desc = (cli.json_format == JSONFormat::Legacy) ? "Legacy Datamonkey JSON" : "Modern HyPhy v3.0 JSON";
         std::cout << Console::success("✔") << " " << Console::bold("Saved " + fmt_desc + " report to: ")
                   << Console::brand(cli.output_file) << "\n\n";
+        if (!res.settings.output_filtered_alignment.empty()) {
+            std::cout << Console::success("✔") << " " << Console::bold("Saved BUSTED-E error-filtered alignment ("
+                      + std::to_string(res.flagged_error_events.size()) + " masked branch-sites) to: ")
+                      << Console::brand(res.settings.output_filtered_alignment) << "\n\n";
+        }
         if (!cli.html_file.empty()) {
             hyphy::report::write_html_report(cli.output_file, cli.html_file);
             std::cout << Console::success("✔") << " " << Console::bold("Saved HTML report to: ")

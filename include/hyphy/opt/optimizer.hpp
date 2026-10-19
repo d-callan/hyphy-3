@@ -38,10 +38,10 @@ public:
         : tree(std::move(t)), aln(a), nuc_aln(a.to_nucleotide_alignment()) {}
 
     GTRFitResult fit() {
-        // Collect non-root branch node indices
+        // Collect active non-root branch node indices (skipping collapsed polytomy tombstones)
         std::vector<int32_t> branch_node_ids;
         for (const auto& node : tree.nodes) {
-            if (node.id != tree.root_id) {
+            if (node.id != tree.root_id && node.parent_id != INVALID_INDEX) {
                 branch_node_ids.push_back(node.id);
             }
         }
@@ -628,7 +628,7 @@ public:
     ) {
         std::vector<int32_t> branch_node_ids;
         for (const auto& node : tree.nodes) {
-            if (node.id != tree.root_id) {
+            if (node.id != tree.root_id && node.parent_id != INVALID_INDEX) {
                 branch_node_ids.push_back(node.id);
             }
         }
@@ -881,10 +881,10 @@ public:
 
         std::vector<size_t> leaf_to_taxon = LikelihoodEngine::build_leaf_to_taxon_map(cur_tree, aln);
 
-        // Collect non-root branches
+        // Collect active non-root branches (skipping collapsed polytomy tombstones)
         std::vector<int32_t> branch_node_ids;
         for (const auto& node : cur_tree.nodes) {
-            if (node.id != cur_tree.root_id) {
+            if (node.id != cur_tree.root_id && node.parent_id != INVALID_INDEX) {
                 branch_node_ids.push_back(node.id);
             }
         }
@@ -894,8 +894,8 @@ public:
 
         Vector x(dim), lb(dim), ub(dim);
         for (size_t i = 0; i < B; ++i) {
-            x(i) = std::log(std::clamp(cur_tree.nodes[branch_node_ids[i]].branch_length, 1e-4, 10.0));
-            lb(i) = -12.0;
+            x(i) = std::log(std::clamp(cur_tree.nodes[branch_node_ids[i]].branch_length, 1e-7, 10.0));
+            lb(i) = -18.420680744;
             ub(i) = 3.0;
         }
 
