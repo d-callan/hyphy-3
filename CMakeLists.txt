@@ -249,7 +249,7 @@ add_test(NAME HTMLReportEndToEndTest
 # PRs labelled full-ci; every other run uses `ctest -LE deep`.
 set_tests_properties(
     MultiDatasetParityTest MEMEParityTest BUSTEDTest BUSTEDMHTest ABSRELTest
-    RELAXTest ContrastFELTest PRIMETest
+    RELAXTest ContrastFELTest PRIMETest MSSTest
     PROPERTIES LABELS deep
 )
 
