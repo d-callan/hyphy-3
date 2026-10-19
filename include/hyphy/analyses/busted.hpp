@@ -265,7 +265,8 @@ public:
         std::vector<Scalar>* out_pattern_ll = nullptr,
         Scalar delta = 0.0,
         Scalar psi = 0.0,
-        Scalar eps_sink = 0.0
+        Scalar eps_sink = 0.0,
+        const MG94Parameters* custom_base_params = nullptr
     ) const {
         size_t num_nodes = tree.num_nodes();
         size_t num_patterns = aln.patterns.size();
@@ -273,11 +274,12 @@ public:
         size_t K = omegas.size();
         size_t M = syn_rates.size();
         Scalar bio_scale = 1.0 - eps_sink;
+        const MG94Parameters& active_base = custom_base_params ? *custom_base_params : base_params;
 
         // Build K rate matrices
         std::vector<MG94Matrix> mg(K);
         for (size_t k = 0; k < K; ++k) {
-            MG94Parameters p = base_params;
+            MG94Parameters p = active_base;
             p.alpha = 1.0;
             p.beta = omegas[k];
             p.delta = delta;
@@ -287,7 +289,7 @@ public:
         bool has_bg = (num_test_branches + 1 < num_nodes);
         MG94Matrix mg_bg;
         if (has_bg) {
-            MG94Parameters p_bg = base_params;
+            MG94Parameters p_bg = active_base;
             p_bg.alpha = 1.0;
             p_bg.beta = mg94_omega;
             p_bg.delta = delta;
@@ -426,7 +428,8 @@ public:
         Scalar psi = 0.0,
         Scalar eps_sink = 0.0,
         Scalar* out_new_eps_sink = nullptr,
-        Scalar max_eps_sink = 0.01
+        Scalar max_eps_sink = 0.01,
+        const MG94Parameters* custom_base_params = nullptr
     ) const {
         size_t K = omegas.size();
         if (K <= 1 && !out_new_eps_sink) return {1.0};
@@ -436,11 +439,12 @@ public:
         size_t num_patterns = aln.patterns.size();
         int S = code->num_sense_codons;
         Scalar bio_scale = (out_new_eps_sink != nullptr) ? (1.0 - eps_sink) : 1.0;
+        const MG94Parameters& active_base = custom_base_params ? *custom_base_params : base_params;
 
         std::vector<std::vector<std::vector<Matrix>>> P_comp(M, std::vector<std::vector<Matrix>>(K, std::vector<Matrix>(num_nodes)));
         std::vector<std::vector<Matrix>> P_mix(M, std::vector<Matrix>(num_nodes));
         for (size_t k = 0; k < K; ++k) {
-            MG94Parameters p = base_params;
+            MG94Parameters p = active_base;
             p.alpha = 1.0;
             p.beta = omegas[k];
             p.delta = delta;
@@ -580,7 +584,8 @@ public:
         const std::vector<Scalar>* custom_branch_lengths = nullptr,
         Scalar delta = 0.0,
         Scalar psi = 0.0,
-        Scalar eps_sink = 0.0
+        Scalar eps_sink = 0.0,
+        const MG94Parameters* custom_base_params = nullptr
     ) const {
         size_t M = syn_rates.size();
         if (M <= 1) return {1.0};
@@ -590,10 +595,11 @@ public:
         int S = code->num_sense_codons;
         size_t K = omegas.size();
         Scalar bio_scale = 1.0 - eps_sink;
+        const MG94Parameters& active_base = custom_base_params ? *custom_base_params : base_params;
 
         std::vector<MG94Matrix> mg(K);
         for (size_t k = 0; k < K; ++k) {
-            MG94Parameters p = base_params;
+            MG94Parameters p = active_base;
             p.alpha = 1.0;
             p.beta = omegas[k];
             p.delta = delta;
@@ -603,7 +609,7 @@ public:
         bool has_bg = (num_test_branches + 1 < num_nodes);
         MG94Matrix mg_bg;
         if (has_bg) {
-            MG94Parameters p_bg = base_params;
+            MG94Parameters p_bg = active_base;
             p_bg.alpha = 1.0;
             p_bg.beta = mg94_omega;
             p_bg.delta = delta;
@@ -734,7 +740,8 @@ public:
         const std::vector<Scalar>& syn_weights = {1.0},
         Scalar delta = 0.0,
         Scalar psi = 0.0,
-        Scalar eps_sink = 0.0
+        Scalar eps_sink = 0.0,
+        const MG94Parameters* custom_base_params = nullptr
     ) const {
         size_t num_nodes = tree.num_nodes();
         size_t num_patterns = aln.patterns.size();
@@ -742,11 +749,12 @@ public:
         size_t K = omegas.size();
         size_t M = syn_rates.size();
         Scalar bio_scale = 1.0 - eps_sink;
+        const MG94Parameters& active_base = custom_base_params ? *custom_base_params : base_params;
 
         // 1. Build K rate matrices
         std::vector<MG94Matrix> mg(K);
         for (size_t k = 0; k < K; ++k) {
-            MG94Parameters p = base_params;
+            MG94Parameters p = active_base;
             p.alpha = 1.0;
             p.beta = omegas[k];
             p.delta = delta;
@@ -756,7 +764,7 @@ public:
         bool has_bg = (num_test_branches + 1 < num_nodes);
         MG94Matrix mg_bg;
         if (has_bg) {
-            MG94Parameters p_bg = base_params;
+            MG94Parameters p_bg = active_base;
             p_bg.alpha = 1.0;
             p_bg.beta = mg94_omega;
             p_bg.delta = delta;
@@ -891,14 +899,15 @@ public:
         Scalar delta = 0.0,
         Scalar psi = 0.0,
         int max_iters = 25,
-        Scalar eps_sink = 0.0
+        Scalar eps_sink = 0.0,
+        const MG94Parameters* custom_base_params = nullptr
     ) const {
         size_t num_nodes = tree.num_nodes();
         std::vector<Scalar> bl = init_bl;
         std::vector<Scalar> log_bl(num_nodes, 0.0);
         for (size_t i = 0; i < num_nodes; ++i) {
             if (i != static_cast<size_t>(tree.root_id)) {
-                bl[i] = std::clamp(bl[i], 1e-8, 10.0);
+                bl[i] = std::clamp(bl[i], 1e-8, 10000.0);
                 log_bl[i] = std::log(bl[i]);
             }
         }
@@ -913,10 +922,10 @@ public:
             std::vector<Scalar> cur_bl(num_nodes, 0.0);
             for (size_t i = 0; i < num_nodes; ++i) {
                 if (i != static_cast<size_t>(tree.root_id)) {
-                    cur_bl[i] = std::exp(std::clamp(y_vec[i], -18.420680744, 2.302585093));
+                    cur_bl[i] = std::exp(std::clamp(y_vec[i], -18.420680744, 9.210340372));
                 }
             }
-            auto [ll, grad_t] = compute_busted_branch_gradients(cur_bl, omegas, weights, syn_rates, syn_weights, delta, psi, eps_sink);
+            auto [ll, grad_t] = compute_busted_branch_gradients(cur_bl, omegas, weights, syn_rates, syn_weights, delta, psi, eps_sink, custom_base_params);
             std::vector<Scalar> grad_y(num_nodes, 0.0);
             for (size_t i = 0; i < num_nodes; ++i) {
                 if (i != static_cast<size_t>(tree.root_id)) {
@@ -1014,10 +1023,10 @@ public:
                 rho_hist.clear();
             }
 
-            // Clamp per-branch log-step to [-1.2, +1.2] (at most ~3.3x multiplier per step) without throttling other branches!
+            // Clamp per-branch log-step to [-2.0, +2.0] (at most ~7.4x multiplier per step) without throttling other branches!
             for (size_t i = 0; i < num_nodes; ++i) {
                 if (i != static_cast<size_t>(tree.root_id)) {
-                    d[i] = std::clamp(d[i], -1.2, 1.2);
+                    d[i] = std::clamp(d[i], -2.0, 2.0);
                 }
             }
             dir_dot_grad = 0.0;
@@ -1037,7 +1046,7 @@ public:
             for (int ls = 0; ls < 12; ++ls) {
                 for (size_t i = 0; i < num_nodes; ++i) {
                     if (i != static_cast<size_t>(tree.root_id)) {
-                        new_log_bl[i] = std::clamp(log_bl[i] + step_size * d[i], -18.420680744, 2.302585093);
+                        new_log_bl[i] = std::clamp(log_bl[i] + step_size * d[i], -18.420680744, 9.210340372);
                     } else {
                         new_log_bl[i] = 0.0;
                     }
@@ -1092,7 +1101,7 @@ public:
         return best_bl;
     }
 
-    // Fits BUSTED model for specified number of rate classes K in {1, 2, 3}, optional SRV, and optional saturation error sink
+    // Fits BUSTED model for specified number of rate categories K in {1, 2, 3}, optional SRV, and optional saturation error sink
     BUSTEDFit fit_model(
         bool is_constrained,
         size_t K = 3,
@@ -1112,9 +1121,17 @@ public:
 
         bool allow_double = (multiple_hits == "Double" || multiple_hits == "Double+Triple");
         bool allow_triple = (multiple_hits == "Double+Triple");
-        Scalar delta = 0.0;
-        Scalar psi = 0.0;
-        Scalar eps_sink = use_error_sink ? std::min(0.002, max_eps_sink * 0.5) : 0.0;
+        Scalar delta = warm_start_fit ? warm_start_fit->delta : 0.0;
+        Scalar psi = warm_start_fit ? warm_start_fit->psi : 0.0;
+        Scalar eps_sink = use_error_sink
+            ? (warm_start_fit && warm_start_fit->error_sink_weight > 0.0
+                ? std::min(warm_start_fit->error_sink_weight, max_eps_sink)
+                : std::min(0.002, max_eps_sink * 0.5))
+            : 0.0;
+
+        MG94Parameters local_base = (warm_start_fit && warm_start_fit->has_gtr_params)
+            ? warm_start_fit->gtr_params
+            : base_params;
 
         // Initialize SRV synonymous rate distribution
         size_t M = srv ? num_syn_rates : 1;
@@ -1140,6 +1157,75 @@ public:
             s = 1.0;
         }
 
+        // Helper: if a purifying rate class (k < K-1) has collapsed in weight (< 0.005) or merged with a neighbor,
+        // propose a split of the purifying mass into (0.0, omega_mid, omega_3) and accept ONLY if it strictly improves lnL
+        auto try_rescue_collapsed_classes = [&](
+            Scalar& cur_s,
+            std::vector<Scalar>& cur_o,
+            std::vector<Scalar>& cur_w,
+            const std::vector<Scalar>* bl_ptr
+        ) {
+            if (K != 3) return;
+            bool collapsed = (cur_w[0] < 0.005) || (cur_w[1] < 0.005) || (std::abs(cur_o[1] - cur_o[0]) < 1e-3);
+            if (!collapsed) return;
+
+            Scalar base_ll = evaluate_log_l(cur_s, cur_o, cur_w, syn_rates, syn_weights, bl_ptr, nullptr, delta, psi, eps_sink, &local_base);
+            size_t dom = (cur_w[0] >= cur_w[1]) ? 0 : 1;
+            Scalar w_pur = std::clamp(cur_w[0] + cur_w[1], 0.04, 0.99);
+            Scalar w_top = std::clamp(1.0 - w_pur, 0.01, 0.96);
+            Scalar o_dom = std::clamp(cur_o[dom], 0.002, 0.80);
+            Scalar o_mg = std::clamp(mg94_omega, 0.01, 0.80);
+            Scalar o_top = is_constrained ? 1.0 : std::max(1.05, cur_o[2]);
+
+            std::vector<std::pair<std::vector<Scalar>, std::vector<Scalar>>> rescue_cands = {
+                {{0.0, std::min(0.95, std::max(0.02, o_dom * 2.2)), o_top}, {0.65 * w_pur, 0.35 * w_pur, w_top}},
+                {{0.0, std::min(0.95, std::max(0.02, o_mg * 0.5)), o_top},  {0.65 * w_pur, 0.35 * w_pur, w_top}},
+                {{0.0, std::min(0.95, o_mg), o_top},                        {0.70 * w_pur, 0.30 * w_pur, w_top}}
+            };
+
+            std::vector<Scalar> best_rc_o = cur_o;
+            std::vector<Scalar> best_rc_w = cur_w;
+            Scalar best_rc_ll = -1e20;
+            for (const auto& [rc_o, rc_w] : rescue_cands) {
+                Scalar ll = evaluate_log_l(cur_s, rc_o, rc_w, syn_rates, syn_weights, bl_ptr, nullptr, delta, psi, eps_sink, &local_base);
+                if (ll > best_rc_ll) {
+                    best_rc_ll = ll;
+                    best_rc_o = rc_o;
+                    best_rc_w = rc_w;
+                }
+            }
+
+            // Polish the best rescue candidate via 2 alternating (M-step on omegas, E-step on weights) rounds
+            Scalar cand_s = cur_s;
+            auto cand_o = best_rc_o;
+            auto cand_w = best_rc_w;
+            for (int r_it = 0; r_it < 2; ++r_it) {
+                if (is_constrained) {
+                    auto opt = NelderMeadND<3>::minimize([&](const std::array<Scalar, 3>& x) {
+                        if (x[1] > x[2]) return 1e20;
+                        return -evaluate_log_l(x[0], {x[1], x[2], 1.0}, cand_w, syn_rates, syn_weights, bl_ptr, nullptr, delta, psi, eps_sink, &local_base);
+                    }, {cand_s, cand_o[0], cand_o[1]}, {0.01, 0.0, 0.0}, {50.0, 1.0, 1.0}, 1e-4, 40);
+                    cand_s = opt.x[0];
+                    cand_o = {opt.x[1], opt.x[2], 1.0};
+                } else {
+                    Scalar max_omega = use_error_sink ? 50.0 : 2000.0;
+                    auto opt = NelderMeadND<4>::minimize([&](const std::array<Scalar, 4>& x) {
+                        if (x[1] > x[2] || x[2] > x[3]) return 1e20;
+                        return -evaluate_log_l(x[0], {x[1], x[2], x[3]}, cand_w, syn_rates, syn_weights, bl_ptr, nullptr, delta, psi, eps_sink, &local_base);
+                    }, {cand_s, cand_o[0], cand_o[1], cand_o[2]}, {0.01, 0.0, 0.0, 1.0}, {50.0, 1.0, max_omega, max_omega}, 1e-4, 45);
+                    cand_s = opt.x[0];
+                    cand_o = {opt.x[1], opt.x[2], opt.x[3]};
+                }
+                cand_w = compute_expected_weights(cand_s, cand_o, cand_w, syn_rates, syn_weights, bl_ptr, delta, psi, eps_sink, nullptr, max_eps_sink, &local_base);
+            }
+            Scalar final_rc_ll = evaluate_log_l(cand_s, cand_o, cand_w, syn_rates, syn_weights, bl_ptr, nullptr, delta, psi, eps_sink, &local_base);
+            if (final_rc_ll > base_ll + 1e-4) {
+                cur_s = cand_s;
+                cur_o = cand_o;
+                cur_w = cand_w;
+            }
+        };
+
         // Initialize rates and weights
         std::vector<Scalar> omegas(K);
         std::vector<Scalar> weights(K);
@@ -1153,8 +1239,14 @@ public:
                 candidates = {
                     {{0.10, 1.0}, {0.75, 0.25}},
                     {{0.02, 1.0}, {0.85, 0.15}},
-                    {{0.25, 1.0}, {0.60, 0.40}}
+                    {{0.25, 1.0}, {0.60, 0.40}},
+                    {{0.0, 1.0},  {0.70, 0.30}}
                 };
+                if (warm_start_fit && warm_start_fit->test_distribution.omegas.size() == 2) {
+                    Scalar w0 = std::min(1.0, warm_start_fit->test_distribution.omegas[0]);
+                    Scalar p0 = std::clamp(warm_start_fit->test_distribution.weights[0], 0.02, 0.98);
+                    candidates.push_back({{w0, 1.0}, {p0, 1.0 - p0}});
+                }
             } else {
                 candidates = {
                     {{0.10, 3.0}, {0.75, 0.25}},
@@ -1164,13 +1256,14 @@ public:
                 if (warm_start_fit && warm_start_fit->test_distribution.omegas.size() == 2) {
                     Scalar w0 = warm_start_fit->test_distribution.omegas[0];
                     Scalar p0 = std::clamp(warm_start_fit->test_distribution.weights[0], 0.05, 0.95);
+                    candidates.push_back({{w0, 1.35}, {p0, 1.0 - p0}});
                     candidates.push_back({{w0, 2.5}, {p0, 1.0 - p0}});
                     candidates.push_back({{w0, 5.0}, {std::max(0.5, p0), 1.0 - std::max(0.5, p0)}});
                 }
             }
             Scalar best_start_ll = -1e20;
             for (const auto& [cand_o, cand_w] : candidates) {
-                Scalar ll = evaluate_log_l(s, cand_o, cand_w, syn_rates, syn_weights, ecm_bl_ptr, nullptr, delta, psi, eps_sink);
+                Scalar ll = evaluate_log_l(s, cand_o, cand_w, syn_rates, syn_weights, ecm_bl_ptr, nullptr, delta, psi, eps_sink, &local_base);
                 if (ll > best_start_ll) {
                     best_start_ll = ll;
                     omegas = cand_o;
@@ -1179,16 +1272,31 @@ public:
             }
         } else {
             // Default K = 3: evaluate grid of candidate distributions to seed ECM in best global basin
+            Scalar w_mg = std::clamp(mg94_omega, 0.01, 0.90);
             if (is_constrained) {
                 std::vector<std::pair<std::vector<Scalar>, std::vector<Scalar>>> candidates = {
                     {{0.05, 0.50, 1.0}, {0.45, 0.45, 0.10}},
                     {{0.01, 0.20, 1.0}, {0.30, 0.30, 0.40}},
                     {{0.10, 0.80, 1.0}, {0.20, 0.20, 0.60}},
-                    {{0.001, 0.05, 1.0}, {0.15, 0.15, 0.70}}
+                    {{0.001, 0.05, 1.0}, {0.15, 0.15, 0.70}},
+                    {{0.0, 0.5 * w_mg, 1.0}, {0.65, 0.27, 0.08}},
+                    {{0.0, w_mg, 1.0},       {0.65, 0.28, 0.07}}
                 };
+                if (warm_start_fit && warm_start_fit->test_distribution.omegas.size() == 3) {
+                    const auto& co = warm_start_fit->test_distribution.omegas;
+                    const auto& cw = warm_start_fit->test_distribution.weights;
+                    Scalar o0 = std::clamp(co[0], 0.0, 1.0);
+                    Scalar o1 = std::clamp(co[1], o0, 1.0);
+                    Scalar p0 = std::clamp(cw[0], 0.01, 0.97);
+                    Scalar p1 = std::clamp(cw[1], 0.01, 0.98 - p0);
+                    Scalar p2 = std::max(0.01, 1.0 - p0 - p1);
+                    candidates.push_back({{o0, o1, 1.0}, {p0, p1, p2}});
+                    Scalar p_pur = std::clamp(cw[0] + cw[1], 0.10, 0.97);
+                    candidates.push_back({{0.0, std::min(0.95, std::max(0.02, o1)), 1.0}, {0.68 * p_pur, 0.32 * p_pur, 1.0 - p_pur}});
+                }
                 Scalar best_start_ll = -1e20;
                 for (const auto& [cand_o, cand_w] : candidates) {
-                    Scalar ll = evaluate_log_l(s, cand_o, cand_w, syn_rates, syn_weights, ecm_bl_ptr, nullptr, delta, psi, eps_sink);
+                    Scalar ll = evaluate_log_l(s, cand_o, cand_w, syn_rates, syn_weights, ecm_bl_ptr, nullptr, delta, psi, eps_sink, &local_base);
                     if (ll > best_start_ll) {
                         best_start_ll = ll;
                         omegas = cand_o;
@@ -1202,21 +1310,24 @@ public:
                     {{0.01, 1.00, 2.0}, {0.40, 0.05, 0.55}},
                     {{0.02, 0.20, 3.0}, {0.35, 0.35, 0.30}},
                     {{0.10, 0.90, 5.0}, {0.30, 0.40, 0.30}},
-                    {{0.005, 0.10, 1.8}, {0.45, 0.15, 0.40}}
+                    {{0.005, 0.10, 1.8}, {0.45, 0.15, 0.40}},
+                    {{0.0, 0.5 * w_mg, 2.0}, {0.65, 0.28, 0.07}},
+                    {{0.0, w_mg, 2.5},       {0.68, 0.27, 0.05}}
                 };
                 if (warm_start_fit && warm_start_fit->test_distribution.omegas.size() == 3) {
                     const auto& co = warm_start_fit->test_distribution.omegas;
                     const auto& cw = warm_start_fit->test_distribution.weights;
-                    Scalar p2 = std::max(0.05, cw[2] * 0.5);
-                    Scalar p0 = std::clamp(cw[0], 0.02, 0.90);
+                    Scalar p2 = std::max(0.02, cw[2] * 0.7);
+                    Scalar p0 = std::clamp(cw[0], 0.02, 0.92);
                     Scalar p1 = std::max(0.02, 1.0 - p0 - p2);
                     Scalar sum_p = p0 + p1 + p2;
-                    candidates.push_back({{co[0], std::min(0.95, std::max(co[0] + 0.01, co[1])), 2.0}, {p0 / sum_p, p1 / sum_p, p2 / sum_p}});
+                    candidates.push_back({{co[0], std::min(0.95, std::max(co[0] + 0.01, co[1])), 1.6}, {p0 / sum_p, p1 / sum_p, p2 / sum_p}});
+                    candidates.push_back({{co[0], std::min(0.95, std::max(co[0] + 0.01, co[1])), 2.5}, {p0 / sum_p, p1 / sum_p, p2 / sum_p}});
                     candidates.push_back({{co[0], 1.0, 2.5}, {p0 / sum_p, p1 / sum_p, p2 / sum_p}});
                 }
                 Scalar best_start_ll = -1e20;
                 for (const auto& [cand_o, cand_w] : candidates) {
-                    Scalar ll = evaluate_log_l(s, cand_o, cand_w, syn_rates, syn_weights, ecm_bl_ptr, nullptr, delta, psi, eps_sink);
+                    Scalar ll = evaluate_log_l(s, cand_o, cand_w, syn_rates, syn_weights, ecm_bl_ptr, nullptr, delta, psi, eps_sink, &local_base);
                     if (ll > best_start_ll) {
                         best_start_ll = ll;
                         omegas = cand_o;
@@ -1229,10 +1340,12 @@ public:
         if (allow_double) {
             Scalar best_grid_ll = -1e20;
             std::vector<Scalar> d_cands = {0.0, 0.02, 0.08, 0.20};
+            if (warm_start_fit && warm_start_fit->delta > 0.0) d_cands.push_back(warm_start_fit->delta);
             std::vector<Scalar> p_cands = allow_triple ? std::vector<Scalar>{0.0, 0.02, 0.05} : std::vector<Scalar>{0.0};
+            if (allow_triple && warm_start_fit && warm_start_fit->psi > 0.0) p_cands.push_back(warm_start_fit->psi);
             for (Scalar d_c : d_cands) {
                 for (Scalar p_c : p_cands) {
-                    Scalar cand_ll = evaluate_log_l(s, omegas, weights, syn_rates, syn_weights, ecm_bl_ptr, nullptr, d_c, p_c, eps_sink);
+                    Scalar cand_ll = evaluate_log_l(s, omegas, weights, syn_rates, syn_weights, ecm_bl_ptr, nullptr, d_c, p_c, eps_sink, &local_base);
                     if (cand_ll > best_grid_ll) {
                         best_grid_ll = cand_ll;
                         delta = d_c;
@@ -1249,15 +1362,15 @@ public:
 
             // Block 1: SQUAREM acceleration for omega weights (and penalized EM update for eps_sink)
             if (K == 1 && use_error_sink) {
-                weights = compute_expected_weights(s, omegas, weights, syn_rates, syn_weights, ecm_bl_ptr, delta, psi, eps_sink, eps_ptr, max_eps_sink);
+                weights = compute_expected_weights(s, omegas, weights, syn_rates, syn_weights, ecm_bl_ptr, delta, psi, eps_sink, eps_ptr, max_eps_sink, &local_base);
             } else if (K == 2) {
                 for (int sq = 0; sq < 2; ++sq) {
                     Scalar eps0 = eps_sink;
                     auto w0 = weights;
                     Scalar eps1 = eps0;
-                    auto w1 = compute_expected_weights(s, omegas, w0, syn_rates, syn_weights, ecm_bl_ptr, delta, psi, eps0, use_error_sink ? &eps1 : nullptr, max_eps_sink);
+                    auto w1 = compute_expected_weights(s, omegas, w0, syn_rates, syn_weights, ecm_bl_ptr, delta, psi, eps0, use_error_sink ? &eps1 : nullptr, max_eps_sink, &local_base);
                     Scalar eps2 = eps1;
-                    auto w2 = compute_expected_weights(s, omegas, w1, syn_rates, syn_weights, ecm_bl_ptr, delta, psi, eps1, use_error_sink ? &eps2 : nullptr, max_eps_sink);
+                    auto w2 = compute_expected_weights(s, omegas, w1, syn_rates, syn_weights, ecm_bl_ptr, delta, psi, eps1, use_error_sink ? &eps2 : nullptr, max_eps_sink, &local_base);
                     eps_sink = eps2;
                     Scalar r = w1[0] - w0[0];
                     Scalar v = (w2[0] - w1[0]) - r;
@@ -1266,9 +1379,9 @@ public:
                         Scalar p_acc = std::clamp(w0[0] - 2.0 * step * r + step * step * v, 1e-5, 1.0 - 1e-5);
                         std::vector<Scalar> w_acc = {p_acc, 1.0 - p_acc};
                         Scalar eps_stab = eps_sink;
-                        auto w_stab = compute_expected_weights(s, omegas, w_acc, syn_rates, syn_weights, ecm_bl_ptr, delta, psi, eps_sink, use_error_sink ? &eps_stab : nullptr, max_eps_sink);
-                        if (evaluate_log_l(s, omegas, w_stab, syn_rates, syn_weights, ecm_bl_ptr, nullptr, delta, psi, eps_stab) >=
-                            evaluate_log_l(s, omegas, w2, syn_rates, syn_weights, ecm_bl_ptr, nullptr, delta, psi, eps2)) {
+                        auto w_stab = compute_expected_weights(s, omegas, w_acc, syn_rates, syn_weights, ecm_bl_ptr, delta, psi, eps_sink, use_error_sink ? &eps_stab : nullptr, max_eps_sink, &local_base);
+                        if (evaluate_log_l(s, omegas, w_stab, syn_rates, syn_weights, ecm_bl_ptr, nullptr, delta, psi, eps_stab, &local_base) >=
+                            evaluate_log_l(s, omegas, w2, syn_rates, syn_weights, ecm_bl_ptr, nullptr, delta, psi, eps2, &local_base)) {
                             weights = w_stab;
                             eps_sink = eps_stab;
                         } else {
@@ -1283,9 +1396,9 @@ public:
                     Scalar eps0 = eps_sink;
                     auto w0 = weights;
                     Scalar eps1 = eps0;
-                    auto w1 = compute_expected_weights(s, omegas, w0, syn_rates, syn_weights, ecm_bl_ptr, delta, psi, eps0, use_error_sink ? &eps1 : nullptr, max_eps_sink);
+                    auto w1 = compute_expected_weights(s, omegas, w0, syn_rates, syn_weights, ecm_bl_ptr, delta, psi, eps0, use_error_sink ? &eps1 : nullptr, max_eps_sink, &local_base);
                     Scalar eps2 = eps1;
-                    auto w2 = compute_expected_weights(s, omegas, w1, syn_rates, syn_weights, ecm_bl_ptr, delta, psi, eps1, use_error_sink ? &eps2 : nullptr, max_eps_sink);
+                    auto w2 = compute_expected_weights(s, omegas, w1, syn_rates, syn_weights, ecm_bl_ptr, delta, psi, eps1, use_error_sink ? &eps2 : nullptr, max_eps_sink, &local_base);
                     eps_sink = eps2;
                     Scalar r0 = w1[0] - w0[0], r1 = w1[1] - w0[1];
                     Scalar v0 = (w2[0] - w1[0]) - r0, v1 = (w2[1] - w1[1]) - r1;
@@ -1303,9 +1416,9 @@ public:
                         Scalar p3_acc = 1.0 - p1_acc - p2_acc;
                         std::vector<Scalar> w_acc = {p1_acc, p2_acc, p3_acc};
                         Scalar eps_stab = eps_sink;
-                        auto w_stab = compute_expected_weights(s, omegas, w_acc, syn_rates, syn_weights, ecm_bl_ptr, delta, psi, eps_sink, use_error_sink ? &eps_stab : nullptr, max_eps_sink);
-                        if (evaluate_log_l(s, omegas, w_stab, syn_rates, syn_weights, ecm_bl_ptr, nullptr, delta, psi, eps_stab) >=
-                            evaluate_log_l(s, omegas, w2, syn_rates, syn_weights, ecm_bl_ptr, nullptr, delta, psi, eps2)) {
+                        auto w_stab = compute_expected_weights(s, omegas, w_acc, syn_rates, syn_weights, ecm_bl_ptr, delta, psi, eps_sink, use_error_sink ? &eps_stab : nullptr, max_eps_sink, &local_base);
+                        if (evaluate_log_l(s, omegas, w_stab, syn_rates, syn_weights, ecm_bl_ptr, nullptr, delta, psi, eps_stab, &local_base) >=
+                            evaluate_log_l(s, omegas, w2, syn_rates, syn_weights, ecm_bl_ptr, nullptr, delta, psi, eps2, &local_base)) {
                             weights = w_stab;
                             eps_sink = eps_stab;
                         } else {
@@ -1321,8 +1434,8 @@ public:
             if (srv && M >= 2) {
                 for (int sq = 0; sq < 2; ++sq) {
                     auto q0 = syn_weights;
-                    auto q1 = compute_expected_syn_weights(s, omegas, weights, syn_rates, q0, ecm_bl_ptr, delta, psi, eps_sink);
-                    auto q2 = compute_expected_syn_weights(s, omegas, weights, syn_rates, q1, ecm_bl_ptr, delta, psi, eps_sink);
+                    auto q1 = compute_expected_syn_weights(s, omegas, weights, syn_rates, q0, ecm_bl_ptr, delta, psi, eps_sink, &local_base);
+                    auto q2 = compute_expected_syn_weights(s, omegas, weights, syn_rates, q1, ecm_bl_ptr, delta, psi, eps_sink, &local_base);
                     if (M == 2) {
                         Scalar r = q1[0] - q0[0];
                         Scalar v = (q2[0] - q1[0]) - r;
@@ -1330,9 +1443,9 @@ public:
                             Scalar step = -std::abs(r) / std::abs(v);
                             Scalar q_acc = std::clamp(q0[0] - 2.0 * step * r + step * step * v, 1e-5, 1.0 - 1e-5);
                             std::vector<Scalar> q_cand = {q_acc, 1.0 - q_acc};
-                            auto q_stab = compute_expected_syn_weights(s, omegas, weights, syn_rates, q_cand, ecm_bl_ptr, delta, psi, eps_sink);
-                            if (evaluate_log_l(s, omegas, weights, syn_rates, q_stab, ecm_bl_ptr, nullptr, delta, psi, eps_sink) >=
-                                evaluate_log_l(s, omegas, weights, syn_rates, q2, ecm_bl_ptr, nullptr, delta, psi, eps_sink)) {
+                            auto q_stab = compute_expected_syn_weights(s, omegas, weights, syn_rates, q_cand, ecm_bl_ptr, delta, psi, eps_sink, &local_base);
+                            if (evaluate_log_l(s, omegas, weights, syn_rates, q_stab, ecm_bl_ptr, nullptr, delta, psi, eps_sink, &local_base) >=
+                                evaluate_log_l(s, omegas, weights, syn_rates, q2, ecm_bl_ptr, nullptr, delta, psi, eps_sink, &local_base)) {
                                 syn_weights = q_stab;
                             } else {
                                 syn_weights = q2;
@@ -1356,9 +1469,9 @@ public:
                             }
                             Scalar q3_acc = 1.0 - q1_acc - q2_acc;
                             std::vector<Scalar> q_cand = {q1_acc, q2_acc, q3_acc};
-                            auto q_stab = compute_expected_syn_weights(s, omegas, weights, syn_rates, q_cand, ecm_bl_ptr, delta, psi, eps_sink);
-                            if (evaluate_log_l(s, omegas, weights, syn_rates, q_stab, ecm_bl_ptr, nullptr, delta, psi, eps_sink) >=
-                                evaluate_log_l(s, omegas, weights, syn_rates, q2, ecm_bl_ptr, nullptr, delta, psi, eps_sink)) {
+                            auto q_stab = compute_expected_syn_weights(s, omegas, weights, syn_rates, q_cand, ecm_bl_ptr, delta, psi, eps_sink, &local_base);
+                            if (evaluate_log_l(s, omegas, weights, syn_rates, q_stab, ecm_bl_ptr, nullptr, delta, psi, eps_sink, &local_base) >=
+                                evaluate_log_l(s, omegas, weights, syn_rates, q2, ecm_bl_ptr, nullptr, delta, psi, eps_sink, &local_base)) {
                                 syn_weights = q_stab;
                             } else {
                                 syn_weights = q2;
@@ -1376,13 +1489,13 @@ public:
             if (is_constrained) {
                 if (K == 1) {
                     auto opt = NelderMead2D::minimize([&](Scalar w1, Scalar s_c) {
-                        return -evaluate_log_l(s_c, {w1}, weights, syn_rates, syn_weights, ecm_bl_ptr, nullptr, delta, psi, eps_sink);
+                        return -evaluate_log_l(s_c, {w1}, weights, syn_rates, syn_weights, ecm_bl_ptr, nullptr, delta, psi, eps_sink, &local_base);
                     }, omegas[0], s, 0.0, 1.0, 1e-4, 40);
                     omegas[0] = opt.a;
                     s = opt.b;
                 } else if (K == 2) {
                     auto opt = NelderMead2D::minimize([&](Scalar w1, Scalar s_c) {
-                        return -evaluate_log_l(s_c, {w1, 1.0}, weights, syn_rates, syn_weights, ecm_bl_ptr, nullptr, delta, psi, eps_sink);
+                        return -evaluate_log_l(s_c, {w1, 1.0}, weights, syn_rates, syn_weights, ecm_bl_ptr, nullptr, delta, psi, eps_sink, &local_base);
                     }, omegas[0], s, 0.0, 1.0, 1e-4, 40);
                     omegas[0] = opt.a;
                     omegas[1] = 1.0;
@@ -1390,7 +1503,7 @@ public:
                 } else if (K == 3) {
                     auto opt = NelderMeadND<3>::minimize([&](const std::array<Scalar, 3>& x) {
                         if (x[1] > x[2]) return 1e20;
-                        return -evaluate_log_l(x[0], {x[1], x[2], 1.0}, weights, syn_rates, syn_weights, ecm_bl_ptr, nullptr, delta, psi, eps_sink);
+                        return -evaluate_log_l(x[0], {x[1], x[2], 1.0}, weights, syn_rates, syn_weights, ecm_bl_ptr, nullptr, delta, psi, eps_sink, &local_base);
                     }, {s, omegas[0], omegas[1]}, {0.01, 0.0, 0.0}, {50.0, 1.0, 1.0}, 1e-4, 50);
                     s = opt.x[0];
                     omegas[0] = opt.x[1];
@@ -1401,13 +1514,13 @@ public:
                 Scalar max_omega = use_error_sink ? 50.0 : 2000.0;
                 if (K == 1) {
                     auto opt = NelderMead2D::minimize([&](Scalar w1, Scalar s_c) {
-                        return -evaluate_log_l(s_c, {w1}, weights, syn_rates, syn_weights, ecm_bl_ptr, nullptr, delta, psi, eps_sink);
+                        return -evaluate_log_l(s_c, {w1}, weights, syn_rates, syn_weights, ecm_bl_ptr, nullptr, delta, psi, eps_sink, &local_base);
                     }, omegas[0], s, 0.0, max_omega, 1e-4, 40);
                     omegas[0] = opt.a;
                     s = opt.b;
                 } else if (K == 2) {
                     auto opt = NelderMeadND<3>::minimize([&](const std::array<Scalar, 3>& x) {
-                        return -evaluate_log_l(x[0], {x[1], x[2]}, weights, syn_rates, syn_weights, ecm_bl_ptr, nullptr, delta, psi, eps_sink);
+                        return -evaluate_log_l(x[0], {x[1], x[2]}, weights, syn_rates, syn_weights, ecm_bl_ptr, nullptr, delta, psi, eps_sink, &local_base);
                     }, {s, omegas[0], omegas[1]}, {0.01, 0.0, 1.0}, {50.0, 1.0, max_omega}, 1e-4, 50);
                     s = opt.x[0];
                     omegas[0] = opt.x[1];
@@ -1415,7 +1528,7 @@ public:
                 } else if (K == 3) {
                     auto opt = NelderMeadND<4>::minimize([&](const std::array<Scalar, 4>& x) {
                         if (x[1] > x[2] || x[2] > x[3]) return 1e20;
-                        return -evaluate_log_l(x[0], {x[1], x[2], x[3]}, weights, syn_rates, syn_weights, ecm_bl_ptr, nullptr, delta, psi, eps_sink);
+                        return -evaluate_log_l(x[0], {x[1], x[2], x[3]}, weights, syn_rates, syn_weights, ecm_bl_ptr, nullptr, delta, psi, eps_sink, &local_base);
                     }, {s, omegas[0], omegas[1], omegas[2]}, {0.01, 0.0, 0.0, 1.0}, {50.0, 1.0, max_omega, max_omega}, 1e-4, 80);
                     s = opt.x[0];
                     omegas[0] = opt.x[1];
@@ -1424,13 +1537,17 @@ public:
                 }
             }
 
+            if (ecm_iter == 1 || ecm_iter == max_ecm - 1) {
+                try_rescue_collapsed_classes(s, omegas, weights, ecm_bl_ptr);
+            }
+
             // Block 2b: Continuous search on synonymous rates (if SRV && M in {2, 3})
             if (srv && M == 2) {
                 auto syn_opt = NelderMead2D::minimize([&](Scalar a1, Scalar /*unused*/) {
                     Scalar q1 = syn_weights[0], q2 = syn_weights[1];
                     Scalar a2 = (1.0 - q1 * a1) / q2;
                     if (a1 < 0.01 || a2 < a1 || a2 > 50.0) return 1e20;
-                    return -evaluate_log_l(s, omegas, weights, {a1, a2}, syn_weights, ecm_bl_ptr, nullptr, delta, psi, eps_sink);
+                    return -evaluate_log_l(s, omegas, weights, {a1, a2}, syn_weights, ecm_bl_ptr, nullptr, delta, psi, eps_sink, &local_base);
                 }, syn_rates[0], 0.0, 0.01, 2.0, 1e-3, 25);
                 Scalar a1 = syn_opt.a;
                 Scalar a2 = (1.0 - syn_weights[0] * a1) / syn_weights[1];
@@ -1444,7 +1561,7 @@ public:
                     Scalar q1 = syn_weights[0], q2 = syn_weights[1], q3 = syn_weights[2];
                     Scalar a3 = (1.0 - q1 * a1 - q2 * a2) / q3;
                     if (a1 < 0.01 || a2 < a1 || a3 < a2 || a3 > 50.0) return 1e20;
-                    return -evaluate_log_l(s, omegas, weights, {a1, a2, a3}, syn_weights, ecm_bl_ptr, nullptr, delta, psi, eps_sink);
+                    return -evaluate_log_l(s, omegas, weights, {a1, a2, a3}, syn_weights, ecm_bl_ptr, nullptr, delta, psi, eps_sink, &local_base);
                 }, {syn_rates[0], syn_rates[1]}, {0.01, 0.01}, {5.0, 10.0}, 1e-4, 40);
 
                 Scalar a1 = syn_opt.x[0];
@@ -1461,14 +1578,14 @@ public:
             if (allow_triple) {
                 auto mh_opt = NelderMead2D::minimize([&](Scalar d, Scalar p) {
                     if (d < 0.0 || d > 10.0 || p < 0.0 || p > 10.0) return 1e20;
-                    return -evaluate_log_l(s, omegas, weights, syn_rates, syn_weights, ecm_bl_ptr, nullptr, d, p, eps_sink);
+                    return -evaluate_log_l(s, omegas, weights, syn_rates, syn_weights, ecm_bl_ptr, nullptr, d, p, eps_sink, &local_base);
                 }, delta, psi, 0.0, 10.0, 1e-4, 30);
                 delta = std::max(0.0, mh_opt.a);
                 psi = std::max(0.0, mh_opt.b);
             } else if (allow_double) {
                 auto d_opt = NelderMead2D::minimize([&](Scalar d, Scalar /*unused*/) {
                     if (d < 0.0 || d > 10.0) return 1e20;
-                    return -evaluate_log_l(s, omegas, weights, syn_rates, syn_weights, ecm_bl_ptr, nullptr, d, 0.0, eps_sink);
+                    return -evaluate_log_l(s, omegas, weights, syn_rates, syn_weights, ecm_bl_ptr, nullptr, d, 0.0, eps_sink, &local_base);
                 }, delta, 0.0, 0.0, 10.0, 1e-4, 25);
                 delta = std::max(0.0, d_opt.a);
             }
@@ -1476,7 +1593,7 @@ public:
             if (pbar) {
                 std::ostringstream ss;
                 ss << model_desc << " (ECM " << (ecm_iter + 1) << "/" << max_ecm << "): lnL = "
-                   << std::fixed << std::setprecision(2) << evaluate_log_l(s, omegas, weights, syn_rates, syn_weights, ecm_bl_ptr, nullptr, delta, psi, eps_sink);
+                   << std::fixed << std::setprecision(2) << evaluate_log_l(s, omegas, weights, syn_rates, syn_weights, ecm_bl_ptr, nullptr, delta, psi, eps_sink, &local_base);
                 if (!is_constrained && !omegas.empty()) {
                     ss << ", ω" << K << " = " << std::setprecision(2) << omegas.back();
                 }
@@ -1497,15 +1614,15 @@ public:
         }
 
         if (refine_branches) {
-            int num_cycles = (K == 1) ? 2 : 4;
+            int num_cycles = (K == 1) ? 2 : 3;
             for (int cycle = 0; cycle < num_cycles; ++cycle) {
-                bl = refine_branch_lengths(bl, omegas, weights, syn_rates, syn_weights, delta, psi, 25, eps_sink);
+                bl = refine_branch_lengths(bl, omegas, weights, syn_rates, syn_weights, delta, psi, 25, eps_sink, &local_base);
 
                 if (K >= 2 || use_error_sink) {
-                    for (int em = 0; em < 4; ++em) {
-                        weights = compute_expected_weights(1.0, omegas, weights, syn_rates, syn_weights, &bl, delta, psi, eps_sink, use_error_sink ? &eps_sink : nullptr, max_eps_sink);
+                    for (int em = 0; em < 2; ++em) {
+                        weights = compute_expected_weights(1.0, omegas, weights, syn_rates, syn_weights, &bl, delta, psi, eps_sink, use_error_sink ? &eps_sink : nullptr, max_eps_sink, &local_base);
                         if (srv && M >= 2) {
-                            syn_weights = compute_expected_syn_weights(1.0, omegas, weights, syn_rates, syn_weights, &bl, delta, psi, eps_sink);
+                            syn_weights = compute_expected_syn_weights(1.0, omegas, weights, syn_rates, syn_weights, &bl, delta, psi, eps_sink, &local_base);
                         }
                     }
                 }
@@ -1513,37 +1630,43 @@ public:
                 // Polish omegas given refined branch lengths
                 if (is_constrained) {
                     if (K == 2) {
-                        auto [w1_opt, val] = Brent1D::minimize([&](Scalar w1) {
-                            return -evaluate_log_l(1.0, {w1, 1.0}, weights, syn_rates, syn_weights, &bl, nullptr, delta, psi, eps_sink);
-                        }, 0.0, omegas[0], 1.0, 1e-4, 40);
-                        omegas[0] = std::clamp(w1_opt, 0.0, 1.0);
+                        auto opt = NelderMead2D::minimize([&](Scalar w1, Scalar /*unused*/) {
+                            return -evaluate_log_l(1.0, {w1, 1.0}, weights, syn_rates, syn_weights, &bl, nullptr, delta, psi, eps_sink, &local_base);
+                        }, omegas[0], 0.0, 0.0, 1.0, 1e-4, 30);
+                        omegas[0] = opt.a;
                         omegas[1] = 1.0;
                     } else if (K == 3) {
-                        auto opt = NelderMeadND<2>::minimize([&](const std::array<Scalar, 2>& x) {
-                            if (x[0] > x[1]) return 1e20;
-                            return -evaluate_log_l(1.0, {x[0], x[1], 1.0}, weights, syn_rates, syn_weights, &bl, nullptr, delta, psi, eps_sink);
-                        }, {omegas[0], omegas[1]}, {0.0, 0.0}, {1.0, 1.0}, 1e-4, 50);
-                        omegas[0] = opt.x[0];
-                        omegas[1] = opt.x[1];
+                        auto opt = NelderMead2D::minimize([&](Scalar w1, Scalar w2) {
+                            if (w1 > w2) return 1e20;
+                            return -evaluate_log_l(1.0, {w1, w2, 1.0}, weights, syn_rates, syn_weights, &bl, nullptr, delta, psi, eps_sink, &local_base);
+                        }, omegas[0], omegas[1], 0.0, 1.0, 1e-4, 40);
+                        omegas[0] = opt.a;
+                        omegas[1] = opt.b;
                         omegas[2] = 1.0;
                     }
                 } else {
                     Scalar max_omega = use_error_sink ? 50.0 : 2000.0;
                     if (K == 2) {
-                        auto opt = NelderMeadND<2>::minimize([&](const std::array<Scalar, 2>& x) {
-                            return -evaluate_log_l(1.0, {x[0], x[1]}, weights, syn_rates, syn_weights, &bl, nullptr, delta, psi, eps_sink);
-                        }, {omegas[0], omegas[1]}, {0.0, 1.0}, {1.0, max_omega}, 1e-4, 50);
-                        omegas[0] = opt.x[0];
-                        omegas[1] = opt.x[1];
+                        auto opt = NelderMead2D::minimize([&](Scalar w1, Scalar w2) {
+                            if (w1 > 1.0 || w2 < 1.0) return 1e20;
+                            return -evaluate_log_l(1.0, {w1, w2}, weights, syn_rates, syn_weights, &bl, nullptr, delta, psi, eps_sink, &local_base);
+                        }, omegas[0], omegas[1], 0.0, max_omega, 1e-4, 40);
+                        omegas[0] = opt.a;
+                        omegas[1] = opt.b;
                     } else if (K == 3) {
                         auto opt = NelderMeadND<3>::minimize([&](const std::array<Scalar, 3>& x) {
                             if (x[0] > x[1] || x[1] > x[2]) return 1e20;
-                            return -evaluate_log_l(1.0, {x[0], x[1], x[2]}, weights, syn_rates, syn_weights, &bl, nullptr, delta, psi, eps_sink);
-                        }, {omegas[0], omegas[1], omegas[2]}, {0.0, 0.0, 1.0}, {1.0, max_omega, max_omega}, 1e-4, 80);
+                            return -evaluate_log_l(1.0, {x[0], x[1], x[2]}, weights, syn_rates, syn_weights, &bl, nullptr, delta, psi, eps_sink, &local_base);
+                        }, {omegas[0], omegas[1], omegas[2]}, {0.0, 0.0, 1.0}, {1.0, max_omega, max_omega}, 1e-4, 55);
                         omegas[0] = opt.x[0];
                         omegas[1] = opt.x[1];
                         omegas[2] = opt.x[2];
                     }
+                }
+
+                if (cycle == 0 || cycle == num_cycles - 1) {
+                    Scalar one_s = 1.0;
+                    try_rescue_collapsed_classes(one_s, omegas, weights, &bl);
                 }
 
                 // If SRV, polish syn_rates given bl
@@ -1553,7 +1676,7 @@ public:
                         Scalar q1 = syn_weights[0], q2 = syn_weights[1], q3 = syn_weights[2];
                         Scalar a3 = (1.0 - q1 * a1 - q2 * a2) / q3;
                         if (a1 < 0.01 || a2 < a1 || a3 < a2 || a3 > 50.0) return 1e20;
-                        return -evaluate_log_l(1.0, omegas, weights, {a1, a2, a3}, syn_weights, &bl, nullptr, delta, psi, eps_sink);
+                        return -evaluate_log_l(1.0, omegas, weights, {a1, a2, a3}, syn_weights, &bl, nullptr, delta, psi, eps_sink, &local_base);
                     }, {syn_rates[0], syn_rates[1]}, {0.01, 0.01}, {5.0, 10.0}, 1e-4, 40);
 
                     Scalar a1 = syn_opt.x[0];
@@ -1577,14 +1700,14 @@ public:
             if (allow_triple) {
                 auto mh_polish = NelderMead2D::minimize([&](Scalar d, Scalar p) {
                     if (d < 0.0 || d > 10.0 || p < 0.0 || p > 10.0) return 1e20;
-                    return -evaluate_log_l(1.0, omegas, weights, syn_rates, syn_weights, &bl, nullptr, d, p, eps_sink);
+                    return -evaluate_log_l(1.0, omegas, weights, syn_rates, syn_weights, &bl, nullptr, d, p, eps_sink, &local_base);
                 }, delta, psi, 0.0, 10.0, 1e-4, 25);
                 delta = std::max(0.0, mh_polish.a);
                 psi = std::max(0.0, mh_polish.b);
             } else if (allow_double) {
                 auto d_polish = NelderMead2D::minimize([&](Scalar d, Scalar /*unused*/) {
                     if (d < 0.0 || d > 10.0) return 1e20;
-                    return -evaluate_log_l(1.0, omegas, weights, syn_rates, syn_weights, &bl, nullptr, d, 0.0, eps_sink);
+                    return -evaluate_log_l(1.0, omegas, weights, syn_rates, syn_weights, &bl, nullptr, d, 0.0, eps_sink, &local_base);
                 }, delta, 0.0, 0.0, 10.0, 1e-4, 25);
                 delta = std::max(0.0, d_polish.a);
             }
@@ -1596,20 +1719,22 @@ public:
             }
         }
 
-        Scalar best_lnL = evaluate_log_l(1.0, omegas, weights, syn_rates, syn_weights, &bl, &fit.site_log_likelihoods, delta, psi, eps_sink);
+        Scalar best_lnL = evaluate_log_l(1.0, omegas, weights, syn_rates, syn_weights, &bl, &fit.site_log_likelihoods, delta, psi, eps_sink, &local_base);
         fit.log_likelihood = best_lnL;
         fit.tree_scale = s;
         fit.branch_lengths = bl;
         fit.delta = delta;
         fit.psi = psi;
         fit.error_sink_weight = eps_sink;
+        fit.has_gtr_params = true;
+        fit.gtr_params = local_base;
 
         // Compute substitution rates and fractions
         Scalar total_rate = 0.0;
         Scalar double_rate = 0.0;
         Scalar triple_rate = 0.0;
         for (size_t k = 0; k < K; ++k) {
-            MG94Parameters p = base_params;
+            MG94Parameters p = local_base;
             p.alpha = 1.0;
             p.beta = omegas[k];
             p.delta = delta;
@@ -4142,32 +4267,61 @@ public:
                 &res.constrained
             );
         } else {
-            res.optimal_k = settings.num_rate_classes;
+            size_t K_fit = settings.num_rate_classes;
+            res.optimal_k = K_fit;
             res.constrained = fit_model(
                 true,
-                settings.num_rate_classes,
+                K_fit,
                 settings.refine_branch_lengths,
                 settings.srv,
                 settings.num_syn_rate_classes,
                 settings.multiple_hits,
                 pbar.get(),
-                "Constrained K=" + std::to_string(settings.num_rate_classes),
+                "Constrained K=" + std::to_string(K_fit),
                 settings.error_sink,
                 settings.error_sink_max_weight
             );
             res.unconstrained = fit_model(
                 false,
-                settings.num_rate_classes,
+                K_fit,
                 settings.refine_branch_lengths,
                 settings.srv,
                 settings.num_syn_rate_classes,
                 settings.multiple_hits,
                 pbar.get(),
-                "Unconstrained K=" + std::to_string(settings.num_rate_classes),
+                "Unconstrained K=" + std::to_string(K_fit),
                 settings.error_sink,
                 settings.error_sink_max_weight,
                 &res.constrained
             );
+            // Bidirectional cross-check: if Constrained Null had a collapsed class or if clamping
+            // Unconstrained's omega_K := 1.0 yields a better Constrained Null basin, warm-start Null from Unconstrained
+            if (K_fit >= 2) {
+                auto alt_clamped_o = res.unconstrained.test_distribution.omegas;
+                for (auto& o : alt_clamped_o) o = std::min(1.0, o);
+                alt_clamped_o.back() = 1.0;
+                const MG94Parameters* alt_base = res.unconstrained.has_gtr_params ? &res.unconstrained.gtr_params : &base_params;
+                Scalar clamped_ll = evaluate_log_l(
+                    1.0, alt_clamped_o, res.unconstrained.test_distribution.weights,
+                    res.unconstrained.test_distribution.syn_rates.empty() ? std::vector<Scalar>{1.0} : res.unconstrained.test_distribution.syn_rates,
+                    res.unconstrained.test_distribution.syn_weights.empty() ? std::vector<Scalar>{1.0} : res.unconstrained.test_distribution.syn_weights,
+                    &res.unconstrained.branch_lengths, nullptr,
+                    res.unconstrained.delta, res.unconstrained.psi, res.unconstrained.error_sink_weight, alt_base
+                );
+                bool null_collapsed = false;
+                for (size_t i = 0; i < K_fit; ++i) {
+                    if (res.constrained.test_distribution.weights[i] < 0.005) null_collapsed = true;
+                }
+                if (null_collapsed || clamped_ll > res.constrained.log_likelihood - 2.0) {
+                    BUSTEDFit null_rescued = fit_model(
+                        true, K_fit, settings.refine_branch_lengths, settings.srv, settings.num_syn_rate_classes,
+                        settings.multiple_hits, nullptr, "", settings.error_sink, settings.error_sink_max_weight, &res.unconstrained
+                    );
+                    if (null_rescued.log_likelihood > res.constrained.log_likelihood) {
+                        res.constrained = std::move(null_rescued);
+                    }
+                }
+            }
         }
 
         if (!settings.phenotype_mode) {

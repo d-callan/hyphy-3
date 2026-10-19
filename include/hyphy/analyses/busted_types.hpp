@@ -50,6 +50,8 @@ struct BUSTEDFit {
     Scalar frac_delta = 0.0;        // Fraction of 2-hit substitutions
     Scalar frac_psi = 0.0;          // Fraction of 3-hit substitutions
     Scalar error_sink_weight = 0.0; // Fitted contamination proportion epsilon
+    bool has_gtr_params = false;
+    MG94Parameters gtr_params;      // Polished nucleotide substitution rates (theta_AC..GT)
 };
 
 struct BUSTEDAutoDiagnostics {
