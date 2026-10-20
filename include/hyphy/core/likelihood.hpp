@@ -17,6 +17,24 @@ namespace hyphy::core {
 
 class LikelihoodEngine {
 public:
+    // Workload-aware OpenMP thread cap to prevent thread oversubscription and allocator/barrier contention
+    // on small alignments (e.g. 135 patterns on 48- or 64-core servers).
+    static int optimal_omp_threads(size_t num_items, size_t min_items_per_thread = 16, int default_cap = 8) {
+#ifdef _OPENMP
+        int max_t = omp_get_max_threads();
+        int cap = std::min(max_t, std::max(default_cap, 1));
+        // If user explicitly set OMP_NUM_THREADS or --threads <= max_t, respect smaller values;
+        // also never spawn more threads than floor(num_items / min_items_per_thread).
+        int work_cap = static_cast<int>(std::max<size_t>(1, (num_items + min_items_per_thread - 1) / min_items_per_thread));
+        return std::max(1, std::min({max_t, cap, work_cap}));
+#else
+        (void)num_items;
+        (void)min_items_per_thread;
+        (void)default_cap;
+        return 1;
+#endif
+    }
+
     static size_t find_taxon_index(const Alignment& aln, const std::string& name) {
         std::string clean_name = name;
         if (clean_name.size() >= 2 && ((clean_name.front() == '\'' && clean_name.back() == '\'') || (clean_name.front() == '"' && clean_name.back() == '"'))) {
@@ -75,13 +93,14 @@ public:
             ? *custom_leaf_to_taxon
             : (local_map = build_leaf_to_taxon_map(tree, aln));
 
-        Scalar total_log_l = 0.0;
+        std::vector<Scalar> pattern_ll(num_patterns, 0.0);
+        int n_threads = optimal_omp_threads(num_patterns, 32);
 
-        #pragma omp parallel
+        #pragma omp parallel num_threads(n_threads)
         {
             std::vector<Vector4> node_L(num_nodes);
             std::vector<double> node_log_scale(num_nodes, 0.0);
-            #pragma omp for reduction(+:total_log_l) schedule(dynamic)
+            #pragma omp for schedule(static)
             for (size_t p = 0; p < num_patterns; ++p) {
                 const auto& pattern = aln.patterns[p];
 
@@ -111,13 +130,17 @@ public:
 
                 Scalar pattern_likelihood = gtr_model.pi.dot(node_L[tree.root_id]);
                 if (pattern_likelihood > 0.0) {
-                    total_log_l += pattern.weight * (std::log(pattern_likelihood) + node_log_scale[tree.root_id]);
+                    pattern_ll[p] = pattern.weight * (std::log(pattern_likelihood) + node_log_scale[tree.root_id]);
                 } else {
-                    total_log_l += pattern.weight * (-1e20);
+                    pattern_ll[p] = pattern.weight * (-1e20);
                 }
             }
         }
 
+        Scalar total_log_l = 0.0;
+        for (size_t p = 0; p < num_patterns; ++p) {
+            total_log_l += pattern_ll[p];
+        }
         return total_log_l;
     }
 
@@ -144,7 +167,7 @@ public:
     }
 
     // Fast single-pass codon tree likelihood from precomputed transition matrices P_branches
-    // Eliminates pre-order traversal and intermediate heap allocations
+    // Eliminates pre-order traversal, intermediate heap allocations, and thread-order non-determinism
     static Scalar compute_tree_log_likelihood_from_P(
         const Tree& tree,
         const Alignment& aln,
@@ -161,14 +184,15 @@ public:
             ? *custom_leaf_to_taxon
             : (local_map = build_leaf_to_taxon_map(tree, aln));
 
-        Scalar total_log_l = 0.0;
+        std::vector<Scalar> pattern_ll(num_patterns, 0.0);
+        int n_threads = optimal_omp_threads(num_patterns, 16);
 
-        #pragma omp parallel
+        #pragma omp parallel num_threads(n_threads)
         {
             std::vector<Vector> node_L(num_nodes, Vector::Zero(S));
             std::vector<double> node_log_scale(num_nodes, 0.0);
 
-            #pragma omp for reduction(+:total_log_l) schedule(dynamic)
+            #pragma omp for schedule(static)
             for (size_t p = 0; p < num_patterns; ++p) {
                 const auto& pattern = aln.patterns[p];
 
@@ -198,13 +222,17 @@ public:
 
                 Scalar pattern_likelihood = pi.dot(node_L[tree.root_id]);
                 if (pattern_likelihood > 0.0) {
-                    total_log_l += pattern.weight * (std::log(pattern_likelihood) + node_log_scale[tree.root_id]);
+                    pattern_ll[p] = pattern.weight * (std::log(pattern_likelihood) + node_log_scale[tree.root_id]);
                 } else {
-                    total_log_l += pattern.weight * (-1e20);
+                    pattern_ll[p] = pattern.weight * (-1e20);
                 }
             }
         }
 
+        Scalar total_log_l = 0.0;
+        for (size_t p = 0; p < num_patterns; ++p) {
+            total_log_l += pattern_ll[p];
+        }
         return total_log_l;
     }
 
@@ -216,6 +244,105 @@ public:
         Scalar likelihood = 0.0;
         Scalar log_likelihood = 0.0;
     };
+
+    // Reusable thread-local workspace for zero-allocation Inside-Outside traversals
+    struct InsideOutsideWorkspace {
+        std::vector<Vector> D;
+        std::vector<Vector> V;
+        std::vector<Vector> P_D;
+        std::vector<Vector> U;
+        std::vector<double> B;
+        std::vector<double> node_log_scale;
+        Vector v_msg;
+        Scalar likelihood = 0.0;
+        Scalar log_likelihood = 0.0;
+
+        void init(size_t num_nodes, int S) {
+            if (D.size() != num_nodes || (num_nodes > 0 && D[0].size() != S)) {
+                D.assign(num_nodes, Vector::Zero(S));
+                V.assign(num_nodes, Vector::Zero(S));
+                P_D.assign(num_nodes, Vector::Zero(S));
+                U.assign(num_nodes, Vector::Zero(S));
+                B.assign(num_nodes, 1.0);
+                node_log_scale.assign(num_nodes, 0.0);
+                v_msg.resize(S);
+            }
+        }
+    };
+
+    static void compute_inside_outside_in_place(
+        const Tree& tree,
+        const SitePattern& pattern,
+        const std::vector<size_t>& leaf_to_taxon,
+        const std::vector<Matrix>& P_branches,
+        const Vector& pi,
+        int S,
+        InsideOutsideWorkspace& ws
+    ) {
+        size_t num_nodes = tree.num_nodes();
+        ws.init(num_nodes, S);
+
+        // 1. Post-order (bottom-up) pass to compute D and cache P_D
+        for (int32_t nid : tree.post_order) {
+            const auto& node = tree.nodes[nid];
+            if (node.is_leaf) {
+                size_t t_idx = leaf_to_taxon[nid];
+                if (t_idx != static_cast<size_t>(-1)) {
+                    int8_t state = pattern.states[t_idx];
+                    if (state >= 0 && state < S) {
+                        ws.D[nid].setZero();
+                        ws.D[nid](state) = 1.0;
+                    } else {
+                        ws.D[nid].setOnes();
+                    }
+                } else {
+                    ws.D[nid].setOnes();
+                }
+                ws.node_log_scale[nid] = 0.0;
+                ws.B[nid] = 1.0;
+            } else {
+                double child_scale_sum = 0.0;
+                for (int32_t cid : node.children) {
+                    ws.P_D[cid].noalias() = P_branches[cid] * ws.D[cid];
+                }
+                double boost_mult = 1.0;
+                const std::vector<std::array<Matrix, 3>>* no_bridges = nullptr;
+                tree.eval_internal_node(nid, P_branches, ws.D, ws.node_log_scale, ws.D[nid], child_scale_sum, no_bridges, &boost_mult);
+                ws.B[nid] = boost_mult;
+                ws.node_log_scale[nid] = child_scale_sum;
+            }
+        }
+
+        ws.likelihood = ws.D[tree.root_id].dot(pi);
+        if (ws.likelihood > 0.0) {
+            ws.log_likelihood = std::log(ws.likelihood) + ws.node_log_scale[tree.root_id];
+        } else {
+            ws.log_likelihood = -1e20;
+        }
+
+        // 2. Pre-order (top-down) pass to compute U and V reusing cached P_D
+        ws.U[tree.root_id] = pi;
+
+        for (auto it = tree.post_order.rbegin(); it != tree.post_order.rend(); ++it) {
+            int32_t uid = *it;
+            const auto& node = tree.nodes[uid];
+            if (node.is_leaf) continue;
+
+            size_t num_children = node.children.size();
+            for (size_t i = 0; i < num_children; ++i) {
+                int32_t vid = node.children[i];
+                ws.v_msg = ws.U[uid];
+                for (size_t j = 0; j < num_children; ++j) {
+                    if (i != j) {
+                        ws.v_msg.array() *= ws.P_D[node.children[j]].array();
+                    }
+                }
+                ws.v_msg *= ws.B[uid];
+                ws.V[vid] = ws.v_msg;
+                ws.U[vid].noalias() = P_branches[vid].transpose() * ws.v_msg;
+            }
+        }
+    }
 
     static InsideOutsideResult compute_inside_outside(
         const Tree& tree,
@@ -387,41 +514,49 @@ public:
             ? *custom_leaf_to_taxon
             : (local_map = build_leaf_to_taxon_map(tree, aln));
 
-        Scalar total_log_l = 0.0;
-        std::vector<Scalar> grad_b(num_nodes, 0.0);
+        std::vector<Scalar> pattern_ll(num_patterns, 0.0);
+        Matrix pattern_grad = Matrix::Zero(num_nodes, num_patterns);
+        int n_threads = optimal_omp_threads(num_patterns, 16);
 
-        #pragma omp parallel
+        #pragma omp parallel num_threads(n_threads)
         {
-            std::vector<Scalar> local_grad(num_nodes, 0.0);
-            Scalar local_ll = 0.0;
+            InsideOutsideWorkspace ws;
+            ws.init(num_nodes, S);
+            Vector tmp_vec(S);
 
-            #pragma omp for schedule(dynamic)
+            #pragma omp for schedule(static)
             for (size_t p = 0; p < num_patterns; ++p) {
                 const auto& pattern = aln.patterns[p];
-                auto io = compute_inside_outside(
-                    tree, pattern, leaf_to_taxon, P_branches, aln.codon_frequencies_f3x4, S
+                compute_inside_outside_in_place(
+                    tree, pattern, leaf_to_taxon, P_branches, aln.codon_frequencies_f3x4, S, ws
                 );
-                Scalar L = io.likelihood;
+                Scalar L = ws.likelihood;
                 if (L > 0.0) {
-                    local_ll += pattern.weight * io.log_likelihood;
+                    pattern_ll[p] = pattern.weight * ws.log_likelihood;
                     Scalar inv_L = pattern.weight / L;
                     for (const auto& node : tree.nodes) {
                         if (node.id != tree.root_id) {
                             int32_t vid = node.id;
-                            Scalar dL_dt = io.V[vid].dot(dP_branches[vid] * io.D[vid]);
-                            local_grad[vid] += inv_L * dL_dt;
+                            tmp_vec.noalias() = dP_branches[vid] * ws.D[vid];
+                            Scalar dL_dt = ws.V[vid].dot(tmp_vec);
+                            pattern_grad(vid, p) = inv_L * dL_dt;
                         }
                     }
                 }
             }
+        }
 
-            #pragma omp critical
-            {
-                total_log_l += local_ll;
-                for (size_t i = 0; i < num_nodes; ++i) {
-                    grad_b[i] += local_grad[i];
-                }
+        Scalar total_log_l = 0.0;
+        for (size_t p = 0; p < num_patterns; ++p) {
+            total_log_l += pattern_ll[p];
+        }
+        std::vector<Scalar> grad_b(num_nodes, 0.0);
+        for (size_t i = 0; i < num_nodes; ++i) {
+            Scalar s = 0.0;
+            for (size_t p = 0; p < num_patterns; ++p) {
+                s += pattern_grad(i, p);
             }
+            grad_b[i] = s;
         }
 
         return {total_log_l, grad_b};
@@ -480,45 +615,59 @@ public:
             ? *custom_leaf_to_taxon
             : (local_map = build_leaf_to_taxon_map(tree, aln));
 
-        Scalar total_log_l = 0.0;
-        std::vector<Scalar> dL_dtau(num_nodes, 0.0);
-        std::vector<Matrix> A_branches(num_nodes, Matrix::Zero(S, S));
+        std::vector<Scalar> pattern_ll(num_patterns, 0.0);
+        Matrix pattern_dL = Matrix::Zero(num_nodes, num_patterns);
+        // Pack V and D across patterns for each branch so A_branches[bid] = V_mat[bid] * D_mat[bid]^T is a single deterministic BLAS GEMM!
+        std::vector<Matrix> V_mat(num_nodes, Matrix::Zero(S, num_patterns));
+        std::vector<Matrix> D_mat(num_nodes, Matrix::Zero(S, num_patterns));
+        int n_threads = optimal_omp_threads(num_patterns, 16);
 
-        #pragma omp parallel
+        #pragma omp parallel num_threads(n_threads)
         {
-            Scalar local_ll = 0.0;
-            std::vector<Scalar> local_dL(num_nodes, 0.0);
-            std::vector<Matrix> local_A(num_nodes, Matrix::Zero(S, S));
+            InsideOutsideWorkspace ws;
+            ws.init(num_nodes, S);
+            Vector tmp_vec(S);
 
-            #pragma omp for schedule(dynamic)
+            #pragma omp for schedule(static)
             for (size_t p = 0; p < num_patterns; ++p) {
                 const auto& pattern = aln.patterns[p];
-                auto io = compute_inside_outside(
-                    tree, pattern, leaf_to_taxon, P_branches, aln.codon_frequencies_f3x4, S
+                compute_inside_outside_in_place(
+                    tree, pattern, leaf_to_taxon, P_branches, aln.codon_frequencies_f3x4, S, ws
                 );
-                Scalar L = io.likelihood;
+                Scalar L = ws.likelihood;
                 if (L > 0.0) {
-                    local_ll += pattern.weight * io.log_likelihood;
+                    pattern_ll[p] = pattern.weight * ws.log_likelihood;
                     Scalar inv_L = pattern.weight / L;
 
                     for (const auto& node : tree.nodes) {
                         if (node.id != tree.root_id) {
                             int32_t bid = node.id;
-                            Scalar dL_dt = io.V[bid].dot(dP_branches[bid] * io.D[bid]);
-                            local_dL[bid] += inv_L * dL_dt;
-                            local_A[bid].noalias() += inv_L * (io.V[bid] * io.D[bid].transpose());
+                            tmp_vec.noalias() = dP_branches[bid] * ws.D[bid];
+                            Scalar dL_dt = ws.V[bid].dot(tmp_vec);
+                            pattern_dL(bid, p) = inv_L * dL_dt;
+                            V_mat[bid].col(p) = inv_L * ws.V[bid];
+                            D_mat[bid].col(p) = ws.D[bid];
                         }
                     }
                 }
             }
+        }
 
-            #pragma omp critical
-            {
-                total_log_l += local_ll;
-                for (size_t i = 0; i < num_nodes; ++i) {
-                    dL_dtau[i] += local_dL[i];
-                    A_branches[i] += local_A[i];
+        Scalar total_log_l = 0.0;
+        for (size_t p = 0; p < num_patterns; ++p) {
+            total_log_l += pattern_ll[p];
+        }
+        std::vector<Scalar> dL_dtau(num_nodes, 0.0);
+        std::vector<Matrix> A_branches(num_nodes);
+        for (const auto& node : tree.nodes) {
+            if (node.id != tree.root_id) {
+                int32_t bid = node.id;
+                Scalar s = 0.0;
+                for (size_t p = 0; p < num_patterns; ++p) {
+                    s += pattern_dL(bid, p);
                 }
+                dL_dtau[bid] = s;
+                A_branches[bid].noalias() = V_mat[bid] * D_mat[bid].transpose();
             }
         }
 

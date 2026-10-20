@@ -138,8 +138,16 @@ public:
     // branch_weights[id]: mixture proportions for branch id
     std::vector<std::vector<Scalar>> branch_weights;
 
-    // Scale factors for Q matrices
+    // Scale factors and precomputed rate templates for Q(1, omega) = Q_syn + omega * Q_nonsyn
     Scalar syn_scale_factor = 1.0;
+    Scalar nonsyn_scale_factor = 1.0;
+    Matrix Q_syn_template;
+    Matrix Q_nonsyn_template;
+    Matrix S_syn_template;
+    Matrix S_nonsyn_template;
+    Vector sqrt_pi_vec;
+    Vector inv_sqrt_pi_vec;
+    Vector pattern_weights_vec;
 
     std::vector<bool> is_test_branch;
 
@@ -148,6 +156,20 @@ public:
         gcode = aln.code ? aln.code.get() : GeneticCode::universal().get();
         pos_nuc_freqs = aln.pos_nuc_frequencies;
         codon_freqs = aln.codon_frequencies_f3x4;
+
+        int S = gcode->num_sense_codons;
+        sqrt_pi_vec.resize(S);
+        inv_sqrt_pi_vec.resize(S);
+        for (int i = 0; i < S; ++i) {
+            sqrt_pi_vec(i) = std::sqrt(std::max(codon_freqs(i), 1e-12));
+            inv_sqrt_pi_vec(i) = 1.0 / sqrt_pi_vec(i);
+        }
+
+        size_t num_patterns = aln.patterns.size();
+        pattern_weights_vec.resize(num_patterns);
+        for (size_t p = 0; p < num_patterns; ++p) {
+            pattern_weights_vec(p) = aln.patterns[p].weight;
+        }
 
         auto sel = tree.select_branches(settings.test_branches, "", {}, false);
         is_test_branch = std::move(sel.is_selected);
@@ -176,31 +198,64 @@ public:
     }
 
     void compute_syn_scale() {
-        MG94Matrix mat;
-        MG94Parameters p;
-        p.alpha = 1.0;
-        p.beta = 0.0; // synonymous only
-        p.theta_AC = gtr_params.theta_AC;
-        p.theta_AT = gtr_params.theta_AT;
-        p.theta_CG = gtr_params.theta_CG;
-        p.theta_CT = gtr_params.theta_CT;
-        p.theta_GT = gtr_params.theta_GT;
-        mat.update(p, pos_nuc_freqs, codon_freqs, *gcode);
-        syn_scale_factor = mat.scale_factor;
+        int S = gcode->num_sense_codons;
+        Scalar r_nuc[4][4] = {
+            {0.0, gtr_params.theta_AC, 1.0, gtr_params.theta_AT},
+            {gtr_params.theta_AC, 0.0, gtr_params.theta_CG, gtr_params.theta_CT},
+            {1.0, gtr_params.theta_CG, 0.0, gtr_params.theta_GT},
+            {gtr_params.theta_AT, gtr_params.theta_CT, gtr_params.theta_GT, 0.0}
+        };
+
+        Q_syn_template = Matrix::Zero(S, S);
+        Q_nonsyn_template = Matrix::Zero(S, S);
+
+        for (int i = 0; i < S; ++i) {
+            for (int j = 0; j < S; ++j) {
+                if (i == j) continue;
+                const auto& diff = gcode->diff_matrix[i][j];
+                if (diff.num_diffs == 1) {
+                    Scalar rate = r_nuc[diff.diff_from[0]][diff.diff_to[0]] *
+                                  pos_nuc_freqs(diff.diff_pos[0], diff.diff_to[0]);
+                    if (diff.synonymous) {
+                        Q_syn_template(i, j) = rate;
+                    } else {
+                        Q_nonsyn_template(i, j) = rate;
+                    }
+                }
+            }
+            Q_syn_template(i, i) = -Q_syn_template.row(i).sum();
+            Q_nonsyn_template(i, i) = -Q_nonsyn_template.row(i).sum();
+        }
+
+        syn_scale_factor = -(codon_freqs.array() * Q_syn_template.diagonal().array()).sum();
+        nonsyn_scale_factor = -(codon_freqs.array() * Q_nonsyn_template.diagonal().array()).sum();
+
+        S_syn_template = sqrt_pi_vec.asDiagonal() * Q_syn_template * inv_sqrt_pi_vec.asDiagonal();
+        S_syn_template = 0.5 * (S_syn_template + S_syn_template.transpose());
+        S_nonsyn_template = sqrt_pi_vec.asDiagonal() * Q_nonsyn_template * inv_sqrt_pi_vec.asDiagonal();
+        S_nonsyn_template = 0.5 * (S_nonsyn_template + S_nonsyn_template.transpose());
     }
 
-    // Build rate matrix Q(1, omega)
+    // Build rate matrix Q(1, omega) using pre-split synonymous and nonsynonymous templates
     MG94Matrix build_q_matrix(Scalar omega) const {
         MG94Matrix mat;
-        MG94Parameters p;
-        p.alpha = 1.0;
-        p.beta = omega;
-        p.theta_AC = gtr_params.theta_AC;
-        p.theta_AT = gtr_params.theta_AT;
-        p.theta_CG = gtr_params.theta_CG;
-        p.theta_CT = gtr_params.theta_CT;
-        p.theta_GT = gtr_params.theta_GT;
-        mat.update(p, pos_nuc_freqs, codon_freqs, *gcode);
+        mat.pi = codon_freqs;
+        mat.sqrt_pi = sqrt_pi_vec;
+        mat.inv_sqrt_pi = inv_sqrt_pi_vec;
+        mat.Q = Q_syn_template + omega * Q_nonsyn_template;
+        mat.scale_factor = syn_scale_factor + omega * nonsyn_scale_factor;
+
+        Matrix S_mat = S_syn_template + omega * S_nonsyn_template;
+        Eigen::SelfAdjointEigenSolver<Matrix> solver(S_mat);
+        if (solver.info() != Eigen::Success) {
+            throw std::runtime_error("MG94 eigendecomposition failed");
+        }
+
+        mat.eigenvalues = solver.eigenvalues().cwiseMin(0.0);
+        mat.eigenvectors = solver.eigenvectors();
+        mat.inv_eigenvectors = mat.eigenvectors.transpose();
+        mat.U_pi = inv_sqrt_pi_vec.asDiagonal() * mat.eigenvectors;
+        mat.V_pi = mat.inv_eigenvectors * sqrt_pi_vec.asDiagonal();
         return mat;
     }
 
@@ -223,14 +278,7 @@ public:
 
     // Precompute all branch transition matrices across the tree
     std::vector<Matrix> compute_all_branch_transition_matrices() const {
-        size_t num_nodes = tree.num_nodes();
-        std::vector<Matrix> P_branches(num_nodes);
-        for (const auto& node : tree.nodes) {
-            if (node.id != tree.root_id) {
-                P_branches[node.id] = compute_branch_transition_matrix(node.id);
-            }
-        }
-        return P_branches;
+        return compute_all_branch_transition_matrices_with(branch_alpha, branch_omegas, branch_weights);
     }
 
     std::vector<Matrix> compute_all_branch_transition_matrices_with(
@@ -241,15 +289,22 @@ public:
         size_t num_nodes = tree.num_nodes();
         int S = gcode->num_sense_codons;
         std::vector<Matrix> P_branches(num_nodes);
+        std::vector<int32_t> active_branches;
+        active_branches.reserve(num_nodes);
         for (const auto& node : tree.nodes) {
             if (node.id != tree.root_id) {
-                int32_t bid = node.id;
-                Scalar a = alphas[bid];
-                P_branches[bid] = Matrix::Zero(S, S);
-                for (size_t k = 0; k < omegas[bid].size(); ++k) {
-                    MG94Matrix mat = build_q_matrix(omegas[bid][k]);
-                    P_branches[bid] += weights[bid][k] * mat.transition_matrix(a);
-                }
+                active_branches.push_back(node.id);
+            }
+        }
+        int n_threads = LikelihoodEngine::optimal_omp_threads(active_branches.size(), 4);
+        #pragma omp parallel for num_threads(n_threads) schedule(static)
+        for (size_t i = 0; i < active_branches.size(); ++i) {
+            int32_t bid = active_branches[i];
+            Scalar a = alphas[bid];
+            P_branches[bid] = Matrix::Zero(S, S);
+            for (size_t k = 0; k < omegas[bid].size(); ++k) {
+                MG94Matrix mat = build_q_matrix(omegas[bid][k]);
+                P_branches[bid] += weights[bid][k] * mat.transition_matrix(a);
             }
         }
         return P_branches;
@@ -270,8 +325,8 @@ public:
         const auto& weights = branch_weights[node_id];
         Scalar total_sub_rate = 0.0;
         for (size_t k = 0; k < omegas.size(); ++k) {
-            MG94Matrix mat = build_q_matrix(omegas[k]);
-            total_sub_rate += weights[k] * (mat.scale_factor / 3.0);
+            Scalar sf = syn_scale_factor + omegas[k] * nonsyn_scale_factor;
+            total_sub_rate += weights[k] * (sf / 3.0);
         }
         return alpha * total_sub_rate;
     }
@@ -295,6 +350,69 @@ public:
     // Asymptotic p-value for mixture distribution: 0.5 * [0.4 * chi2_1 + 0.6 * chi2_2]
     static Scalar compute_mixture_p_value(Scalar lrt) {
         return hyphy::core::stats::mixture_chi2_p_value(lrt, 0.20, 0.30);
+    }
+
+    // Vectorized evaluation of branch log-likelihood from packed [S x num_patterns] V_mat and D_mat
+    Scalar eval_branch_ll_from_matrices(
+        const Matrix& P_b,
+        const Matrix& V_mat,
+        const Matrix& D_mat,
+        Scalar log_scale_offset,
+        Matrix& PD_scratch
+    ) const {
+        PD_scratch.noalias() = P_b * D_mat;
+        size_t num_patterns = aln.patterns.size();
+        Scalar ll = log_scale_offset;
+        for (size_t p = 0; p < num_patterns; ++p) {
+            Scalar Lp = V_mat.col(p).dot(PD_scratch.col(p));
+            if (Lp > 0.0) {
+                ll += pattern_weights_vec(p) * std::log(Lp);
+            } else {
+                ll += pattern_weights_vec(p) * (-1e20);
+            }
+        }
+        return ll;
+    }
+
+    // Zero-allocation helper to compute V_mat [S x P], D_mat [S x P], and log_scale_offset for a single branch
+    void compute_branch_context_matrices(
+        int32_t bid,
+        const std::vector<Matrix>& P_branches,
+        Matrix& V_mat,
+        Matrix& D_mat,
+        Scalar& log_scale_offset
+    ) const {
+        int S = gcode->num_sense_codons;
+        size_t num_patterns = aln.patterns.size();
+        size_t num_nodes = tree.num_nodes();
+        V_mat.resize(S, num_patterns);
+        D_mat.resize(S, num_patterns);
+        std::vector<Scalar> scale_offsets(num_patterns, 0.0);
+
+        int n_threads = LikelihoodEngine::optimal_omp_threads(num_patterns, 16);
+        #pragma omp parallel num_threads(n_threads)
+        {
+            LikelihoodEngine::InsideOutsideWorkspace ws;
+            ws.init(num_nodes, S);
+
+            #pragma omp for schedule(static)
+            for (size_t p = 0; p < num_patterns; ++p) {
+                const auto& pattern = aln.patterns[p];
+                LikelihoodEngine::compute_inside_outside_in_place(
+                    tree, pattern, leaf_to_taxon, P_branches, codon_freqs, S, ws
+                );
+                V_mat.col(p) = ws.V[bid];
+                D_mat.col(p) = ws.D[bid];
+                if (ws.likelihood > 0.0) {
+                    scale_offsets[p] = pattern.weight * (ws.log_likelihood - std::log(ws.likelihood));
+                }
+            }
+        }
+
+        log_scale_offset = 0.0;
+        for (size_t p = 0; p < num_patterns; ++p) {
+            log_scale_offset += scale_offsets[p];
+        }
     }
 
     // Phase 1: Fit GTR
@@ -328,7 +446,8 @@ public:
     ) {
         int S = gcode->num_sense_codons;
         size_t num_patterns = aln.patterns.size();
-        size_t num_branches = tree.num_nodes() - 1;
+        size_t num_nodes = tree.num_nodes();
+        size_t num_branches = num_nodes - 1;
 
         std::vector<int32_t> branch_ids;
         branch_ids.reserve(num_branches);
@@ -352,64 +471,66 @@ public:
         std::vector<Matrix> P_branches = compute_all_branch_transition_matrices();
         Scalar prev_ll = compute_tree_log_likelihood(P_branches);
 
-        for (int cycle = 0; cycle < max_cycles; ++cycle) {
-            // 1. Single Inside-Outside pass for all patterns across entire tree
-            std::vector<std::vector<Vector>> V_all(tree.num_nodes(), std::vector<Vector>(num_patterns));
-            std::vector<std::vector<Vector>> D_all(tree.num_nodes(), std::vector<Vector>(num_patterns));
+        std::vector<Matrix> V_all(num_nodes, Matrix::Zero(S, num_patterns));
+        std::vector<Matrix> D_all(num_nodes, Matrix::Zero(S, num_patterns));
 
-            #pragma omp parallel for schedule(dynamic)
-            for (size_t p = 0; p < num_patterns; ++p) {
-                const auto& pattern = aln.patterns[p];
-                auto io = LikelihoodEngine::compute_inside_outside(
-                    tree, pattern, leaf_to_taxon, P_branches, codon_freqs, S
-                );
-                for (int32_t bid : branch_ids) {
-                    V_all[bid][p] = std::move(io.V[bid]);
-                    D_all[bid][p] = std::move(io.D[bid]);
+        for (int cycle = 0; cycle < max_cycles; ++cycle) {
+            // 1. Single zero-allocation Inside-Outside pass for all patterns across entire tree
+            int io_threads = LikelihoodEngine::optimal_omp_threads(num_patterns, 16);
+            #pragma omp parallel num_threads(io_threads)
+            {
+                LikelihoodEngine::InsideOutsideWorkspace ws;
+                ws.init(num_nodes, S);
+
+                #pragma omp for schedule(static)
+                for (size_t p = 0; p < num_patterns; ++p) {
+                    const auto& pattern = aln.patterns[p];
+                    LikelihoodEngine::compute_inside_outside_in_place(
+                        tree, pattern, leaf_to_taxon, P_branches, codon_freqs, S, ws
+                    );
+                    for (int32_t bid : branch_ids) {
+                        V_all[bid].col(p) = ws.V[bid];
+                        D_all[bid].col(p) = ws.D[bid];
+                    }
                 }
             }
 
-            std::vector<Scalar> new_alpha(tree.num_nodes());
-            std::vector<Scalar> new_omega(tree.num_nodes());
+            std::vector<Scalar> new_alpha(num_nodes);
+            std::vector<Scalar> new_omega(num_nodes);
 
-            // 2. Parallel branch optimization using cached Inside-Outside context
-            #pragma omp parallel for schedule(dynamic)
-            for (size_t bi = 0; bi < branch_ids.size(); ++bi) {
-                int32_t bid = branch_ids[bi];
-                const auto& node = tree.nodes[bid];
+            // 2. Parallel branch optimization using cached Inside-Outside context matrices
+            int br_threads = LikelihoodEngine::optimal_omp_threads(branch_ids.size(), 2);
+            #pragma omp parallel num_threads(br_threads)
+            {
+                Matrix PD_scratch(S, num_patterns);
+                #pragma omp for schedule(static)
+                for (size_t bi = 0; bi < branch_ids.size(); ++bi) {
+                    int32_t bid = branch_ids[bi];
+                    const auto& node = tree.nodes[bid];
 
-                auto branch_obj = [&](Scalar log_alpha, Scalar log_omega) -> Scalar {
-                    Scalar cur_alpha = std::exp(log_alpha);
-                    Scalar cur_omega = std::exp(log_omega);
-                    if (cur_alpha > 50.0 || cur_omega > 5000.0) return 1e20;
+                    auto branch_obj = [&](Scalar log_alpha, Scalar log_omega) -> Scalar {
+                        Scalar cur_alpha = std::exp(log_alpha);
+                        Scalar cur_omega = std::exp(log_omega);
+                        if (cur_alpha > 50.0 || cur_omega > 5000.0) return 1e20;
 
-                    MG94Matrix mat = build_q_matrix(cur_omega);
-                    Matrix P_b = mat.transition_matrix(cur_alpha);
+                        MG94Matrix mat = build_q_matrix(cur_omega);
+                        Matrix P_b = mat.transition_matrix(cur_alpha);
+                        return -eval_branch_ll_from_matrices(P_b, V_all[bid], D_all[bid], 0.0, PD_scratch);
+                    };
 
-                    Scalar ll = 0.0;
-                    for (size_t p = 0; p < num_patterns; ++p) {
-                        Scalar Lp = V_all[bid][p].dot(P_b * D_all[bid][p]);
-                        if (Lp > 0.0) {
-                            ll += aln.patterns[p].weight * std::log(Lp);
-                        } else {
-                            ll += aln.patterns[p].weight * (-1e20);
-                        }
+                    Scalar init_log_alpha = std::log(std::clamp(branch_alpha[bid], 1e-4, 20.0));
+                    Scalar init_log_omega = std::log(std::clamp(branch_omegas[bid][0], 1e-3, 50.0));
+
+                    auto opt_res = NelderMead2D::minimize(branch_obj, init_log_alpha, init_log_omega, -10.0, 10.0, 1e-4, 80);
+                    new_alpha[bid] = std::exp(opt_res.a);
+                    new_omega[bid] = std::exp(opt_res.b);
+
+                    if (pbar_p2) {
+                        pbar_p2->tick();
+                        std::ostringstream ss;
+                        ss << node.name << " (c" << (cycle + 1) << "/" << max_cycles << " w=" << std::fixed << std::setprecision(2) << new_omega[bid] << ")";
+                        pbar_p2->set_status(ss.str());
                     }
-                    return -ll;
-                };
-
-                Scalar init_log_alpha = std::log(std::clamp(branch_alpha[bid], 1e-4, 20.0));
-                Scalar init_log_omega = std::log(std::clamp(branch_omegas[bid][0], 1e-3, 50.0));
-
-                auto opt_res = NelderMead2D::minimize(branch_obj, init_log_alpha, init_log_omega, -10.0, 10.0, 1e-4, 80);
-                new_alpha[bid] = std::exp(opt_res.a);
-                new_omega[bid] = std::exp(opt_res.b);
-
-                if (pbar_p2) {
-                    pbar_p2->tick();
-                    std::ostringstream ss;
-                    ss << node.name << " (c" << (cycle + 1) << "/" << max_cycles << " w=" << std::fixed << std::setprecision(2) << new_omega[bid] << ")";
-                    pbar_p2->set_status(ss.str());
                 }
             }
 
@@ -417,9 +538,8 @@ public:
                 branch_alpha[bid] = new_alpha[bid];
                 branch_omegas[bid][0] = new_omega[bid];
                 branch_weights[bid][0] = 1.0;
-                MG94Matrix updated_mat = build_q_matrix(new_omega[bid]);
-                P_branches[bid] = updated_mat.transition_matrix(new_alpha[bid]);
             }
+            P_branches = compute_all_branch_transition_matrices();
 
             if (progress_cb) {
                 double cycle_frac = static_cast<double>(cycle + 1) / static_cast<double>(max_cycles);
@@ -457,39 +577,31 @@ public:
         Scalar alpha = 0.01;
     };
 
-    LocalBranchFit optimize_branch_mixture(
+    LocalBranchFit optimize_branch_mixture_mat(
         int32_t bid,
         int M,
-        const std::vector<Vector>& V_patterns,
-        const std::vector<Vector>& D_patterns,
+        const Matrix& V_mat,
+        const Matrix& D_mat,
         bool constrain_null = false,
         Scalar override_alpha = -1.0,
         const std::vector<Scalar>* override_omegas = nullptr,
         const std::vector<Scalar>* override_weights = nullptr,
         Scalar log_scale_offset = 0.0
     ) const {
+        int S = gcode->num_sense_codons;
         size_t num_patterns = aln.patterns.size();
         Scalar cur_alpha = (override_alpha > 0.0) ? override_alpha : std::max(1e-5, branch_alpha[bid]);
         const auto& cur_omegas = (override_omegas != nullptr) ? *override_omegas : branch_omegas[bid];
         const auto& cur_weights = (override_weights != nullptr) ? *override_weights : branch_weights[bid];
 
+        Matrix PD_scratch(S, num_patterns);
+
         if (M == 1) {
+            MG94Matrix mat_w1 = build_q_matrix(1.0);
             auto obj_1d = [&](Scalar log_a, Scalar log_w) -> Scalar {
                 Scalar a = std::exp(log_a);
-                Scalar w = constrain_null ? 1.0 : std::exp(log_w);
-                MG94Matrix mat = build_q_matrix(w);
-                Matrix P_b = mat.transition_matrix(a);
-
-                Scalar ll = log_scale_offset;
-                for (size_t p = 0; p < num_patterns; ++p) {
-                    Scalar Lp = V_patterns[p].dot(P_b * D_patterns[p]);
-                    if (Lp > 0.0) {
-                        ll += aln.patterns[p].weight * std::log(Lp);
-                    } else {
-                        ll += aln.patterns[p].weight * (-1e20);
-                    }
-                }
-                return -ll;
+                Matrix P_b = constrain_null ? mat_w1.transition_matrix(a) : build_q_matrix(std::exp(log_w)).transition_matrix(a);
+                return -eval_branch_ll_from_matrices(P_b, V_mat, D_mat, log_scale_offset, PD_scratch);
             };
 
             LocalBranchFit res;
@@ -499,8 +611,8 @@ public:
                 };
                 Scalar scaled_alpha = cur_alpha;
                 if (!cur_omegas.empty() && cur_omegas[0] > 1.0) {
-                    Scalar cur_exp = build_q_matrix(cur_omegas[0]).scale_factor;
-                    Scalar null_exp = build_q_matrix(1.0).scale_factor;
+                    Scalar cur_exp = syn_scale_factor + cur_omegas[0] * nonsyn_scale_factor;
+                    Scalar null_exp = syn_scale_factor + nonsyn_scale_factor;
                     if (null_exp > 1e-12) {
                         scaled_alpha = cur_alpha * (cur_exp / null_exp);
                     }
@@ -531,28 +643,17 @@ public:
         // x[3] = log(omega2): omega2 = exp(x[3]) in [0, 10000]
         if (M == 2) {
             if (constrain_null) {
+                MG94Matrix mat_w2_one = build_q_matrix(1.0);
                 // 3D optimization: log(alpha), logit(p1), logit(omega1) with omega2 = 1.0 fixed
                 auto obj_3d = [&](const std::array<Scalar, 3>& x) -> Scalar {
                     Scalar a = std::exp(x[0]);
                     Scalar p1 = 1.0 / (1.0 + std::exp(-x[1]));
                     Scalar p2 = 1.0 - p1;
                     Scalar w1 = 1.0 / (1.0 + std::exp(-x[2]));
-                    Scalar w2 = 1.0;
 
                     MG94Matrix mat1 = build_q_matrix(w1);
-                    MG94Matrix mat2 = build_q_matrix(w2);
-                    Matrix P_mix = p1 * mat1.transition_matrix(a) + p2 * mat2.transition_matrix(a);
-
-                    Scalar ll = log_scale_offset;
-                    for (size_t p = 0; p < num_patterns; ++p) {
-                        Scalar Lp = V_patterns[p].dot(P_mix * D_patterns[p]);
-                        if (Lp > 0.0) {
-                            ll += aln.patterns[p].weight * std::log(Lp);
-                        } else {
-                            ll += aln.patterns[p].weight * (-1e20);
-                        }
-                    }
-                    return -ll;
+                    Matrix P_mix = p1 * mat1.transition_matrix(a) + p2 * mat_w2_one.transition_matrix(a);
+                    return -eval_branch_ll_from_matrices(P_mix, V_mat, D_mat, log_scale_offset, PD_scratch);
                 };
 
                 Scalar init_log_a = std::log(cur_alpha);
@@ -571,17 +672,60 @@ public:
                 };
                 Scalar best_sc = obj_3d(best_pt);
 
-                for (Scalar a_mult : {0.25, 0.5, 1.0, 2.0, 4.0, 8.0}) {
+                // Precompute eigendecompositions for the 5 w1 grid values, and PD = P(a)*D_mat for each (a_mult, w)
+                constexpr std::array<Scalar, 6> a_grid = {0.25, 0.5, 1.0, 2.0, 4.0, 8.0};
+                constexpr std::array<Scalar, 5> p1_grid = {0.98, 0.90, 0.75, 0.50, 0.20};
+                constexpr std::array<Scalar, 5> w1_grid = {0.005, 0.05, 0.20, 0.50, 0.80};
+
+                std::array<MG94Matrix, 5> mat_w1_grid;
+                std::array<Scalar, 5> x2_grid;
+                for (size_t iw1 = 0; iw1 < 5; ++iw1) {
+                    Scalar x2 = std::log(w1_grid[iw1] / (1.0 - w1_grid[iw1]));
+                    x2_grid[iw1] = x2;
+                    Scalar w1_exact = 1.0 / (1.0 + std::exp(-x2));
+                    mat_w1_grid[iw1] = build_q_matrix(w1_exact);
+                }
+
+                // Precompute L_p(a, w) = V_mat.col(p).dot(P(a, w) * D_mat.col(p)) for each grid point!
+                // Since Lp(p1) = p1 * L_p(a, w1) + (1 - p1) * L_p(a, 1.0), evaluating all 5 p1 values requires ZERO matrix multiplications!
+                Vector L_w2(num_patterns);
+                std::array<Vector, 5> L_w1;
+                for (size_t iw1 = 0; iw1 < 5; ++iw1) L_w1[iw1].resize(num_patterns);
+
+                for (Scalar a_mult : a_grid) {
                     Scalar cand_log_a = std::log(cur_alpha * a_mult);
-                    for (Scalar p1 : {0.98, 0.90, 0.75, 0.50, 0.20}) {
-                        Scalar cand_x1 = std::log(p1 / (1.0 - p1));
-                        for (Scalar w1 : {0.005, 0.05, 0.20, 0.50, 0.80}) {
-                            Scalar cand_x2 = std::log(w1 / (1.0 - w1));
-                            std::array<Scalar, 3> pt = {cand_log_a, cand_x1, cand_x2};
-                            Scalar sc = obj_3d(pt);
+                    Scalar a = std::exp(cand_log_a);
+
+                    PD_scratch.noalias() = mat_w2_one.transition_matrix(a) * D_mat;
+                    for (size_t p = 0; p < num_patterns; ++p) {
+                        L_w2(p) = V_mat.col(p).dot(PD_scratch.col(p));
+                    }
+
+                    for (size_t iw1 = 0; iw1 < 5; ++iw1) {
+                        PD_scratch.noalias() = mat_w1_grid[iw1].transition_matrix(a) * D_mat;
+                        for (size_t p = 0; p < num_patterns; ++p) {
+                            L_w1[iw1](p) = V_mat.col(p).dot(PD_scratch.col(p));
+                        }
+                    }
+
+                    for (Scalar p1_val : p1_grid) {
+                        Scalar cand_x1 = std::log(p1_val / (1.0 - p1_val));
+                        Scalar p1 = 1.0 / (1.0 + std::exp(-cand_x1));
+                        Scalar p2 = 1.0 - p1;
+                        for (size_t iw1 = 0; iw1 < 5; ++iw1) {
+                            Scalar ll = log_scale_offset;
+                            for (size_t p = 0; p < num_patterns; ++p) {
+                                Scalar Lp = p1 * L_w1[iw1](p) + p2 * L_w2(p);
+                                if (Lp > 0.0) {
+                                    ll += pattern_weights_vec(p) * std::log(Lp);
+                                } else {
+                                    ll += pattern_weights_vec(p) * (-1e20);
+                                }
+                            }
+                            Scalar sc = -ll;
                             if (sc < best_sc) {
                                 best_sc = sc;
-                                best_pt = pt;
+                                best_pt = {cand_log_a, cand_x1, x2_grid[iw1]};
                             }
                         }
                     }
@@ -610,17 +754,7 @@ public:
                     MG94Matrix mat1 = build_q_matrix(w1);
                     MG94Matrix mat2 = build_q_matrix(w2);
                     Matrix P_mix = p1 * mat1.transition_matrix(a) + p2 * mat2.transition_matrix(a);
-
-                    Scalar ll = log_scale_offset;
-                    for (size_t p = 0; p < num_patterns; ++p) {
-                        Scalar Lp = V_patterns[p].dot(P_mix * D_patterns[p]);
-                        if (Lp > 0.0) {
-                            ll += aln.patterns[p].weight * std::log(Lp);
-                        } else {
-                            ll += aln.patterns[p].weight * (-1e20);
-                        }
-                    }
-                    return -ll;
+                    return -eval_branch_ll_from_matrices(P_mix, V_mat, D_mat, log_scale_offset, PD_scratch);
                 };
 
                 Scalar init_log_a = std::log(cur_alpha);
@@ -643,19 +777,74 @@ public:
                 };
                 Scalar best_sc = obj_4d(best_pt);
 
-                for (Scalar a_mult : {0.5, 1.0, 2.0, 6.0}) {
+                // Factorized 4D grid search:
+                // Only 3 w1 values and 5 w2 values exist on the grid -> 8 eigendecompositions total (instead of 480)!
+                // For each of the 4 a_mult values, we compute L_w1[3] and L_w2[5] (32 matrix exponentials total instead of 480)
+                // and then evaluate all 4 * 3 * 5 = 60 (p1, w1, w2) combinations by scalar linear combination p1*L_w1 + p2*L_w2!
+                constexpr std::array<Scalar, 4> a_grid = {0.5, 1.0, 2.0, 6.0};
+                constexpr std::array<Scalar, 4> p1_grid = {0.98, 0.92, 0.80, 0.50};
+                constexpr std::array<Scalar, 3> w1_grid = {0.005, 0.05, 0.20};
+                constexpr std::array<Scalar, 5> w2_grid = {2.0, 15.0, 80.0, 500.0, 2500.0};
+
+                std::array<MG94Matrix, 3> mat_w1_grid;
+                std::array<Scalar, 3> x2_grid;
+                for (size_t iw1 = 0; iw1 < 3; ++iw1) {
+                    Scalar x2 = std::log(w1_grid[iw1] / (1.0 - w1_grid[iw1]));
+                    x2_grid[iw1] = x2;
+                    Scalar w1_exact = 1.0 / (1.0 + std::exp(-x2));
+                    mat_w1_grid[iw1] = build_q_matrix(w1_exact);
+                }
+
+                std::array<MG94Matrix, 5> mat_w2_grid;
+                std::array<Scalar, 5> x3_grid;
+                for (size_t iw2 = 0; iw2 < 5; ++iw2) {
+                    Scalar x3 = std::log(w2_grid[iw2]);
+                    x3_grid[iw2] = x3;
+                    Scalar w2_exact = std::exp(x3);
+                    mat_w2_grid[iw2] = build_q_matrix(w2_exact);
+                }
+
+                std::array<Vector, 3> L_w1;
+                std::array<Vector, 5> L_w2;
+                for (size_t iw1 = 0; iw1 < 3; ++iw1) L_w1[iw1].resize(num_patterns);
+                for (size_t iw2 = 0; iw2 < 5; ++iw2) L_w2[iw2].resize(num_patterns);
+
+                for (Scalar a_mult : a_grid) {
                     Scalar cand_log_a = std::log(cur_alpha * a_mult);
-                    for (Scalar p1 : {0.98, 0.92, 0.80, 0.50}) {
-                        Scalar cand_x1 = std::log(p1 / (1.0 - p1));
-                        for (Scalar w1 : {0.005, 0.05, 0.20}) {
-                            Scalar cand_x2 = std::log(w1 / (1.0 - w1));
-                            for (Scalar w2 : {2.0, 15.0, 80.0, 500.0, 2500.0}) {
-                                Scalar cand_x3 = std::log(w2);
-                                std::array<Scalar, 4> pt = {cand_log_a, cand_x1, cand_x2, cand_x3};
-                                Scalar sc = obj_4d(pt);
+                    Scalar a = std::exp(cand_log_a);
+
+                    for (size_t iw1 = 0; iw1 < 3; ++iw1) {
+                        PD_scratch.noalias() = mat_w1_grid[iw1].transition_matrix(a) * D_mat;
+                        for (size_t p = 0; p < num_patterns; ++p) {
+                            L_w1[iw1](p) = V_mat.col(p).dot(PD_scratch.col(p));
+                        }
+                    }
+                    for (size_t iw2 = 0; iw2 < 5; ++iw2) {
+                        PD_scratch.noalias() = mat_w2_grid[iw2].transition_matrix(a) * D_mat;
+                        for (size_t p = 0; p < num_patterns; ++p) {
+                            L_w2[iw2](p) = V_mat.col(p).dot(PD_scratch.col(p));
+                        }
+                    }
+
+                    for (Scalar p1_val : p1_grid) {
+                        Scalar cand_x1 = std::log(p1_val / (1.0 - p1_val));
+                        Scalar p1 = 1.0 / (1.0 + std::exp(-cand_x1));
+                        Scalar p2 = 1.0 - p1;
+                        for (size_t iw1 = 0; iw1 < 3; ++iw1) {
+                            for (size_t iw2 = 0; iw2 < 5; ++iw2) {
+                                Scalar ll = log_scale_offset;
+                                for (size_t p = 0; p < num_patterns; ++p) {
+                                    Scalar Lp = p1 * L_w1[iw1](p) + p2 * L_w2[iw2](p);
+                                    if (Lp > 0.0) {
+                                        ll += pattern_weights_vec(p) * std::log(Lp);
+                                    } else {
+                                        ll += pattern_weights_vec(p) * (-1e20);
+                                    }
+                                }
+                                Scalar sc = -ll;
                                 if (sc < best_sc) {
                                     best_sc = sc;
-                                    best_pt = pt;
+                                    best_pt = {cand_log_a, cand_x1, x2_grid[iw1], x3_grid[iw2]};
                                 }
                             }
                         }
@@ -681,6 +870,30 @@ public:
         LocalBranchFit res;
         res.log_l = -1e20;
         return res;
+    }
+
+    LocalBranchFit optimize_branch_mixture(
+        int32_t bid,
+        int M,
+        const std::vector<Vector>& V_patterns,
+        const std::vector<Vector>& D_patterns,
+        bool constrain_null = false,
+        Scalar override_alpha = -1.0,
+        const std::vector<Scalar>* override_omegas = nullptr,
+        const std::vector<Scalar>* override_weights = nullptr,
+        Scalar log_scale_offset = 0.0
+    ) const {
+        int S = gcode->num_sense_codons;
+        size_t num_patterns = aln.patterns.size();
+        Matrix V_mat(S, num_patterns);
+        Matrix D_mat(S, num_patterns);
+        for (size_t p = 0; p < num_patterns; ++p) {
+            V_mat.col(p) = V_patterns[p];
+            D_mat.col(p) = D_patterns[p];
+        }
+        return optimize_branch_mixture_mat(
+            bid, M, V_mat, D_mat, constrain_null, override_alpha, override_omegas, override_weights, log_scale_offset
+        );
     }
 
     // Run complete aBSREL analysis
@@ -723,7 +936,7 @@ public:
         size_t num_patterns = aln.patterns.size();
         int S = gcode->num_sense_codons;
 
-        // Sort branches by baseline length descending
+        // Sort branches by baseline length descending (with deterministic tie-breaker by node id)
         std::vector<int32_t> sorted_branches;
         for (const auto& node : tree.nodes) {
             if (node.id != tree.root_id) {
@@ -731,8 +944,10 @@ public:
             }
         }
         std::sort(sorted_branches.begin(), sorted_branches.end(), [&](int32_t a, int32_t b) {
-            return result.branches[tree.nodes[a].name].baseline_branch_length >
-                   result.branches[tree.nodes[b].name].baseline_branch_length;
+            Scalar la = result.branches[tree.nodes[a].name].baseline_branch_length;
+            Scalar lb = result.branches[tree.nodes[b].name].baseline_branch_length;
+            if (std::abs(la - lb) > 1e-12) return la > lb;
+            return a < b;
         });
 
         Scalar current_best_aicc = base_summary.aicc;
@@ -751,6 +966,9 @@ public:
             );
         }
 
+        Matrix V_mat_p3(S, num_patterns);
+        Matrix D_mat_p3(S, num_patterns);
+
         for (size_t b_idx = 0; b_idx < sorted_branches.size(); ++b_idx) {
             int32_t bid = sorted_branches[b_idx];
             const std::string& bname = tree.nodes[bid].name;
@@ -759,22 +977,9 @@ public:
                 pbar_p3->set_status(bname + ": testing complexity (M=1.." + std::to_string(settings.max_rate_classes) + ")");
             }
 
-            // Compute local (V, D) context for branch bid
-            std::vector<Vector> V_patterns(num_patterns);
-            std::vector<Vector> D_patterns(num_patterns);
+            // Compute local (V, D) context matrices for branch bid (zero-alloc, deterministic)
             Scalar log_scale_offset = 0.0;
-            #pragma omp parallel for reduction(+:log_scale_offset) schedule(dynamic)
-            for (size_t p = 0; p < num_patterns; ++p) {
-                const auto& pattern = aln.patterns[p];
-                auto io = LikelihoodEngine::compute_inside_outside(
-                    tree, pattern, leaf_to_taxon, P_branches, codon_freqs, S
-                );
-                V_patterns[p] = io.V[bid];
-                D_patterns[p] = io.D[bid];
-                if (io.likelihood > 0.0) {
-                    log_scale_offset += pattern.weight * (io.log_likelihood - std::log(io.likelihood));
-                }
-            }
+            compute_branch_context_matrices(bid, P_branches, V_mat_p3, D_mat_p3, log_scale_offset);
 
             int current_classes = 1;
             LocalBranchFit best_fit;
@@ -786,7 +991,7 @@ public:
                 if (pbar_p3) {
                     pbar_p3->set_status(bname + ": evaluating M=" + std::to_string(M) + " rate classes...");
                 }
-                LocalBranchFit cand_fit = optimize_branch_mixture(bid, M, V_patterns, D_patterns, false, -1.0, nullptr, nullptr, log_scale_offset);
+                LocalBranchFit cand_fit = optimize_branch_mixture_mat(bid, M, V_mat_p3, D_mat_p3, false, -1.0, nullptr, nullptr, log_scale_offset);
                 size_t cand_params = current_params + 2;
                 Scalar cand_aicc = compute_aicc(cand_fit.log_l, cand_params);
 
@@ -853,6 +1058,19 @@ public:
             const std::vector<std::vector<Scalar>>& cur_omegas,
             const std::vector<std::vector<Scalar>>& cur_weights
         ) -> Scalar {
+            // Precompute the MG94Matrix spectral decompositions for each branch's omega components once per L-BFGS call!
+            // Inside BranchObjective::operator(), only alpha_ref[bid] changes, so we reuse cached eigendecompositions
+            // instead of calling SelfAdjointEigenSolver<Matrix> on every line-search step!
+            size_t num_nodes = tree.num_nodes();
+            std::vector<std::vector<MG94Matrix>> cached_branch_mg(num_nodes);
+            for (int32_t bid : all_branches) {
+                size_t K_b = cur_omegas[bid].size();
+                cached_branch_mg[bid].resize(K_b);
+                for (size_t k = 0; k < K_b; ++k) {
+                    cached_branch_mg[bid][k] = build_q_matrix(cur_omegas[bid][k]);
+                }
+            }
+
             struct BranchObjective {
                 ABSRELAnalyzer& abs;
                 const std::vector<int32_t>& nodes;
@@ -861,6 +1079,9 @@ public:
                 std::vector<Scalar>& alpha_ref;
                 const std::vector<std::vector<Scalar>>& omegas_ref;
                 const std::vector<std::vector<Scalar>>& weights_ref;
+                const std::vector<std::vector<MG94Matrix>>& branch_mg;
+                std::vector<Scalar> pattern_ll;
+                Matrix pattern_dL;
 
                 Scalar operator()(const Vector& y, Vector& grad) {
                     size_t n = nodes.size();
@@ -870,66 +1091,79 @@ public:
 
                     size_t num_nodes = abs.tree.num_nodes();
                     std::vector<Matrix> P_b(num_nodes);
-                    std::vector<Matrix> dP_branches(num_nodes, Matrix::Zero(S_val, S_val));
-                    for (int32_t bid : nodes) {
+                    std::vector<Matrix> dP_branches(num_nodes);
+
+                    int br_threads = LikelihoodEngine::optimal_omp_threads(n, 4);
+                    #pragma omp parallel for num_threads(br_threads) schedule(static)
+                    for (size_t i = 0; i < n; ++i) {
+                        int32_t bid = nodes[i];
                         Scalar alpha = alpha_ref[bid];
                         P_b[bid] = Matrix::Zero(S_val, S_val);
+                        dP_branches[bid] = Matrix::Zero(S_val, S_val);
                         for (size_t k = 0; k < omegas_ref[bid].size(); ++k) {
-                            Scalar w = omegas_ref[bid][k];
                             Scalar p = weights_ref[bid][k];
-                            MG94Matrix mat = abs.build_q_matrix(w);
+                            const MG94Matrix& mat = branch_mg[bid][k];
                             Matrix P_k = mat.transition_matrix(alpha);
-                            P_b[bid] += p * P_k;
-                            dP_branches[bid] += p * (mat.Q * P_k);
+                            P_b[bid].noalias() += p * P_k;
+                            dP_branches[bid].noalias() += p * (mat.Q * P_k);
+                        }
+                    }
+
+                    if (pattern_ll.size() != n_pat) pattern_ll.resize(n_pat);
+                    if (pattern_dL.rows() != static_cast<Eigen::Index>(num_nodes) ||
+                        pattern_dL.cols() != static_cast<Eigen::Index>(n_pat)) {
+                        pattern_dL.resize(num_nodes, n_pat);
+                    }
+                    std::fill(pattern_ll.begin(), pattern_ll.end(), 0.0);
+                    pattern_dL.setZero();
+
+                    int pat_threads = LikelihoodEngine::optimal_omp_threads(n_pat, 16);
+                    #pragma omp parallel num_threads(pat_threads)
+                    {
+                        LikelihoodEngine::InsideOutsideWorkspace ws;
+                        ws.init(num_nodes, S_val);
+                        Vector tmp_vec(S_val);
+
+                        #pragma omp for schedule(static)
+                        for (size_t p = 0; p < n_pat; ++p) {
+                            const auto& pattern = abs.aln.patterns[p];
+                            LikelihoodEngine::compute_inside_outside_in_place(
+                                abs.tree, pattern, abs.leaf_to_taxon, P_b, abs.codon_freqs, S_val, ws
+                            );
+                            Scalar L = ws.likelihood;
+                            if (L > 0.0) {
+                                pattern_ll[p] = pattern.weight * ws.log_likelihood;
+                                Scalar inv_L = pattern.weight / L;
+                                for (int32_t bid : nodes) {
+                                    tmp_vec.noalias() = dP_branches[bid] * ws.D[bid];
+                                    Scalar term = ws.V[bid].dot(tmp_vec);
+                                    pattern_dL(bid, p) = inv_L * term;
+                                }
+                            }
                         }
                     }
 
                     Scalar total_ll = 0.0;
-                    std::vector<Scalar> dL_da(num_nodes, 0.0);
-
-                    #pragma omp parallel
-                    {
-                        Scalar local_ll = 0.0;
-                        std::vector<Scalar> local_dL(num_nodes, 0.0);
-
-                        #pragma omp for schedule(dynamic)
-                        for (size_t p = 0; p < n_pat; ++p) {
-                            const auto& pattern = abs.aln.patterns[p];
-                            auto io = LikelihoodEngine::compute_inside_outside(
-                                abs.tree, pattern, abs.leaf_to_taxon, P_b, abs.codon_freqs, S_val
-                            );
-                            Scalar L = io.likelihood;
-                            if (L > 0.0) {
-                                local_ll += pattern.weight * io.log_likelihood;
-                                Scalar inv_L = pattern.weight / L;
-                                for (int32_t bid : nodes) {
-                                    Scalar term = io.V[bid].dot(dP_branches[bid] * io.D[bid]);
-                                    local_dL[bid] += inv_L * term;
-                                }
-                            }
-                        }
-
-                        #pragma omp critical
-                        {
-                            total_ll += local_ll;
-                            for (int32_t bid : nodes) {
-                                dL_da[bid] += local_dL[bid];
-                            }
-                        }
+                    for (size_t p = 0; p < n_pat; ++p) {
+                        total_ll += pattern_ll[p];
                     }
 
                     grad.resize(n);
                     for (size_t i = 0; i < n; ++i) {
                         int32_t bid = nodes[i];
+                        Scalar dL_sum = 0.0;
+                        for (size_t p = 0; p < n_pat; ++p) {
+                            dL_sum += pattern_dL(bid, p);
+                        }
                         Scalar alpha = alpha_ref[bid];
-                        grad(i) = -alpha * dL_da[bid];
+                        grad(i) = -alpha * dL_sum;
                     }
 
                     return -total_ll;
                 }
             };
 
-            BranchObjective b_obj{*this, all_branches, S, num_patterns, cur_alpha, cur_omegas, cur_weights};
+            BranchObjective b_obj{*this, all_branches, S, num_patterns, cur_alpha, cur_omegas, cur_weights, cached_branch_mg, {}, {}};
             Vector y(n_b), lb(n_b), ub(n_b);
             for (size_t i = 0; i < n_b; ++i) {
                 y(i) = std::log(std::clamp(cur_alpha[all_branches[i]], 1e-6, 50.0));
@@ -982,25 +1216,14 @@ public:
 
         auto run_mixture_refinement = [&]() {
             auto P_b = compute_all_branch_transition_matrices();
+            Matrix V_mat_ref(S, num_patterns);
+            Matrix D_mat_ref(S, num_patterns);
             for (int32_t bid : all_branches) {
                 int M = branch_omegas[bid].size();
-                std::vector<Vector> V_patterns(num_patterns);
-                std::vector<Vector> D_patterns(num_patterns);
                 Scalar log_scale_offset = 0.0;
-                #pragma omp parallel for reduction(+:log_scale_offset) schedule(dynamic)
-                for (size_t p = 0; p < num_patterns; ++p) {
-                    const auto& pattern = aln.patterns[p];
-                    auto io = LikelihoodEngine::compute_inside_outside(
-                        tree, pattern, leaf_to_taxon, P_b, codon_freqs, S
-                    );
-                    V_patterns[p] = io.V[bid];
-                    D_patterns[p] = io.D[bid];
-                    if (io.likelihood > 0.0) {
-                        log_scale_offset += pattern.weight * (io.log_likelihood - std::log(io.likelihood));
-                    }
-                }
+                compute_branch_context_matrices(bid, P_b, V_mat_ref, D_mat_ref, log_scale_offset);
 
-                auto refined_fit = optimize_branch_mixture(bid, M, V_patterns, D_patterns, false, -1.0, nullptr, nullptr, log_scale_offset);
+                auto refined_fit = optimize_branch_mixture_mat(bid, M, V_mat_ref, D_mat_ref, false, -1.0, nullptr, nullptr, log_scale_offset);
                 branch_alpha[bid] = refined_fit.alpha;
                 branch_omegas[bid] = refined_fit.omegas;
                 branch_weights[bid] = refined_fit.weights;
@@ -1094,6 +1317,35 @@ public:
             );
         }
 
+        // Precompute full-model Inside-Outside context ONCE across the tree for all branches!
+        // (Previously this was recomputed from scratch for every tested branch with omega_max > 1).
+        size_t num_nodes_total = tree.num_nodes();
+        std::vector<Matrix> V_full_all(num_nodes_total, Matrix::Zero(S, num_patterns));
+        std::vector<Matrix> D_full_all(num_nodes_total, Matrix::Zero(S, num_patterns));
+        {
+            int io_threads = LikelihoodEngine::optimal_omp_threads(num_patterns, 16);
+            #pragma omp parallel num_threads(io_threads)
+            {
+                LikelihoodEngine::InsideOutsideWorkspace ws;
+                ws.init(num_nodes_total, S);
+
+                #pragma omp for schedule(static)
+                for (size_t p = 0; p < num_patterns; ++p) {
+                    const auto& pattern = aln.patterns[p];
+                    LikelihoodEngine::compute_inside_outside_in_place(
+                        tree, pattern, leaf_to_taxon, P_branches, codon_freqs, S, ws
+                    );
+                    for (int32_t bid_node : all_branches) {
+                        V_full_all[bid_node].col(p) = ws.V[bid_node];
+                        D_full_all[bid_node].col(p) = ws.D[bid_node];
+                    }
+                }
+            }
+        }
+
+        Matrix V_null_mat(S, num_patterns);
+        Matrix D_null_mat(S, num_patterns);
+
         size_t t_idx = 0;
         for (const std::string& bname : to_test) {
             auto& bres = result.branches[bname];
@@ -1121,18 +1373,8 @@ public:
                 continue;
             }
 
-            // Compute local (V, D) context under Full model (used for Empirical Bayes Factors)
-            std::vector<Vector> V_patterns(num_patterns);
-            std::vector<Vector> D_patterns(num_patterns);
-            #pragma omp parallel for schedule(dynamic)
-            for (size_t p = 0; p < num_patterns; ++p) {
-                const auto& pattern = aln.patterns[p];
-                auto io = LikelihoodEngine::compute_inside_outside(
-                    tree, pattern, leaf_to_taxon, P_branches, codon_freqs, S
-                );
-                V_patterns[p] = io.V[bid];
-                D_patterns[p] = io.D[bid];
-            }
+            const Matrix& V_branch_full = V_full_all[bid];
+            const Matrix& D_branch_full = D_full_all[bid];
 
             // Full tree optimization under Null Hypothesis (omega_max <= 1.0 on branch bid)
             // Hot start from global best-fit model
@@ -1148,8 +1390,8 @@ public:
                 null_weights[bid] = {1.0};
 
                 // Hot-start alpha to preserve expected substitutions per site
-                Scalar cur_exp = build_q_matrix(full_omega).scale_factor;
-                Scalar null_exp = build_q_matrix(1.0).scale_factor;
+                Scalar cur_exp = syn_scale_factor + full_omega * nonsyn_scale_factor;
+                Scalar null_exp = syn_scale_factor + nonsyn_scale_factor;
                 if (null_exp > 1e-12) {
                     null_alpha[bid] = std::clamp(branch_alpha[bid] * (cur_exp / null_exp), 1e-6, 50.0);
                 }
@@ -1161,8 +1403,8 @@ public:
                 Scalar full_omega_max = null_omegas[bid].back();
                 null_omegas[bid].back() = 1.0;
                 if (full_omega_max > 2.0) {
-                    Scalar cur_exp = build_q_matrix(full_omega_max).scale_factor;
-                    Scalar null_exp = build_q_matrix(1.0).scale_factor;
+                    Scalar cur_exp = syn_scale_factor + full_omega_max * nonsyn_scale_factor;
+                    Scalar null_exp = syn_scale_factor + nonsyn_scale_factor;
                     Scalar p_max = null_weights[bid].back();
                     if (null_exp > 1e-12 && p_max > 0.05) {
                         Scalar scale_ratio = 1.0 + p_max * (cur_exp / null_exp - 1.0);
@@ -1179,24 +1421,11 @@ public:
                 for (int n_pass = 0; n_pass < max_null_passes; ++n_pass) {
                     auto P_null = compute_all_branch_transition_matrices_with(null_alpha, null_omegas, null_weights);
 
-                    std::vector<Vector> V_null(num_patterns);
-                    std::vector<Vector> D_null(num_patterns);
                     Scalar null_scale_offset = 0.0;
-                    #pragma omp parallel for reduction(+:null_scale_offset) schedule(dynamic)
-                    for (size_t p = 0; p < num_patterns; ++p) {
-                        const auto& pattern = aln.patterns[p];
-                        auto io = LikelihoodEngine::compute_inside_outside(
-                            tree, pattern, leaf_to_taxon, P_null, codon_freqs, S
-                        );
-                        V_null[p] = io.V[bid];
-                        D_null[p] = io.D[bid];
-                        if (io.likelihood > 0.0) {
-                            null_scale_offset += pattern.weight * (io.log_likelihood - std::log(io.likelihood));
-                        }
-                    }
+                    compute_branch_context_matrices(bid, P_null, V_null_mat, D_null_mat, null_scale_offset);
 
-                    LocalBranchFit fit = optimize_branch_mixture(
-                        bid, bres.rate_classes, V_null, D_null, true,
+                    LocalBranchFit fit = optimize_branch_mixture_mat(
+                        bid, bres.rate_classes, V_null_mat, D_null_mat, true,
                         null_alpha[bid], &null_omegas[bid], &null_weights[bid], null_scale_offset
                     );
                     null_alpha[bid] = fit.alpha;
@@ -1246,7 +1475,7 @@ public:
                 std::vector<Scalar> comp_L(K);
                 Scalar denom = 0.0;
                 for (size_t k = 0; k < K; ++k) {
-                    Scalar L_k = V_patterns[p].dot(P_comps[k] * D_patterns[p]);
+                    Scalar L_k = V_branch_full.col(p).dot(P_comps[k] * D_branch_full.col(p));
                     comp_L[k] = bres.rate_distribution.weights[k] * L_k;
                     denom += comp_L[k];
                 }

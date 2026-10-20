@@ -327,12 +327,13 @@ public:
             out_pattern_ll->assign(num_patterns, 0.0);
         }
 
-        Scalar total_log_l = 0.0;
-        #pragma omp parallel
+        std::vector<Scalar> pat_ll_vec(num_patterns, 0.0);
+        int n_threads = LikelihoodEngine::optimal_omp_threads(num_patterns, 16);
+        #pragma omp parallel num_threads(n_threads)
         {
             std::vector<Vector> node_L(num_nodes, Vector::Zero(S));
             std::vector<double> node_log_scale(num_nodes, 0.0);
-            #pragma omp for reduction(+:total_log_l) schedule(dynamic)
+            #pragma omp for schedule(static)
             for (size_t p = 0; p < num_patterns; ++p) {
                 const auto& pattern = aln.patterns[p];
                 Scalar pll = -1e20;
@@ -410,11 +411,15 @@ public:
                         }
                     }
                 }
-                total_log_l += pattern.weight * pll;
+                pat_ll_vec[p] = pll;
                 if (out_pattern_ll) {
                     (*out_pattern_ll)[p] = pll;
                 }
             }
+        }
+        Scalar total_log_l = 0.0;
+        for (size_t p = 0; p < num_patterns; ++p) {
+            total_log_l += aln.patterns[p].weight * pat_ll_vec[p];
         }
         return total_log_l;
     }
@@ -480,16 +485,14 @@ public:
             }
         }
 
-        Vector weight_accum = Vector::Zero(K);
-        Scalar sink_accum = 0.0;
-        Scalar total_pattern_weight = 0.0;
+        Matrix pat_weight_accum = Matrix::Zero(K, num_patterns);
+        std::vector<Scalar> pat_sink_accum(num_patterns, 0.0);
+        std::vector<Scalar> pat_wt_accum(num_patterns, 0.0);
+        int n_threads = LikelihoodEngine::optimal_omp_threads(num_patterns, 16);
 
-        #pragma omp parallel
+        #pragma omp parallel num_threads(n_threads)
         {
-            Vector local_accum = Vector::Zero(K);
-            Scalar local_sink_accum = 0.0;
-            Scalar local_pat_wt = 0.0;
-            #pragma omp for schedule(dynamic)
+            #pragma omp for schedule(static)
             for (size_t p = 0; p < num_patterns; ++p) {
                 const auto& pattern = aln.patterns[p];
                 std::vector<LikelihoodEngine::InsideOutsideResult> io_m(M);
@@ -529,7 +532,7 @@ public:
                                             ratio_k += post_m[m] * (io_m[m].V[nid].dot(P_comp[m][k][nid] * io_m[m].D[nid]) / io_m[m].likelihood);
                                         }
                                     }
-                                    local_accum(k) += pattern.weight * (bio_scale * weights[k]) * ratio_k;
+                                    pat_weight_accum(k, p) += pattern.weight * (bio_scale * weights[k]) * ratio_k;
                                 }
                                 if (out_new_eps_sink != nullptr) {
                                     Scalar sink_ratio = 0.0;
@@ -538,20 +541,23 @@ public:
                                             sink_ratio += post_m[m] * (eval_sink_bilinear(io_m[m].V[nid], io_m[m].D[nid]) / io_m[m].likelihood);
                                         }
                                     }
-                                    local_sink_accum += pattern.weight * eps_sink * sink_ratio;
+                                    pat_sink_accum[p] += pattern.weight * eps_sink * sink_ratio;
                                 }
-                                local_pat_wt += pattern.weight;
+                                pat_wt_accum[p] += pattern.weight;
                             }
                         }
                     }
                 }
             }
-            #pragma omp critical
-            {
-                weight_accum += local_accum;
-                sink_accum += local_sink_accum;
-                total_pattern_weight += local_pat_wt;
-            }
+        }
+
+        Vector weight_accum = Vector::Zero(K);
+        Scalar sink_accum = 0.0;
+        Scalar total_pattern_weight = 0.0;
+        for (size_t p = 0; p < num_patterns; ++p) {
+            weight_accum += pat_weight_accum.col(p);
+            sink_accum += pat_sink_accum[p];
+            total_pattern_weight += pat_wt_accum[p];
         }
 
         std::vector<Scalar> new_weights(K);
@@ -642,17 +648,16 @@ public:
             }
         }
 
-        Vector syn_accum = Vector::Zero(M);
-        Scalar total_pattern_weight = 0.0;
+        Matrix pat_syn_accum = Matrix::Zero(M, num_patterns);
+        std::vector<Scalar> pat_wt_accum(num_patterns, 0.0);
+        int n_threads = LikelihoodEngine::optimal_omp_threads(num_patterns, 16);
 
-        #pragma omp parallel
+        #pragma omp parallel num_threads(n_threads)
         {
-            Vector local_accum = Vector::Zero(M);
-            Scalar local_pat_wt = 0.0;
             std::vector<Vector> node_L(num_nodes, Vector::Zero(S));
             std::vector<double> node_log_scale(num_nodes, 0.0);
 
-            #pragma omp for schedule(dynamic)
+            #pragma omp for schedule(static)
             for (size_t p = 0; p < num_patterns; ++p) {
                 const auto& pattern = aln.patterns[p];
                 Scalar max_term = -std::numeric_limits<Scalar>::infinity();
@@ -703,18 +708,19 @@ public:
                     }
                     if (sum_exp > 0.0) {
                         for (size_t m = 0; m < M; ++m) {
-                            local_accum(m) += pattern.weight * (rho[m] / sum_exp);
+                            pat_syn_accum(m, p) = pattern.weight * (rho[m] / sum_exp);
                         }
-                        local_pat_wt += pattern.weight;
+                        pat_wt_accum[p] = pattern.weight;
                     }
                 }
             }
+        }
 
-            #pragma omp critical
-            {
-                syn_accum += local_accum;
-                total_pattern_weight += local_pat_wt;
-            }
+        Vector syn_accum = Vector::Zero(M);
+        Scalar total_pattern_weight = 0.0;
+        for (size_t p = 0; p < num_patterns; ++p) {
+            syn_accum += pat_syn_accum.col(p);
+            total_pattern_weight += pat_wt_accum[p];
         }
 
         std::vector<Scalar> new_syn_weights(M);
@@ -806,30 +812,33 @@ public:
             }
         }
 
-        // 3. Parallel inside-outside traversal
-        Scalar total_log_l = 0.0;
-        std::vector<Scalar> grad_b(num_nodes, 0.0);
+        // 3. Parallel inside-outside traversal (deterministic pattern-indexed accumulation)
+        std::vector<Scalar> pat_ll_vec(num_patterns, 0.0);
+        Matrix pat_grad_mat = Matrix::Zero(num_nodes, num_patterns);
+        int n_threads = LikelihoodEngine::optimal_omp_threads(num_patterns, 16);
 
-        #pragma omp parallel
+        #pragma omp parallel num_threads(n_threads)
         {
-            std::vector<Scalar> local_grad(num_nodes, 0.0);
-            Scalar local_ll = 0.0;
+            LikelihoodEngine::InsideOutsideWorkspace ws;
+            ws.init(num_nodes, S);
+            Vector tmp_vec(S);
 
-            #pragma omp for schedule(dynamic)
+            #pragma omp for schedule(static)
             for (size_t p = 0; p < num_patterns; ++p) {
                 const auto& pattern = aln.patterns[p];
                 if (M == 1) {
-                    auto io = LikelihoodEngine::compute_inside_outside(
-                        tree, pattern, leaf_to_taxon, P_mix[0], aln.codon_frequencies_f3x4, S
+                    LikelihoodEngine::compute_inside_outside_in_place(
+                        tree, pattern, leaf_to_taxon, P_mix[0], aln.codon_frequencies_f3x4, S, ws
                     );
-                    if (io.likelihood > 0.0) {
-                        local_ll += pattern.weight * io.log_likelihood;
-                        Scalar inv_L = pattern.weight / io.likelihood;
+                    if (ws.likelihood > 0.0) {
+                        pat_ll_vec[p] = pattern.weight * ws.log_likelihood;
+                        Scalar inv_L = pattern.weight / ws.likelihood;
                         for (const auto& node : tree.nodes) {
                             if (node.id != tree.root_id) {
                                 int32_t vid = node.id;
-                                Scalar dL_dt = io.V[vid].dot(dP_mix[0][vid] * io.D[vid]);
-                                local_grad[vid] += inv_L * dL_dt;
+                                tmp_vec.noalias() = dP_mix[0][vid] * ws.D[vid];
+                                Scalar dL_dt = ws.V[vid].dot(tmp_vec);
+                                pat_grad_mat(vid, p) = inv_L * dL_dt;
                             }
                         }
                     }
@@ -859,7 +868,7 @@ public:
                         }
                         if (sum_exp > 0.0) {
                             Scalar pat_ll = max_ll + std::log(sum_exp);
-                            local_ll += pattern.weight * pat_ll;
+                            pat_ll_vec[p] = pattern.weight * pat_ll;
                             Scalar inv_sum = 1.0 / sum_exp;
                             for (size_t m = 0; m < M; ++m) post_w[m] *= inv_sum;
 
@@ -872,21 +881,26 @@ public:
                                             d_lnL_dt += post_w[m] * (io_m[m].V[vid].dot(dP_mix[m][vid] * io_m[m].D[vid]) / io_m[m].likelihood);
                                         }
                                     }
-                                    local_grad[vid] += pattern.weight * d_lnL_dt;
+                                    pat_grad_mat(vid, p) = pattern.weight * d_lnL_dt;
                                 }
                             }
                         }
                     }
                 }
             }
+        }
 
-            #pragma omp critical
-            {
-                total_log_l += local_ll;
-                for (size_t i = 0; i < num_nodes; ++i) {
-                    grad_b[i] += local_grad[i];
-                }
+        Scalar total_log_l = 0.0;
+        for (size_t p = 0; p < num_patterns; ++p) {
+            total_log_l += pat_ll_vec[p];
+        }
+        std::vector<Scalar> grad_b(num_nodes, 0.0);
+        for (size_t i = 0; i < num_nodes; ++i) {
+            Scalar s = 0.0;
+            for (size_t p = 0; p < num_patterns; ++p) {
+                s += pat_grad_mat(i, p);
             }
+            grad_b[i] = s;
         }
 
         return {total_log_l, grad_b};
@@ -1254,13 +1268,16 @@ public:
                 candidates = {
                     {{0.10, 3.0}, {0.75, 0.25}},
                     {{0.02, 4.5}, {0.90, 0.10}},
-                    {{0.05, 2.0}, {0.80, 0.20}}
+                    {{0.05, 2.0}, {0.80, 0.20}},
+                    {{0.02, 3.0}, {0.95, 0.05}}
                 };
                 if (warm_start_fit && warm_start_fit->test_distribution.omegas.size() == 2) {
                     Scalar w0 = warm_start_fit->test_distribution.omegas[0];
                     Scalar p0 = std::clamp(warm_start_fit->test_distribution.weights[0], 0.05, 0.95);
                     candidates.push_back({{w0, 1.35}, {p0, 1.0 - p0}});
                     candidates.push_back({{w0, 2.5}, {p0, 1.0 - p0}});
+                    candidates.push_back({{w0, 3.5}, {0.95, 0.05}});
+                    candidates.push_back({{w0, 2.5}, {0.88, 0.12}});
                     candidates.push_back({{w0, 5.0}, {std::max(0.5, p0), 1.0 - std::max(0.5, p0)}});
                 }
             }
@@ -1840,44 +1857,48 @@ public:
 
         // Per-pattern, per-node posterior probability of the saturation sink (underflow-safe via log-likelihood)
         std::vector<std::vector<Scalar>> pat_node_post(num_patterns, std::vector<Scalar>(num_nodes, 0.0));
-        #pragma omp parallel for schedule(dynamic)
-        for (size_t p = 0; p < num_patterns; ++p) {
-            const auto& pattern = aln.patterns[p];
-            std::vector<LikelihoodEngine::InsideOutsideResult> io_m(M);
-            Scalar max_ll = -std::numeric_limits<Scalar>::infinity();
-            for (size_t m = 0; m < M; ++m) {
-                if (syn_weights[m] <= 1e-12) continue;
-                io_m[m] = LikelihoodEngine::compute_inside_outside(
-                    tree, pattern, leaf_to_taxon, P_mix[m], aln.codon_frequencies_f3x4, S
-                );
-                if (io_m[m].likelihood > 0.0) {
-                    Scalar term = std::log(syn_weights[m]) + io_m[m].log_likelihood;
-                    if (term > max_ll) max_ll = term;
-                }
-            }
-            if (max_ll > -1e19) {
-                Scalar sum_exp = 0.0;
-                std::vector<Scalar> post_m(M, 0.0);
+        const int n_threads_sink = LikelihoodEngine::optimal_omp_threads(num_patterns);
+        #pragma omp parallel num_threads(n_threads_sink)
+        {
+            std::vector<LikelihoodEngine::InsideOutsideWorkspace> io_m(M);
+            #pragma omp for schedule(static)
+            for (size_t p = 0; p < num_patterns; ++p) {
+                const auto& pattern = aln.patterns[p];
+                Scalar max_ll = -std::numeric_limits<Scalar>::infinity();
                 for (size_t m = 0; m < M; ++m) {
-                    if (syn_weights[m] > 1e-12 && io_m[m].likelihood > 0.0) {
-                        Scalar e = std::exp(std::log(syn_weights[m]) + io_m[m].log_likelihood - max_ll);
-                        post_m[m] = e;
-                        sum_exp += e;
+                    if (syn_weights[m] <= 1e-12) continue;
+                    LikelihoodEngine::compute_inside_outside_in_place(
+                        tree, pattern, leaf_to_taxon, P_mix[m], aln.codon_frequencies_f3x4, S, io_m[m]
+                    );
+                    if (io_m[m].likelihood > 0.0) {
+                        Scalar term = std::log(syn_weights[m]) + io_m[m].log_likelihood;
+                        if (term > max_ll) max_ll = term;
                     }
                 }
-                if (sum_exp > 0.0) {
-                    for (size_t m = 0; m < M; ++m) post_m[m] /= sum_exp;
-                    for (const auto& node : tree.nodes) {
-                        if (node.id != tree.root_id && is_test_branch[node.id]) {
-                            int nid = node.id;
-                            Scalar sink_ratio = 0.0;
-                            for (size_t m = 0; m < M; ++m) {
-                                if (post_m[m] > 1e-12 && io_m[m].likelihood > 0.0) {
-                                    sink_ratio += post_m[m] * (eval_sink_bilinear(io_m[m].V[nid], io_m[m].D[nid]) / io_m[m].likelihood);
+                if (max_ll > -1e19) {
+                    Scalar sum_exp = 0.0;
+                    std::vector<Scalar> post_m(M, 0.0);
+                    for (size_t m = 0; m < M; ++m) {
+                        if (syn_weights[m] > 1e-12 && io_m[m].likelihood > 0.0) {
+                            Scalar e = std::exp(std::log(syn_weights[m]) + io_m[m].log_likelihood - max_ll);
+                            post_m[m] = e;
+                            sum_exp += e;
+                        }
+                    }
+                    if (sum_exp > 0.0) {
+                        for (size_t m = 0; m < M; ++m) post_m[m] /= sum_exp;
+                        for (const auto& node : tree.nodes) {
+                            if (node.id != tree.root_id && is_test_branch[node.id]) {
+                                int nid = node.id;
+                                Scalar sink_ratio = 0.0;
+                                for (size_t m = 0; m < M; ++m) {
+                                    if (post_m[m] > 1e-12 && io_m[m].likelihood > 0.0) {
+                                        sink_ratio += post_m[m] * (eval_sink_bilinear(io_m[m].V[nid], io_m[m].D[nid]) / io_m[m].likelihood);
+                                    }
                                 }
+                                Scalar post = std::clamp(eps * sink_ratio, 0.0, 1.0 - 1e-9);
+                                pat_node_post[p][nid] = post;
                             }
-                            Scalar post = std::clamp(eps * sink_ratio, 0.0, 1.0 - 1e-9);
-                            pat_node_post[p][nid] = post;
                         }
                     }
                 }
@@ -1987,34 +2008,39 @@ public:
         std::vector<Scalar> pat_syn_score(num_patterns, 0.0);
         std::vector<Scalar> pat_syn_info(num_patterns, 0.0);
 
-        #pragma omp parallel for schedule(dynamic)
-        for (size_t p = 0; p < num_patterns; ++p) {
-            const auto& pattern = aln.patterns[p];
-            auto io = LikelihoodEngine::compute_inside_outside(
-                tree, pattern, leaf_to_taxon, P0, aln.codon_frequencies_f3x4, S
-            );
-            Scalar L_p = io.likelihood;
-            if (L_p > 0.0) {
-                Scalar inv_L = 1.0 / L_p;
-                Scalar u_syn = 0.0;
-                Scalar v_syn = 0.0;
-                for (const auto& node : tree.nodes) {
-                    if (node.id != tree.root_id) {
-                        int nid = node.id;
-                        Scalar bl = s0 * branch_tau[nid];
-                        if (is_test_branch[nid]) {
-                            Scalar sink_val = eval_sink_bilinear(io.V[nid], io.D[nid]);
-                            pat_R_sink[p][nid] = sink_val * inv_L;
-                            pat_T2[p][nid] = bl * io.V[nid].dot(Q2_off * io.D[nid]) * inv_L;
-                            pat_T3[p][nid] = bl * io.V[nid].dot(Q3_off * io.D[nid]) * inv_L;
+        const int n_threads_auto = LikelihoodEngine::optimal_omp_threads(num_patterns);
+        #pragma omp parallel num_threads(n_threads_auto)
+        {
+            LikelihoodEngine::InsideOutsideWorkspace io_ws;
+            #pragma omp for schedule(static)
+            for (size_t p = 0; p < num_patterns; ++p) {
+                const auto& pattern = aln.patterns[p];
+                LikelihoodEngine::compute_inside_outside_in_place(
+                    tree, pattern, leaf_to_taxon, P0, aln.codon_frequencies_f3x4, S, io_ws
+                );
+                Scalar L_p = io_ws.likelihood;
+                if (L_p > 0.0) {
+                    Scalar inv_L = 1.0 / L_p;
+                    Scalar u_syn = 0.0;
+                    Scalar v_syn = 0.0;
+                    for (const auto& node : tree.nodes) {
+                        if (node.id != tree.root_id) {
+                            int nid = node.id;
+                            Scalar bl = s0 * branch_tau[nid];
+                            if (is_test_branch[nid]) {
+                                Scalar sink_val = eval_sink_bilinear(io_ws.V[nid], io_ws.D[nid]);
+                                pat_R_sink[p][nid] = sink_val * inv_L;
+                                pat_T2[p][nid] = bl * io_ws.V[nid].dot(Q2_off * io_ws.D[nid]) * inv_L;
+                                pat_T3[p][nid] = bl * io_ws.V[nid].dot(Q3_off * io_ws.D[nid]) * inv_L;
+                            }
+                            Scalar branch_u = bl * io_ws.V[nid].dot(Q_syn * (P0[nid] * io_ws.D[nid])) * inv_L;
+                            u_syn += branch_u;
+                            v_syn += branch_u * branch_u;
                         }
-                        Scalar branch_u = bl * io.V[nid].dot(Q_syn * (P0[nid] * io.D[nid])) * inv_L;
-                        u_syn += branch_u;
-                        v_syn += branch_u * branch_u;
                     }
+                    pat_syn_score[p] = u_syn;
+                    pat_syn_info[p] = std::max(1e-6, v_syn);
                 }
-                pat_syn_score[p] = u_syn;
-                pat_syn_info[p] = std::max(1e-6, v_syn);
             }
         }
 
@@ -2351,12 +2377,13 @@ public:
             out_pattern_ll->assign(num_patterns, 0.0);
         }
 
-        Scalar total_log_l = 0.0;
-        #pragma omp parallel
+        std::vector<Scalar> pat_ll_buf(num_patterns, -1e20);
+        const int n_threads = LikelihoodEngine::optimal_omp_threads(num_patterns);
+        #pragma omp parallel num_threads(n_threads)
         {
             std::vector<Vector> node_L(num_nodes, Vector::Zero(S));
             std::vector<double> node_log_scale(num_nodes, 0.0);
-            #pragma omp for reduction(+:total_log_l) schedule(dynamic)
+            #pragma omp for schedule(static)
             for (size_t p = 0; p < num_patterns; ++p) {
                 const auto& pattern = aln.patterns[p];
                 Scalar pll = -1e20;
@@ -2434,11 +2461,15 @@ public:
                         }
                     }
                 }
-                total_log_l += pattern.weight * pll;
+                pat_ll_buf[p] = pll;
                 if (out_pattern_ll) {
                     (*out_pattern_ll)[p] = pll;
                 }
             }
+        }
+        Scalar total_log_l = 0.0;
+        for (size_t p = 0; p < num_patterns; ++p) {
+            total_log_l += aln.patterns[p].weight * pat_ll_buf[p];
         }
         return total_log_l;
     }
@@ -2582,30 +2613,27 @@ public:
             }
         }
 
-        Vector accum_t = Vector::Zero(K_t);
-        Vector accum_b = Vector::Zero(K_b);
-        Vector accum_u = Vector::Zero(std::max<size_t>(1, K_u));
-        Scalar sink_accum_t = 0.0, sink_accum_b = 0.0;
-        Scalar total_wt_t = 0.0, total_wt_b = 0.0, total_wt_u = 0.0;
+        size_t K_u_safe = std::max<size_t>(1, K_u);
+        std::vector<Vector> pat_accum_t(num_patterns, Vector::Zero(K_t));
+        std::vector<Vector> pat_accum_b(num_patterns, Vector::Zero(K_b));
+        std::vector<Vector> pat_accum_u(num_patterns, Vector::Zero(K_u_safe));
+        std::vector<Scalar> pat_sink_t(num_patterns, 0.0), pat_sink_b(num_patterns, 0.0);
+        std::vector<Scalar> pat_wt_t(num_patterns, 0.0), pat_wt_b(num_patterns, 0.0), pat_wt_u(num_patterns, 0.0);
 
-        #pragma omp parallel
+        const int n_threads = LikelihoodEngine::optimal_omp_threads(num_patterns);
+        #pragma omp parallel num_threads(n_threads)
         {
-            Vector local_t = Vector::Zero(K_t);
-            Vector local_b = Vector::Zero(K_b);
-            Vector local_u = Vector::Zero(std::max<size_t>(1, K_u));
-            Scalar local_sink_t = 0.0, local_sink_b = 0.0;
-            Scalar local_wt_t = 0.0, local_wt_b = 0.0, local_wt_u = 0.0;
+            std::vector<LikelihoodEngine::InsideOutsideWorkspace> io_m(M);
 
-            #pragma omp for schedule(dynamic)
+            #pragma omp for schedule(static)
             for (size_t p = 0; p < num_patterns; ++p) {
                 const auto& pattern = aln.patterns[p];
-                std::vector<LikelihoodEngine::InsideOutsideResult> io_m(M);
                 Scalar max_ll = -std::numeric_limits<Scalar>::infinity();
 
                 for (size_t m = 0; m < M; ++m) {
                     if (syn_weights[m] <= 1e-12) continue;
-                    io_m[m] = LikelihoodEngine::compute_inside_outside(
-                        tree, pattern, leaf_to_taxon, P_mix[m], aln.codon_frequencies_f3x4, S
+                    LikelihoodEngine::compute_inside_outside_in_place(
+                        tree, pattern, leaf_to_taxon, P_mix[m], aln.codon_frequencies_f3x4, S, io_m[m]
                     );
                     if (io_m[m].likelihood > 0.0) {
                         Scalar term = std::log(syn_weights[m]) + io_m[m].log_likelihood;
@@ -2625,6 +2653,12 @@ public:
                     }
                     if (sum_exp > 0.0) {
                         for (size_t m = 0; m < M; ++m) post_m[m] /= sum_exp;
+                        Vector local_t = Vector::Zero(K_t);
+                        Vector local_b = Vector::Zero(K_b);
+                        Vector local_u = Vector::Zero(K_u_safe);
+                        Scalar local_sink_t = 0.0, local_sink_b = 0.0;
+                        Scalar local_wt_t = 0.0, local_wt_b = 0.0, local_wt_u = 0.0;
+
                         for (const auto& node : tree.nodes) {
                             if (node.id != tree.root_id) {
                                 int nid = node.id;
@@ -2683,20 +2717,33 @@ public:
                                 }
                             }
                         }
+                        pat_accum_t[p] = local_t;
+                        pat_accum_b[p] = local_b;
+                        pat_accum_u[p] = local_u;
+                        pat_sink_t[p] = local_sink_t;
+                        pat_sink_b[p] = local_sink_b;
+                        pat_wt_t[p] = local_wt_t;
+                        pat_wt_b[p] = local_wt_b;
+                        pat_wt_u[p] = local_wt_u;
                     }
                 }
             }
-            #pragma omp critical
-            {
-                accum_t += local_t;
-                accum_b += local_b;
-                accum_u += local_u;
-                sink_accum_t += local_sink_t;
-                sink_accum_b += local_sink_b;
-                total_wt_t += local_wt_t;
-                total_wt_b += local_wt_b;
-                total_wt_u += local_wt_u;
-            }
+        }
+
+        Vector accum_t = Vector::Zero(K_t);
+        Vector accum_b = Vector::Zero(K_b);
+        Vector accum_u = Vector::Zero(K_u_safe);
+        Scalar sink_accum_t = 0.0, sink_accum_b = 0.0;
+        Scalar total_wt_t = 0.0, total_wt_b = 0.0, total_wt_u = 0.0;
+        for (size_t p = 0; p < num_patterns; ++p) {
+            accum_t += pat_accum_t[p];
+            accum_b += pat_accum_b[p];
+            accum_u += pat_accum_u[p];
+            sink_accum_t += pat_sink_t[p];
+            sink_accum_b += pat_sink_b[p];
+            total_wt_t += pat_wt_t[p];
+            total_wt_b += pat_wt_b[p];
+            total_wt_u += pat_wt_u[p];
         }
 
         std::vector<Scalar> new_wt_t = weights_test;
@@ -2828,17 +2875,16 @@ public:
             }
         }
 
-        Vector syn_accum = Vector::Zero(M);
-        Scalar total_pattern_weight = 0.0;
+        std::vector<Vector> pat_syn_accum(num_patterns, Vector::Zero(M));
+        std::vector<Scalar> pat_valid_wt(num_patterns, 0.0);
+        const int n_threads = LikelihoodEngine::optimal_omp_threads(num_patterns);
 
-        #pragma omp parallel
+        #pragma omp parallel num_threads(n_threads)
         {
-            Vector local_accum = Vector::Zero(M);
-            Scalar local_pat_wt = 0.0;
             std::vector<Vector> node_L(num_nodes, Vector::Zero(S));
             std::vector<double> node_log_scale(num_nodes, 0.0);
 
-            #pragma omp for schedule(dynamic)
+            #pragma omp for schedule(static)
             for (size_t p = 0; p < num_patterns; ++p) {
                 const auto& pattern = aln.patterns[p];
                 Scalar max_term = -std::numeric_limits<Scalar>::infinity();
@@ -2889,18 +2935,19 @@ public:
                     }
                     if (sum_exp > 0.0) {
                         for (size_t m = 0; m < M; ++m) {
-                            local_accum(m) += pattern.weight * (rho[m] / sum_exp);
+                            pat_syn_accum[p](m) = pattern.weight * (rho[m] / sum_exp);
                         }
-                        local_pat_wt += pattern.weight;
+                        pat_valid_wt[p] = pattern.weight;
                     }
                 }
             }
+        }
 
-            #pragma omp critical
-            {
-                syn_accum += local_accum;
-                total_pattern_weight += local_pat_wt;
-            }
+        Vector syn_accum = Vector::Zero(M);
+        Scalar total_pattern_weight = 0.0;
+        for (size_t p = 0; p < num_patterns; ++p) {
+            syn_accum += pat_syn_accum[p];
+            total_pattern_weight += pat_valid_wt[p];
         }
 
         std::vector<Scalar> new_syn_weights(M);
@@ -3014,39 +3061,38 @@ public:
             }
         }
 
-        Scalar total_log_l = 0.0;
-        std::vector<Scalar> grad_b(num_nodes, 0.0);
+        std::vector<Scalar> pat_ll_vec(num_patterns, 0.0);
+        std::vector<std::vector<Scalar>> pat_grad(num_patterns, std::vector<Scalar>(num_nodes, 0.0));
+        const int n_threads = LikelihoodEngine::optimal_omp_threads(num_patterns);
 
-        #pragma omp parallel
+        #pragma omp parallel num_threads(n_threads)
         {
-            std::vector<Scalar> local_grad(num_nodes, 0.0);
-            Scalar local_ll = 0.0;
+            std::vector<LikelihoodEngine::InsideOutsideWorkspace> io_m(M);
 
-            #pragma omp for schedule(dynamic)
+            #pragma omp for schedule(static)
             for (size_t p = 0; p < num_patterns; ++p) {
                 const auto& pattern = aln.patterns[p];
                 if (M == 1) {
-                    auto io = LikelihoodEngine::compute_inside_outside(
-                        tree, pattern, leaf_to_taxon, P_mix[0], aln.codon_frequencies_f3x4, S
+                    LikelihoodEngine::compute_inside_outside_in_place(
+                        tree, pattern, leaf_to_taxon, P_mix[0], aln.codon_frequencies_f3x4, S, io_m[0]
                     );
-                    if (io.likelihood > 0.0) {
-                        local_ll += pattern.weight * io.log_likelihood;
-                        Scalar inv_L = pattern.weight / io.likelihood;
+                    if (io_m[0].likelihood > 0.0) {
+                        pat_ll_vec[p] = pattern.weight * io_m[0].log_likelihood;
+                        Scalar inv_L = pattern.weight / io_m[0].likelihood;
                         for (const auto& node : tree.nodes) {
                             if (node.id != tree.root_id) {
                                 int32_t vid = node.id;
-                                Scalar dL_dt = io.V[vid].dot(dP_mix[0][vid] * io.D[vid]);
-                                local_grad[vid] += inv_L * dL_dt;
+                                Scalar dL_dt = io_m[0].V[vid].dot(dP_mix[0][vid] * io_m[0].D[vid]);
+                                pat_grad[p][vid] = inv_L * dL_dt;
                             }
                         }
                     }
                 } else {
-                    std::vector<LikelihoodEngine::InsideOutsideResult> io_m(M);
                     Scalar max_ll = -std::numeric_limits<Scalar>::infinity();
                     for (size_t m = 0; m < M; ++m) {
                         if (syn_weights[m] <= 1e-12) continue;
-                        io_m[m] = LikelihoodEngine::compute_inside_outside(
-                            tree, pattern, leaf_to_taxon, P_mix[m], aln.codon_frequencies_f3x4, S
+                        LikelihoodEngine::compute_inside_outside_in_place(
+                            tree, pattern, leaf_to_taxon, P_mix[m], aln.codon_frequencies_f3x4, S, io_m[m]
                         );
                         if (io_m[m].likelihood > 0.0) {
                             Scalar term = std::log(syn_weights[m]) + io_m[m].log_likelihood;
@@ -3066,7 +3112,7 @@ public:
                         }
                         if (sum_exp > 0.0) {
                             Scalar pat_ll = max_ll + std::log(sum_exp);
-                            local_ll += pattern.weight * pat_ll;
+                            pat_ll_vec[p] = pattern.weight * pat_ll;
                             Scalar inv_sum = 1.0 / sum_exp;
                             for (size_t m = 0; m < M; ++m) post_w[m] *= inv_sum;
 
@@ -3079,20 +3125,21 @@ public:
                                             d_lnL_dt += post_w[m] * (io_m[m].V[vid].dot(dP_mix[m][vid] * io_m[m].D[vid]) / io_m[m].likelihood);
                                         }
                                     }
-                                    local_grad[vid] += pattern.weight * d_lnL_dt;
+                                    pat_grad[p][vid] = pattern.weight * d_lnL_dt;
                                 }
                             }
                         }
                     }
                 }
             }
+        }
 
-            #pragma omp critical
-            {
-                total_log_l += local_ll;
-                for (size_t i = 0; i < num_nodes; ++i) {
-                    grad_b[i] += local_grad[i];
-                }
+        Scalar total_log_l = 0.0;
+        std::vector<Scalar> grad_b(num_nodes, 0.0);
+        for (size_t p = 0; p < num_patterns; ++p) {
+            total_log_l += pat_ll_vec[p];
+            for (size_t i = 0; i < num_nodes; ++i) {
+                grad_b[i] += pat_grad[p][i];
             }
         }
 

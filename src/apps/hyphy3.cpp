@@ -21,6 +21,8 @@ int run_slac(int argc, char* argv[]);
 int run_dfel(int argc, char* argv[]);
 int run_ohmic(int argc, char* argv[]);
 int run_tree(int argc, char* argv[]);
+int run_joint_align(int argc, char* argv[]);
+int run_characterize(int argc, char* argv[]);
 int run_mss(int argc, char* argv[]);
 int run_report(int argc, char* argv[]);
 
@@ -36,8 +38,11 @@ void print_hyphy3_banner() {
 void print_hyphy3_usage(const char* prog) {
     print_hyphy3_banner();
     std::cout << Console::bold("Usage:") << " " << prog << " " 
-              << Console::accent("<analysis>") << " "
+              << Console::accent("<analysis> | -u <unaligned.fa> | -a <alignment.nex>") << " "
               << Console::muted("[OPTIONS]") << "\n\n";
+
+    std::cout << Console::bold("One-Button End-to-End Characterization:") << "\n"
+              << "  " << Console::brand("characterize ") << "  Complete unaligned/aligned evolutionary & selection atlas (aliases: auto, omni, or pass -u/-a directly)\n\n";
 
     std::cout << Console::bold("Available Analyses:") << "\n"
               << "  " << Console::brand("fel          ") << "  Fixed Effects Likelihood (site-by-site selection)\n"
@@ -54,7 +59,8 @@ void print_hyphy3_usage(const char* prog) {
               << "  " << Console::brand("dfel         ") << "  Directional FEL (non-stationary selection & auto-rooting)\n"
               << "  " << Console::brand("mss          ") << "  Multi-class Synonymous Substitution Models (SynREV, TSVs & fast DP selector)\n"
               << "  " << Console::brand("ohmic        ") << "  Ohmic Phylogenetic Networks & Wheatstone Pruning\n"
-              << "  " << Console::brand("tree         ") << "  ML/Ohmic Tree Engine (spectral scaffold & native polytomies)\n\n";
+              << "  " << Console::brand("tree         ") << "  ML/Ohmic Tree Engine (spectral scaffold & native polytomies)\n"
+              << "  " << Console::brand("joint-align  ") << "  Ohmic Co-Inference of Codon Alignment, Phylogeny & Selection\n\n";
 
     std::cout << Console::bold("Reports:") << "\n"
               << "  " << Console::brand("report       ") << "  Write a self-contained HTML report for an existing result JSON\n\n";
@@ -64,9 +70,12 @@ void print_hyphy3_usage(const char* prog) {
               << "  " << Console::brand("--version, -v") << "  Show version information\n\n";
 
     std::cout << Console::bold("Examples:") << "\n"
+              << "  " << prog << " -u tests/data/unaligned_cds/mammalian_ifitm3_unaligned.fa\n"
+              << "  " << prog << " characterize --unaligned tests/data/unaligned_cds/mammalian_ifitm3_unaligned.fa --html ifitm3.html\n"
               << "  " << prog << " fel --alignment data/cd2.fna --tree data/cd2.nwk --html cd2.FEL.html\n"
               << "  " << prog << " dfel --alignment tests/data/adh.nex --root auto\n"
               << "  " << prog << " ohmic --alignment tests/data/cd2.fna\n"
+              << "  " << prog << " joint-align --unaligned tests/data/unaligned_cds/mammalian_ifitm3_unaligned.fa\n"
               << "  " << prog << " meme --alignment tests/data/adh.nex --threads 8\n"
               << "  " << prog << " busted --alignment tests/data/adh.nex --auto-k --threads 8\n"
               << "  " << prog << " busted-ph --alignment data/cd2.fna --tree data/cd2.nwk --branches Human,Chimp,Baboon\n"
@@ -94,6 +103,12 @@ int main(int argc, char* argv[]) {
         return 0;
     }
 
+    // Direct One-Button invocation: if the user passes -u/--unaligned or -a/--alignment/--msa directly to hyphy3,
+    // route straight to the unified CharacterizeEngine!
+    if (cmd == "-u" || cmd == "--unaligned" || cmd == "-a" || cmd == "--alignment" || cmd == "--msa") {
+        return run_characterize(argc, argv);
+    }
+
     // Shift arguments so the subcommand sees argv[0] as "hyphy3 <subcommand>"
     // and remaining arguments as its options
     std::vector<char*> sub_argv;
@@ -105,7 +120,9 @@ int main(int argc, char* argv[]) {
     int sub_argc = static_cast<int>(sub_argv.size());
 
     try {
-        if (cmd == "fel") {
+        if (cmd == "characterize" || cmd == "auto" || cmd == "omni" || cmd == "one-button") {
+            return run_characterize(sub_argc, sub_argv.data());
+        } else if (cmd == "fel") {
             return run_fel(sub_argc, sub_argv.data());
         } else if (cmd == "contrast-fel" || cmd == "contrast_fel" || cmd == "cfel") {
             return run_contrast_fel(sub_argc, sub_argv.data());
@@ -135,6 +152,8 @@ int main(int argc, char* argv[]) {
             return run_ohmic(sub_argc, sub_argv.data());
         } else if (cmd == "tree" || cmd == "TREE" || cmd == "tree-search") {
             return run_tree(sub_argc, sub_argv.data());
+        } else if (cmd == "joint-align" || cmd == "joint_align" || cmd == "align") {
+            return run_joint_align(sub_argc, sub_argv.data());
         } else if (cmd == "report") {
             return run_report(sub_argc, sub_argv.data());
         } else {

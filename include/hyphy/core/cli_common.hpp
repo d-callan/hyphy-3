@@ -9,6 +9,7 @@
 #include "hyphy/core/progress_bar.hpp"
 #include "hyphy/core/provenance.hpp"
 #include "hyphy/analyses/tree_engine.hpp"
+#include "hyphy/analyses/joint_align.hpp"
 #if __has_include("hyphy/report/viewer_assets.hpp")
 // viewer_assets.hpp is generated into the build tree by hyphy3_viewer_assets and
 // is only on the include path of targets linking hyphy3_report. html_report.hpp
@@ -45,7 +46,11 @@ struct CommonCLIOptions {
     std::string branches = "All";
     std::string branch_regex;
     std::string embeddings_file;
+    std::string out_poa_file;
+    std::string out_stk_file;
+    std::string out_enewick_file;
 
+    bool force_unaligned = false;
     bool use_ohmic = false;
     bool use_hyphaeon = false;
     bool full_model = true;
@@ -92,6 +97,23 @@ inline CommonArgParseStatus parse_common_cli_arg(int& i, int argc, char* argv[],
     std::string arg = argv[i];
     if ((arg == "--alignment" || arg == "-a" || arg == "--msa") && i + 1 < argc) {
         opts.alignment_file = argv[++i];
+        return CommonArgParseStatus::Handled;
+    }
+    if ((arg == "--unaligned" || arg == "-u" || arg == "--sequences") && i + 1 < argc) {
+        opts.alignment_file = argv[++i];
+        opts.force_unaligned = true;
+        return CommonArgParseStatus::Handled;
+    }
+    if ((arg == "--out-poa" || arg == "--out-gfa") && i + 1 < argc) {
+        opts.out_poa_file = argv[++i];
+        return CommonArgParseStatus::Handled;
+    }
+    if ((arg == "--out-stk" || arg == "--out-stockholm") && i + 1 < argc) {
+        opts.out_stk_file = argv[++i];
+        return CommonArgParseStatus::Handled;
+    }
+    if ((arg == "--out-enewick" || arg == "--out-enwk") && i + 1 < argc) {
+        opts.out_enewick_file = argv[++i];
         return CommonArgParseStatus::Handled;
     }
     if ((arg == "--tree" || arg == "-t") && i + 1 < argc) {
@@ -203,6 +225,10 @@ inline void finalize_common_cli_options(CommonCLIOptions& opts, const std::strin
 #ifdef _OPENMP
     if (opts.num_threads > 0) {
         omp_set_num_threads(opts.num_threads);
+    } else if (std::getenv("OMP_NUM_THREADS") == nullptr) {
+        // Default to at most 8 threads unless the user explicitly passed --threads N or OMP_NUM_THREADS
+        int hw = omp_get_max_threads();
+        omp_set_num_threads(std::min(hw, 8));
     }
 #endif
     if (opts.output_file.empty() && !opts.alignment_file.empty()) {
@@ -225,7 +251,8 @@ struct LoadedCodonDataset {
 };
 
 /**
- * @brief Load GeneticCode, Codon Alignment, and resolve Tree/OhmicNetwork with uniform error reporting.
+ * @brief Load GeneticCode, Codon Alignment (or automatically co-infer MSA + Ohmic Tree from unaligned CDS!),
+ *        and resolve Tree/OhmicNetwork with uniform error reporting.
  */
 inline bool load_codon_dataset(
     const CommonCLIOptions& opts,
@@ -245,11 +272,77 @@ inline bool load_codon_dataset(
         }
     }
 
-    try {
-        out.aln = Alignment::load(opts.alignment_file, out.gcode);
-    } catch (const std::exception& e) {
-        std::cerr << Console::danger("Error loading alignment: ") << e.what() << "\n";
-        return false;
+    bool built_from_unaligned = false;
+    if (!opts.force_unaligned) {
+        try {
+            out.aln = Alignment::load(opts.alignment_file, out.gcode);
+        } catch (const std::exception& e) {
+            std::string err = e.what();
+            if (err.find("unequal lengths") != std::string::npos ||
+                err.find("length mismatch") != std::string::npos ||
+                err.find("multiple of 3") != std::string::npos) {
+                built_from_unaligned = true;
+            } else {
+                std::cerr << Console::danger("Error loading alignment: ") << err << "\n";
+                return false;
+            }
+        }
+    } else {
+        built_from_unaligned = true;
+    }
+
+    if (built_from_unaligned) {
+        try {
+            auto unaligned_seqs = analyses::JointAlignEngine::load_unaligned_fasta(opts.alignment_file, out.gcode);
+            if (unaligned_seqs.size() < 2) {
+                throw std::runtime_error("Need at least 2 homologous sequences for de novo joint alignment.");
+            }
+            size_t min_c = 999999, max_c = 0;
+            for (const auto& s : unaligned_seqs) {
+                size_t cl = s.raw_seq.size() / 3;
+                min_c = std::min(min_c, cl);
+                max_c = std::max(max_c, cl);
+            }
+            if (!opts.quiet) {
+                std::cout << Console::info("ℹ") << " "
+                          << Console::bold("Unaligned homologous CDS detected (")
+                          << unaligned_seqs.size() << " taxa, " << min_c << ".." << max_c
+                          << " codons) — running De Novo Ohmic Co-Inference (MSA + Phylogeny + POA)...\n";
+            }
+            analyses::JointAlignSettings js;
+            js.quiet = opts.quiet;
+            js.run_marginalized_fel = false; // Only co-estimate the MAP alignment + coupled-SPR Ohmic tree + POA!
+            analyses::JointAlignEngine jengine(js);
+            auto [dn_aln, dn_tree] = analyses::JointAlignEngine::build_de_novo_codon_alignment_and_tree(
+                unaligned_seqs, out.gcode, js
+            );
+            auto jres = jengine.run(dn_aln, dn_tree);
+
+            if (!opts.out_poa_file.empty()) {
+                std::ofstream pf(opts.out_poa_file);
+                if (pf.is_open()) pf << jres.poa_gfa;
+            }
+            if (!opts.out_stk_file.empty()) {
+                std::ofstream sf(opts.out_stk_file);
+                if (sf.is_open()) sf << jres.stockholm_alignment;
+            }
+            if (!opts.out_enewick_file.empty()) {
+                std::ofstream ef(opts.out_enewick_file);
+                if (ef.is_open()) ef << jres.extended_newick << "\n";
+            }
+
+            out.aln = std::move(jres.map_alignment);
+            out.tree = std::move(jres.optimized_tree);
+            out.ohmic_net = std::move(jres.ohmic_network);
+            out.tree_source = "De Novo Ohmic Circuit + MG94 Codon Transducer + Coupled SPR (" +
+                              std::to_string(out.aln.num_codons) + " codons, " +
+                              std::to_string(out.ohmic_net.bridges.size()) + " Wheatstone bridges)";
+            return true;
+        } catch (const std::exception& e) {
+            std::cerr << Console::danger("Error building de novo alignment & phylogeny from unaligned sequences: ")
+                      << e.what() << "\n";
+            return false;
+        }
     }
 
     try {
