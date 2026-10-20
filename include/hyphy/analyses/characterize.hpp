@@ -2733,12 +2733,25 @@ private:
 
         // 4C. 1D Spatial Segmentation & Synonymous Constraint Islands (Tier 1)
         {
-            // 1. Penalized BIC 1D Change-Point Segmentation on site-wise log(ω_c + 0.05) and gap fraction
-            size_t L_min = std::min<size_t>(10, std::max<size_t>(1, C / 2));
-            std::vector<Scalar> y_vec(C, 0.0);
+            // 1. Penalized BIC 1D Change-Point Segmentation on 5-codon smoothed site-wise log(ω_c + 0.08) + gap fraction
+            size_t L_min = std::min<size_t>(15, std::max<size_t>(1, C / 4));
+            std::vector<Scalar> y_raw(C, 0.0), y_vec(C, 0.0);
             for (size_t c = 0; c < C; ++c) {
-                Scalar w_c = res.site_atlas[c].beta_pervasive / std::max<Scalar>(0.05, res.site_atlas[c].alpha);
-                y_vec[c] = std::log(std::clamp<Scalar>(w_c, 0.0, 10.0) + 0.05) + 1.5 * res.site_atlas[c].gap_fraction;
+                Scalar eff_a = std::max<Scalar>(0.15, std::min<Scalar>(10.0, res.site_atlas[c].alpha));
+                Scalar eff_b = std::min<Scalar>(10.0, res.site_atlas[c].beta_pervasive);
+                Scalar w_c = eff_b / eff_a;
+                y_raw[c] = std::log(std::clamp<Scalar>(w_c, 0.0, 5.0) + 0.08) + 1.5 * res.site_atlas[c].gap_fraction;
+            }
+            for (size_t c = 0; c < C; ++c) {
+                if (C < 20) {
+                    y_vec[c] = y_raw[c];
+                } else {
+                    size_t w_lo = (c >= 2) ? (c - 2) : 0;
+                    size_t w_hi = std::min<size_t>(C - 1, c + 2);
+                    Scalar s_val = 0.0;
+                    for (size_t k = w_lo; k <= w_hi; ++k) s_val += y_raw[k];
+                    y_vec[c] = s_val / static_cast<Scalar>(w_hi - w_lo + 1);
+                }
             }
 
             // Prefix sums for O(1) segment variance evaluation
@@ -2748,8 +2761,8 @@ private:
                 pref_y2[c + 1] = pref_y2[c] + y_vec[c] * y_vec[c];
             }
             Scalar total_mean = pref_y[C] / std::max<Scalar>(1.0, static_cast<Scalar>(C));
-            Scalar total_var = std::max<Scalar>(0.10, (pref_y2[C] / std::max<Scalar>(1.0, static_cast<Scalar>(C))) - total_mean * total_mean);
-            Scalar bic_pen = 2.5 * total_var * std::log(static_cast<Scalar>(std::max<size_t>(2, C)));
+            Scalar total_var = std::max<Scalar>(0.05, (pref_y2[C] / std::max<Scalar>(1.0, static_cast<Scalar>(C))) - total_mean * total_mean);
+            Scalar bic_pen = 4.0 * total_var * std::log(static_cast<Scalar>(std::max<size_t>(2, C)));
 
             auto seg_rss = [&](size_t s, size_t e) -> Scalar {
                 Scalar len = static_cast<Scalar>(e - s);
@@ -2790,10 +2803,12 @@ private:
                 Scalar len = static_cast<Scalar>(bnd.second - bnd.first + 1);
                 Scalar sum_w = 0.0, sum_a = 0.0, sum_b = 0.0, sum_g = 0.0, sum_neff = 0.0;
                 for (size_t c = bnd.first; c <= bnd.second; ++c) {
-                    Scalar w_c = res.site_atlas[c].beta_pervasive / std::max<Scalar>(0.05, res.site_atlas[c].alpha);
-                    sum_w += std::min<Scalar>(5.0, w_c);
-                    sum_a += res.site_atlas[c].alpha;
-                    sum_b += res.site_atlas[c].beta_pervasive;
+                    Scalar eff_a = std::max<Scalar>(0.15, std::min<Scalar>(10.0, res.site_atlas[c].alpha));
+                    Scalar eff_b = std::min<Scalar>(10.0, res.site_atlas[c].beta_pervasive);
+                    Scalar w_c = eff_b / eff_a;
+                    sum_w += std::min<Scalar>(3.0, w_c);
+                    sum_a += eff_a;
+                    sum_b += eff_b;
                     sum_g += res.site_atlas[c].gap_fraction;
                     sum_neff += res.site_atlas[c].effective_aa_alphabet;
                 }
@@ -2802,9 +2817,9 @@ private:
                 dom.mean_beta = sum_b / len;
                 dom.mean_gap_fraction = sum_g / len;
                 dom.mean_n_eff = sum_neff / len;
-                if (dom.mean_gap_fraction >= 0.25 || dom.mean_omega >= 0.85) {
+                if (dom.mean_gap_fraction >= 0.25 || dom.mean_omega >= 0.90) {
                     dom.domain_type = "Hypervariable / IDR";
-                } else if (dom.mean_omega <= 0.22) {
+                } else if (dom.mean_omega <= 0.28) {
                     dom.domain_type = "Purifying Core";
                 } else {
                     dom.domain_type = "Permissive / Surface";
@@ -2816,55 +2831,81 @@ private:
             }
 
             // 2. Synonymous Constraint Island Scan (dual-coding / RNA structure / splice enhancer detection)
+            //    Combines Winsorized α_c (<= 5.0) depletion Z-score with exact Binomial silent-codon run test
             if (C >= 25) {
+                std::vector<Scalar> win_alpha(C, 0.0);
                 Scalar sum_a = 0.0, sum_a2 = 0.0;
+                size_t total_silent = 0;
                 for (size_t c = 0; c < C; ++c) {
-                    sum_a += res.site_atlas[c].alpha;
-                    sum_a2 += res.site_atlas[c].alpha * res.site_atlas[c].alpha;
+                    win_alpha[c] = std::min<Scalar>(5.0, res.site_atlas[c].alpha);
+                    sum_a += win_alpha[c];
+                    sum_a2 += win_alpha[c] * win_alpha[c];
+                    if (win_alpha[c] <= 0.15 && res.site_atlas[c].gap_fraction <= 0.25) total_silent++;
                 }
-                Scalar gene_mean_a = std::max<Scalar>(0.10, sum_a / static_cast<Scalar>(C));
-                Scalar gene_sd_a = std::sqrt(std::max<Scalar>(0.02, (sum_a2 / static_cast<Scalar>(C)) - gene_mean_a * gene_mean_a));
+                Scalar gene_mean_a = std::max<Scalar>(0.15, sum_a / static_cast<Scalar>(C));
+                Scalar gene_sd_a = std::sqrt(std::max<Scalar>(0.04, (sum_a2 / static_cast<Scalar>(C)) - gene_mean_a * gene_mean_a));
+                Scalar p_silent = std::clamp<Scalar>(static_cast<Scalar>(total_silent) / static_cast<Scalar>(C), 0.05, 0.90);
 
-                size_t win_len = std::min<size_t>(15, C / 3);
+                auto binom_upper_tail = [](size_t k_obs, size_t n_tot, Scalar p0) -> Scalar {
+                    if (k_obs == 0) return 1.0;
+                    Scalar log_p = std::log(p0), log_q = std::log(1.0 - p0);
+                    Scalar prob = 0.0;
+                    for (size_t k = k_obs; k <= n_tot; ++k) {
+                        Scalar lchoose = std::lgamma(static_cast<Scalar>(n_tot + 1)) -
+                                         std::lgamma(static_cast<Scalar>(k + 1)) -
+                                         std::lgamma(static_cast<Scalar>(n_tot - k + 1));
+                        prob += std::exp(lchoose + static_cast<Scalar>(k) * log_p + static_cast<Scalar>(n_tot - k) * log_q);
+                    }
+                    return std::clamp<Scalar>(prob, 0.0, 1.0);
+                };
+
+                size_t win_len = std::min<size_t>(11, C / 3);
                 std::vector<bool> used_in_island(C, false);
                 for (size_t s = 0; s + win_len <= C; ++s) {
                     if (used_in_island[s]) continue;
-                    Scalar w_sum = 0.0, g_sum = 0.0;
-                    for (size_t k = 0; k < win_len; ++k) {
-                        w_sum += res.site_atlas[s + k].alpha;
-                        g_sum += res.site_atlas[s + k].gap_fraction;
-                    }
-                    Scalar w_mean = w_sum / static_cast<Scalar>(win_len);
-                    Scalar g_mean = g_sum / static_cast<Scalar>(win_len);
-                    // Require low gap fraction so missing data is not mistaken for synonymous conservation
-                    if (g_mean <= 0.20 && w_mean <= 0.35 * gene_mean_a) {
-                        size_t e = s + win_len - 1;
-                        while (e + 1 < C && res.site_atlas[e + 1].alpha <= 0.45 * gene_mean_a &&
-                               res.site_atlas[e + 1].gap_fraction <= 0.25) {
-                            w_sum += res.site_atlas[e + 1].alpha;
-                            e++;
-                        }
+                    // Find best contiguous extension [s, e] up to length 24 that minimizes p_isl
+                    size_t best_e = s + win_len - 1;
+                    Scalar best_p = 1.0, best_z = 0.0, best_mean_a = gene_mean_a;
+                    for (size_t e = s + win_len - 1; e < std::min<size_t>(C, s + 24); ++e) {
                         size_t span = e - s + 1;
-                        Scalar island_mean_a = w_sum / static_cast<Scalar>(span);
-                        Scalar z_dep = (gene_mean_a - island_mean_a) / (gene_sd_a / std::sqrt(static_cast<Scalar>(span)));
-                        Scalar p_isl = 0.5 * std::erfc(z_dep / std::sqrt(2.0));
-                        Scalar adj_p = std::min<Scalar>(1.0, p_isl * static_cast<Scalar>(std::max<size_t>(1, C / 5)));
-                        if (adj_p <= 0.05 && z_dep >= 2.8) {
-                            SynonymousConstraintIsland isl;
-                            isl.start_codon = s;
-                            isl.end_codon = e;
-                            isl.mean_alpha = island_mean_a;
-                            isl.gene_mean_alpha = gene_mean_a;
-                            isl.suppression_ratio = island_mean_a / gene_mean_a;
-                            isl.z_score = z_dep;
-                            isl.p_value = adj_p;
-                            res.synonymous_islands.push_back(isl);
-                            for (size_t k = s; k <= e; ++k) {
-                                used_in_island[k] = true;
-                                res.site_atlas[k].in_synonymous_island = true;
-                            }
-                            s = e;
+                        Scalar w_sum = 0.0, g_sum = 0.0;
+                        size_t k_silent = 0;
+                        for (size_t c = s; c <= e; ++c) {
+                            w_sum += win_alpha[c];
+                            g_sum += res.site_atlas[c].gap_fraction;
+                            if (win_alpha[c] <= 0.15) k_silent++;
                         }
+                        Scalar w_mean = w_sum / static_cast<Scalar>(span);
+                        Scalar g_mean = g_sum / static_cast<Scalar>(span);
+                        if (g_mean > 0.20 || w_mean > 0.35 * gene_mean_a) continue;
+
+                        Scalar z_dep = (gene_mean_a - w_mean) / (gene_sd_a / std::sqrt(static_cast<Scalar>(span)));
+                        Scalar p_norm = 0.5 * std::erfc(z_dep / std::sqrt(2.0));
+                        Scalar p_bin = binom_upper_tail(k_silent, span, p_silent);
+                        Scalar p_cand = std::min(p_norm, p_bin);
+                        if (p_cand < best_p) {
+                            best_p = p_cand;
+                            best_e = e;
+                            best_mean_a = w_mean;
+                            best_z = std::max(z_dep, std::sqrt(std::max<Scalar>(0.0, -2.0 * std::log(std::max<Scalar>(1e-16, p_cand)))));
+                        }
+                    }
+                    Scalar adj_p = std::min<Scalar>(1.0, best_p * static_cast<Scalar>(std::max<size_t>(1, C / 12)));
+                    if (best_p <= 0.010 && adj_p <= 0.12) {
+                        SynonymousConstraintIsland isl;
+                        isl.start_codon = s;
+                        isl.end_codon = best_e;
+                        isl.mean_alpha = best_mean_a;
+                        isl.gene_mean_alpha = gene_mean_a;
+                        isl.suppression_ratio = best_mean_a / gene_mean_a;
+                        isl.z_score = best_z;
+                        isl.p_value = adj_p;
+                        res.synonymous_islands.push_back(isl);
+                        for (size_t k = s; k <= best_e; ++k) {
+                            used_in_island[k] = true;
+                            res.site_atlas[k].in_synonymous_island = true;
+                        }
+                        s = best_e;
                     }
                 }
             }

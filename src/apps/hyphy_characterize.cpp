@@ -265,7 +265,18 @@ int main(int argc, char* argv[])
             s_q3_dom << (res.spatial_domains[i].start_codon + 1) << "-" << (res.spatial_domains[i].end_codon + 1)
                      << ":" << res.spatial_domains[i].domain_type;
         }
-        s_q3_dom << ")  │  Synonymous Constraint Islands: " << res.synonymous_islands.size();
+        s_q3_dom << ")  │  SRV Islands: " << res.synonymous_islands.size();
+        if (!res.synonymous_islands.empty()) {
+            s_q3_dom << " (";
+            for (size_t i = 0; i < res.synonymous_islands.size(); ++i) {
+                if (i > 0) s_q3_dom << ", ";
+                s_q3_dom << "codons " << (res.synonymous_islands[i].start_codon + 1) << "-"
+                         << (res.synonymous_islands[i].end_codon + 1) << " [α="
+                         << std::fixed << std::setprecision(2) << res.synonymous_islands[i].mean_alpha
+                         << ", " << std::setprecision(2) << res.synonymous_islands[i].suppression_ratio << "x]";
+            }
+            s_q3_dom << ")";
+        }
 
         s_q3_sites << "▲ Episodic (MEME): " << res.sites_episodic_diversifying
                    << "  │  ▲ Pervasive (FEL/dFEL): " << res.sites_pervasive_diversifying
