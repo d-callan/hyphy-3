@@ -1873,95 +1873,150 @@ private:
         }
 
         // ---------------------------------------------------------------------
-        // 3B. Gene-Wide BUSTED-E via EM on Shared Tensor + Dedicated Error Sink
-        //     (Decision 2: 3 Biological ω Classes + Dedicated Error-Sink Class ω_err)
+        // 3B. Gene-Wide BUSTED-E via EM on Shared Tensor + Rank-1 Off-Diagonal Error Sink
+        //     (Decision 2: 3 Biological ω Classes + Rank-1 Instantaneous Jump Kernel P_sink)
+        //     Unlike a high-ω biological rate class (which absorbs genuine 1-nt positive
+        //     selection!), P_sink(i, j) = π_j / (1 - π_i) for i != j and P_sink(i, i) = 0
+        //     has zero diagonal and specifically absorbs multi-nucleotide / indel-boundary
+        //     mismatches where all biological 1-nt transition probabilities are ~O(t^2..t^3).
         // ---------------------------------------------------------------------
         {
-            size_t best_g1 = 1, best_g2 = 6, best_g3 = 11;
-            std::array<Scalar, 3> weights = {0.70, 0.25, 0.05};
-            Scalar best_err_w = 0.0;
+            // Precompute rank-1 off-diagonal sink relative likelihood W_sink[c][bi]
+            Vector inv_one_minus_pi = Vector::Zero(S);
+            for (int i = 0; i < S; ++i) {
+                inv_one_minus_pi(i) = 1.0 / std::max<Scalar>(1e-12, 1.0 - pi_codon(i));
+            }
+            std::vector<std::vector<Scalar>> W_sink(C, std::vector<Scalar>(B, 0.0));
+            for (size_t bi = 0; bi < B; ++bi) {
+                int32_t bid = active_branches[bi];
+                Scalar bl = work_tree.nodes[bid].branch_length * conv;
+                Matrix P_ref = branch_grid_transition_matrix(bid, 6, bl); // ω = 0.50 reference
+                for (size_t c = 0; c < C; ++c) {
+                    const Vector& U = site_outside[c][bid];
+                    const Vector& L = site_inside[c][bid];
+                    Scalar ref_val = std::max<Scalar>(1e-30, U.dot(P_ref * L));
+                    Scalar pi_dot_L = pi_codon.dot(L);
+                    Scalar sink_val = 0.0;
+                    for (int i = 0; i < S; ++i) {
+                        Scalar p_sink_L_i = (pi_dot_L - pi_codon(i) * L(i)) * inv_one_minus_pi(i);
+                        sink_val += U(i) * std::max<Scalar>(0.0, p_sink_L_i);
+                    }
+                    W_sink[c][bi] = std::max<Scalar>(0.0, sink_val / ref_val);
+                }
+            }
 
-            auto fit_busted_e_em = [&](size_t g1, size_t g2, size_t g3, bool allow_w3,
-                                       std::array<Scalar, 3>& out_w, Scalar& out_w_err) -> Scalar {
-                std::array<Scalar, 4> w = allow_w3
-                    ? std::array<Scalar, 4>{0.70, 0.24, 0.05, 0.01}
-                    : std::array<Scalar, 4>{0.74, 0.25, 0.00, 0.01};
-                size_t g_arr[4] = {g1, g2, g3, G - 1}; // Class 3 is dedicated error sink (ω_err = 25..50)
-                Scalar total_ll = -1e18;
-                for (int iter = 0; iter < 18; ++iter) {
-                    std::array<Scalar, 4> accum = {1e-6, 1e-6, allow_w3 ? 1e-6 : 0.0, 1e-6};
-                    total_ll = 0.0;
-                    for (size_t c = 0; c < C; ++c) {
-                        Scalar pp = res.site_atlas[c].column_homology_posterior;
-                        for (size_t bi = 0; bi < B; ++bi) {
-                            Scalar l0 = w[0] * W_tensor[c][bi][g_arr[0]];
-                            Scalar l1 = w[1] * W_tensor[c][bi][g_arr[1]];
-                            Scalar l2 = allow_w3 ? (w[2] * W_tensor[c][bi][g_arr[2]]) : 0.0;
-                            // Error sink absorbs severe multi-nucleotide / indel-boundary outliers
-                            Scalar l_err = w[3] * (1.25 * W_tensor[c][bi][g_arr[3]]);
-                            Scalar s = std::max<Scalar>(1e-30, l0 + l1 + l2 + l_err);
-                            total_ll += pp * std::log(s);
-                            accum[0] += pp * (l0 / s);
-                            accum[1] += pp * (l1 / s);
-                            if (allow_w3) accum[2] += pp * (l2 / s);
-                            accum[3] += pp * (l_err / s);
+            auto fit_busted_em_model = [&](bool use_sink,
+                                           size_t& best_g1, size_t& best_g2, size_t& best_g3,
+                                           std::array<Scalar, 3>& best_w, Scalar& best_err_w,
+                                           Scalar& out_null_ll, Scalar& out_alt_ll) {
+                auto run_em = [&](size_t g1, size_t g2, size_t g3, bool allow_w3,
+                                  std::array<Scalar, 3>& out_w, Scalar& out_w_err) -> Scalar {
+                    std::array<Scalar, 4> w = allow_w3
+                        ? std::array<Scalar, 4>{0.70, 0.25, 0.049, use_sink ? 0.001 : 0.0}
+                        : std::array<Scalar, 4>{0.75, 0.249, 0.00, use_sink ? 0.001 : 0.0};
+                    Scalar total_ll = -1e18;
+                    for (int iter = 0; iter < 25; ++iter) {
+                        std::array<Scalar, 4> accum = {1e-6, 1e-6, allow_w3 ? 1e-6 : 0.0, use_sink ? 1e-9 : 0.0};
+                        total_ll = 0.0;
+                        for (size_t c = 0; c < C; ++c) {
+                            Scalar pp = res.site_atlas[c].column_homology_posterior;
+                            for (size_t bi = 0; bi < B; ++bi) {
+                                Scalar l0 = w[0] * W_tensor[c][bi][g1];
+                                Scalar l1 = w[1] * W_tensor[c][bi][g2];
+                                Scalar l2 = allow_w3 ? (w[2] * W_tensor[c][bi][g3]) : 0.0;
+                                Scalar l_err = use_sink ? (w[3] * W_sink[c][bi]) : 0.0;
+                                Scalar s = std::max<Scalar>(1e-30, l0 + l1 + l2 + l_err);
+                                total_ll += pp * std::log(s);
+                                accum[0] += pp * (l0 / s);
+                                accum[1] += pp * (l1 / s);
+                                if (allow_w3) accum[2] += pp * (l2 / s);
+                                if (use_sink) accum[3] += pp * (l_err / s);
+                            }
+                        }
+                        Scalar sum_a = accum[0] + accum[1] + accum[2] + accum[3];
+                        for (int k = 0; k < 4; ++k) w[k] = accum[k] / sum_a;
+                        if (use_sink && w[3] > 0.01) {
+                            Scalar excess = w[3] - 0.01;
+                            w[3] = 0.01;
+                            w[0] += 0.5 * excess;
+                            w[1] += 0.5 * excess;
                         }
                     }
-                    Scalar sum_a = accum[0] + accum[1] + accum[2] + accum[3];
-                    for (int k = 0; k < 4; ++k) w[k] = accum[k] / sum_a;
-                    // Cap error-sink weight at <= 2.5% as in BUSTED-E specification
-                    if (w[3] > 0.025) {
-                        Scalar excess = w[3] - 0.025;
-                        w[3] = 0.025;
-                        w[0] += 0.5 * excess;
-                        w[1] += 0.5 * excess;
+                    Scalar bio_sum = std::max<Scalar>(1e-12, w[0] + w[1] + w[2]);
+                    out_w = {w[0] / bio_sum, w[1] / bio_sum, w[2] / bio_sum};
+                    out_w_err = use_sink ? w[3] : 0.0;
+                    return total_ll;
+                };
+
+                out_null_ll = -1e18;
+                std::array<Scalar, 3> null_w = {0.75, 0.25, 0.0};
+                Scalar null_err_w = 0.0;
+                best_g1 = 1; best_g2 = 6; best_g3 = 8;
+                for (size_t g1 : {size_t(0), size_t(1), size_t(2), size_t(3), size_t(4)}) {
+                    for (size_t g2 : {size_t(5), size_t(6), size_t(7), size_t(8)}) {
+                        std::array<Scalar, 3> w_tmp;
+                        Scalar w_err_tmp = 0.0;
+                        Scalar ll = run_em(g1, g2, 8, false, w_tmp, w_err_tmp);
+                        if (ll > out_null_ll) {
+                            out_null_ll = ll;
+                            best_g1 = g1;
+                            best_g2 = g2;
+                            null_w = w_tmp;
+                            null_err_w = w_err_tmp;
+                        }
                     }
                 }
-                Scalar bio_sum = std::max<Scalar>(1e-12, w[0] + w[1] + w[2]);
-                out_w = {w[0] / bio_sum, w[1] / bio_sum, w[2] / bio_sum};
-                out_w_err = w[3];
-                return total_ll;
+
+                out_alt_ll = out_null_ll;
+                best_w = null_w;
+                best_err_w = null_err_w;
+                for (size_t g1 : {best_g1 > 0 ? best_g1 - 1 : best_g1, best_g1, std::min<size_t>(4, best_g1 + 1)}) {
+                    for (size_t g2 : {best_g2 > 5 ? best_g2 - 1 : best_g2, best_g2, std::min<size_t>(8, best_g2 + 1)}) {
+                        for (size_t g3 = 9; g3 < G; ++g3) {
+                            std::array<Scalar, 3> w_tmp;
+                            Scalar w_err_tmp = 0.0;
+                            Scalar ll = run_em(g1, g2, g3, true, w_tmp, w_err_tmp);
+                            if (ll > out_alt_ll) {
+                                out_alt_ll = ll;
+                                best_g1 = g1;
+                                best_g2 = g2;
+                                best_g3 = g3;
+                                best_w = w_tmp;
+                                best_err_w = w_err_tmp;
+                            }
+                        }
+                    }
+                }
             };
 
-            std::array<Scalar, 3> null_w;
-            Scalar null_err_w = 0.0;
-            Scalar best_null = -1e18;
-            for (size_t g1 : {size_t(0), size_t(1), size_t(2), size_t(3)}) {
-                for (size_t g2 : {size_t(5), size_t(6), size_t(7), size_t(8)}) {
-                    std::array<Scalar, 3> w_tmp;
-                    Scalar w_err_tmp = 0.0;
-                    Scalar ll = fit_busted_e_em(g1, g2, 8, false, w_tmp, w_err_tmp);
-                    if (ll > best_null) {
-                        best_null = ll;
-                        best_g1 = g1;
-                        best_g2 = g2;
-                        null_w = w_tmp;
-                        null_err_w = w_err_tmp;
-                    }
-                }
-            }
+            // Fit standard 3-class BUSTED (no sink) and rank-1 P_sink BUSTED-E;
+            // only retain the error sink if it improves unconstrained log-likelihood by >= 0.5 * ln(B*C) (BIC check)
+            size_t g1_std = 1, g2_std = 6, g3_std = 8;
+            std::array<Scalar, 3> w_std = {0.75, 0.25, 0.0};
+            Scalar err_std = 0.0, null_std = -1e18, alt_std = -1e18;
+            fit_busted_em_model(false, g1_std, g2_std, g3_std, w_std, err_std, null_std, alt_std);
 
-            Scalar best_alt = best_null;
-            weights = null_w;
-            best_err_w = null_err_w;
-            best_g3 = 8;
-            for (size_t g3 = 9; g3 < G; ++g3) {
-                std::array<Scalar, 3> w_tmp;
-                Scalar w_err_tmp = 0.0;
-                Scalar ll = fit_busted_e_em(best_g1, best_g2, g3, true, w_tmp, w_err_tmp);
-                if (ll > best_alt) {
-                    best_alt = ll;
-                    best_g3 = g3;
-                    weights = w_tmp;
-                    best_err_w = w_err_tmp;
-                }
-            }
+            size_t g1_sk = 1, g2_sk = 6, g3_sk = 8;
+            std::array<Scalar, 3> w_sk = {0.75, 0.25, 0.0};
+            Scalar err_sk = 0.0, null_sk = -1e18, alt_sk = -1e18;
+            fit_busted_em_model(true, g1_sk, g2_sk, g3_sk, w_sk, err_sk, null_sk, alt_sk);
+
+            Scalar sink_bic_threshold = 0.5 * std::log(static_cast<Scalar>(std::max<size_t>(2, B * C)));
+            bool sink_supported = (2.0 * (alt_sk - alt_std) > 2.0 * sink_bic_threshold) && (err_sk >= 1e-4);
+
+            size_t best_g1 = sink_supported ? g1_sk : g1_std;
+            size_t best_g2 = sink_supported ? g2_sk : g2_std;
+            size_t best_g3 = sink_supported ? g3_sk : g3_std;
+            std::array<Scalar, 3> weights = sink_supported ? w_sk : w_std;
+            Scalar best_err_w = sink_supported ? err_sk : 0.0;
+            Scalar best_null = sink_supported ? null_sk : null_std;
+            Scalar best_alt = sink_supported ? alt_sk : alt_std;
 
             Scalar base_sum = 0.0;
             for (Scalar s_ll : site_base_ll) base_sum += s_ll;
             res.gene_wide.omega_classes = {omega_grid[best_g1], omega_grid[best_g2], omega_grid[best_g3]};
             res.gene_wide.omega_weights = weights;
-            res.gene_wide.error_sink_omega = 50.0;
+            res.gene_wide.error_sink_omega = 100.0;
             res.gene_wide.error_sink_weight = best_err_w;
             res.gene_wide.null_log_l = base_sum + best_null;
             res.gene_wide.unconstrained_log_l = base_sum + best_alt;
