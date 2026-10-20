@@ -69,6 +69,7 @@ public:
     Scalar mg94_log_l = 0.0;
     Scalar mg94_omega = 1.0;
     Scalar mg94_tree_length = 0.0;
+    mutable size_t num_mss_free_params = 0;
 
     BUSTEDAnalyzer(
         Tree t,
@@ -1779,7 +1780,7 @@ public:
         size_t num_mixture_params = (2 * K - 1) - (is_constrained ? 1 : 0) + (use_error_sink ? 1 : 0);
         size_t num_syn_params = srv ? 2 * (M - 1) : 0;
         size_t num_mh_params = (allow_double ? 1 : 0) + (allow_triple ? 1 : 0);
-        size_t K_params = 5 + (refine_branches ? num_branches : 1) + num_mixture_params + num_syn_params + num_mh_params;
+        size_t K_params = 5 + (refine_branches ? num_branches : 1) + num_mixture_params + num_syn_params + num_mh_params + num_mss_free_params;
         fit.aicc = -2.0 * fit.log_likelihood + 2.0 * K_params * N_codons / (N_codons - K_params - 1.0);
 
         return fit;
@@ -3636,7 +3637,7 @@ public:
                                   + (use_error_sink ? 2 : 0);
         size_t num_syn_params = srv ? 2 * (M - 1) : 0;
         size_t num_mh_params = (allow_double ? 1 : 0) + (allow_triple ? 1 : 0);
-        size_t K_params = 5 + (refine_branches ? num_branches : 1) + num_mixture_params + num_syn_params + num_mh_params;
+        size_t K_params = 5 + (refine_branches ? num_branches : 1) + num_mixture_params + num_syn_params + num_mh_params + num_mss_free_params;
         fit.aicc = -2.0 * fit.log_likelihood + 2.0 * K_params * N_codons / std::max(1.0, static_cast<double>(N_codons) - static_cast<double>(K_params) - 1.0);
 
         return fit;
@@ -3972,7 +3973,7 @@ public:
         size_t num_mixture_params = (2 * K - 1) + 1 + (has_u ? (2 * K - 1) : 0) + (use_error_sink ? 1 : 0); // shared weights + BG omegas + k_relax
         size_t num_syn_params = srv ? 2 * (M - 1) : 0;
         size_t num_mh_params = (allow_double ? 1 : 0) + (allow_triple ? 1 : 0);
-        size_t K_params = 5 + (refine_branches ? num_branches : 1) + num_mixture_params + num_syn_params + num_mh_params;
+        size_t K_params = 5 + (refine_branches ? num_branches : 1) + num_mixture_params + num_syn_params + num_mh_params + num_mss_free_params;
         fit.aicc = -2.0 * fit.log_likelihood + 2.0 * K_params * N_codons / std::max(1.0, static_cast<double>(N_codons) - static_cast<double>(K_params) - 1.0);
 
         return fit;
@@ -4088,6 +4089,7 @@ public:
 
             syn_pair_rates_storage = mss_part.expand_to_matrix(code->num_sense_codons, class_rates);
             base_params.syn_pair_rates = &syn_pair_rates_storage;
+            num_mss_free_params = (mss_part.num_classes() > 1) ? (mss_part.num_classes() - 1) : 0;
 
             std::vector<size_t> pair_counts(mss_part.num_classes(), 0);
             for (const auto& sp : mss_part.pairs) {
@@ -4105,6 +4107,7 @@ public:
             }
         } else {
             base_params.syn_pair_rates = nullptr;
+            num_mss_free_params = 0;
         }
         if (settings.full_auto) {
             res.auto_diagnostics = diagnose_and_select_model(settings);
