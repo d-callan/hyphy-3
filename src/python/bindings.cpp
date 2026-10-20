@@ -58,8 +58,8 @@ NB_MODULE(_hyphy3, m) {
     // Tree
     nb::class_<Tree>(m, "Tree")
         .def(nb::init<>())
-        .def_static("from_newick", &Tree::from_newick, "newick"_a)
-        .def_static("from_newick_file", &Tree::from_newick_file, "filepath"_a)
+        .def_static("from_newick", &Tree::from_newick, "newick"_a, "keep_rooted"_a = true)
+        .def_static("from_newick_file", &Tree::from_newick_file, "filepath"_a, "keep_rooted"_a = true)
         .def("num_nodes", &Tree::num_nodes)
         .def("num_leaves", &Tree::num_leaves)
         .def_ro("root_id", &Tree::root_id)
@@ -322,7 +322,9 @@ NB_MODULE(_hyphy3, m) {
         .def("__init__", [](BUSTEDAnalyzer* self, Tree tree, Alignment aln, const MG94Parameters& params) {
             new (self) BUSTEDAnalyzer(std::move(tree), std::move(aln), params);
         }, "tree"_a, "alignment"_a, "params"_a = MG94Parameters{})
-        .def_static("create_and_fit", &BUSTEDAnalyzer::create_and_fit, "tree"_a, "alignment"_a)
+        .def_static("create_and_fit", [](Tree tree, Alignment aln) {
+            return BUSTEDAnalyzer::create_and_fit(std::move(tree), std::move(aln));
+        }, "tree"_a, "alignment"_a)
         .def("run", &BUSTEDAnalyzer::run, "settings"_a = BUSTEDSettings{}, "show_progress"_a = false, "force_progress"_a = false)
         .def("to_json", [](const BUSTEDAnalyzer& busted, const BUSTEDResult& res, const std::string& fmt) {
             auto format = (fmt == "legacy") ? JSONFormat::Legacy : JSONFormat::ModernV3;
@@ -414,6 +416,8 @@ NB_MODULE(_hyphy3, m) {
         .def_rw("reference_branch_regex", &RELAXSettings::reference_branch_regex)
         .def_rw("reference_branch_names", &RELAXSettings::reference_branch_names)
         .def_rw("refine_branch_lengths", &RELAXSettings::refine_branch_lengths)
+        .def_rw("max_joint_cycles", &RELAXSettings::max_joint_cycles)
+        .def_rw("joint_tolerance", &RELAXSettings::joint_tolerance)
         .def_rw("verbose", &RELAXSettings::verbose);
 
     nb::class_<RELAXRateDistribution>(m, "RELAXRateDistribution")
@@ -428,8 +432,11 @@ NB_MODULE(_hyphy3, m) {
         .def_ro("parameters", &RELAXModelFit::parameters)
         .def_ro("tree_scale", &RELAXModelFit::tree_scale)
         .def_ro("k", &RELAXModelFit::k)
+        .def_ro("realized_cycles", &RELAXModelFit::realized_cycles)
+        .def_ro("converged", &RELAXModelFit::converged)
         .def_ro("reference_distribution", &RELAXModelFit::reference_distribution)
         .def_ro("test_distribution", &RELAXModelFit::test_distribution)
+        .def_ro("unclassified_distribution", &RELAXModelFit::unclassified_distribution)
         .def_ro("branch_lengths", &RELAXModelFit::branch_lengths)
         .def_ro("site_log_likelihoods", &RELAXModelFit::site_log_likelihoods);
 
@@ -445,6 +452,7 @@ NB_MODULE(_hyphy3, m) {
         .def_ro("mg94_omega_T", &RELAXResult::mg94_omega_T)
         .def_ro("alternative_fit", &RELAXResult::alternative_fit)
         .def_ro("null_fit", &RELAXResult::null_fit)
+        .def_ro("branch_switched_evidence_ratios", &RELAXResult::branch_switched_evidence_ratios)
         .def_ro("lrt", &RELAXResult::lrt)
         .def_ro("p_value", &RELAXResult::p_value)
         .def_ro("k", &RELAXResult::k)

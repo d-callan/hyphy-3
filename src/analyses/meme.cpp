@@ -196,7 +196,7 @@ nlohmann::json MEMEAnalyzer::to_modern_json(const Provenance& prov) const {
         j["statistical_tests"]["site_level_summary"] = {
             {"method", "Mixed Effects Model of Evolution (MEME)"},
             {"test_statistic", "Likelihood Ratio Test (LRT)"},
-            {"distribution", "Asymptotic Chi-squared Mixture (0.5 chi^2_0 + 0.5 chi^2_2)"},
+            {"distribution", "Asymptotic Chi-squared Mixture (0.333 chi^2_0 + 0.300 chi^2_1 + 0.367 chi^2_2)"},
             {"degrees_of_freedom", 2},
             {"null_hypothesis", "beta+ <= alpha or p+ = 0 (No episodic positive selection)"},
             {"alternative_hypothesis", "beta+ > alpha and p+ > 0 (Episodic positive selection on a subset of branches)"},

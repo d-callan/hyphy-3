@@ -251,18 +251,27 @@ public:
         };
 
         // Construct grid starting points matching HyPhy 2.5 MEME.bf
-        Scalar alpha_fel = std::clamp(fel_res.alpha, 1e-4, 100.0);
-        Scalar beta_fel = std::clamp(fel_res.beta, 1e-4, 1000.0);
+        Scalar alpha_fel = std::clamp(fel_res.alpha, 1e-4, 10000.0);
+        Scalar beta_fel = std::clamp(fel_res.beta, 1e-4, 100000.0);
         std::vector<std::array<Scalar, 4>> start_grid;
 
         Scalar w1_0 = std::clamp(beta_fel / std::max(alpha_fel, 1e-4), 0.0, 1.0);
 
         if (alpha_fel >= beta_fel) {
-            // Conserved Site Regime: targeted grid points matching HyPhy
+            // Conserved Site Regime: targeted grid points + episodic beta_plus > alpha probes (F-040)
             start_grid.push_back({alpha_fel, w1_0, 0.75, beta_fel});
             start_grid.push_back({alpha_fel, 0.0, 0.75, beta_fel});
             start_grid.push_back({alpha_fel, 0.0, 0.95, alpha_fel * 0.5});
             start_grid.push_back({alpha_fel, 0.25, 0.85, alpha_fel * 0.9});
+            Scalar bp1 = std::max(alpha_fel * 1.5, beta_fel * 2.0);
+            Scalar bp2 = std::max(alpha_fel * 2.5, beta_fel * 4.0);
+            Scalar bp3 = std::max(alpha_fel * 4.0, beta_fel * 8.0);
+            for (Scalar p_plus_probe : {0.05, 0.10, 0.20}) {
+                Scalar p1_probe = 1.0 - p_plus_probe;
+                start_grid.push_back({alpha_fel, w1_0, p1_probe, bp1});
+                start_grid.push_back({alpha_fel, w1_0, p1_probe, bp2});
+                start_grid.push_back({alpha_fel, w1_0, p1_probe, bp3});
+            }
         } else {
             // Positive Selection Regime: structured grid points matching HyPhy
             start_grid.push_back({alpha_fel, w1_0, 0.75, beta_fel});
@@ -280,8 +289,8 @@ public:
         };
 
         std::array<Scalar, 4> lb_alt = {1e-4, 0.0, 1e-6, 1e-4};
-        std::array<Scalar, 4> ub_alt = {100.0, 1.0, 1.0 - 1e-6, 2000.0};
-        auto opt_alt = NelderMeadND<4>::minimize(obj_alt, start_grid[0], lb_alt, ub_alt, 1e-4, 400, start_grid);
+        std::array<Scalar, 4> ub_alt = {10000.0, 1.0, 1.0 - 1e-6, 100000.0};
+        auto opt_alt = NelderMeadND<4>::minimize(obj_alt, start_grid[0], lb_alt, ub_alt, 1e-5, 800, start_grid);
 
         res.alpha = opt_alt.x[0];
         Scalar omega1 = opt_alt.x[1];
@@ -308,15 +317,44 @@ public:
             }
 
             std::array<Scalar, 3> lb_null = {1e-4, 0.0, 1e-6};
-            std::array<Scalar, 3> ub_null = {100.0, 1.0, 1.0 - 1e-6};
-            auto opt_null = NelderMeadND<3>::minimize(obj_null, null_grid[0], lb_null, ub_null, 1e-4, 400, null_grid);
+            std::array<Scalar, 3> ub_null = {10000.0, 1.0, 1.0 - 1e-6};
+            auto opt_null = NelderMeadND<3>::minimize(obj_null, null_grid[0], lb_null, ub_null, 1e-5, 800, null_grid);
 
             Scalar log_l_null = -opt_null.f;
+            if (log_l_null > res.log_l_meme && std::isfinite(log_l_null)) {
+                // Warm-start alternative model directly from the null MLE (F-074, F-094)
+                Scalar alpha_null = opt_null.x[0];
+                Scalar omega1_null = opt_null.x[1];
+                Scalar p1_null = opt_null.x[2];
+                std::vector<std::array<Scalar, 4>> warm_alt_grid = {
+                    {alpha_null, omega1_null, p1_null, alpha_null},
+                    {alpha_null, omega1_null, 0.99, alpha_null}
+                };
+                auto opt_alt2 = NelderMeadND<4>::minimize(obj_alt, warm_alt_grid[0], lb_alt, ub_alt, 1e-5, 800, warm_alt_grid);
+                if (-opt_alt2.f > res.log_l_meme) {
+                    res.alpha = opt_alt2.x[0];
+                    omega1 = opt_alt2.x[1];
+                    res.p1 = opt_alt2.x[2];
+                    res.beta_plus = opt_alt2.x[3];
+                    res.beta1 = res.alpha * omega1;
+                    res.p_plus = 1.0 - res.p1;
+                    res.log_l_meme = -opt_alt2.f;
+                }
+            }
+
             if (log_l_null <= -1e10 || res.log_l_meme <= -1e10 || !std::isfinite(log_l_null) || !std::isfinite(res.log_l_meme)) {
                 res.lrt = 0.0;
                 res.p_value = 1.0;
                 res.branches_under_selection = 0;
-            } else if (log_l_null > res.log_l_meme) {
+            } else if (log_l_null >= res.log_l_meme) {
+                Scalar alpha_null = opt_null.x[0];
+                Scalar omega1_null = opt_null.x[1];
+                Scalar beta1_null = alpha_null * omega1_null;
+                res.alpha = alpha_null;
+                res.beta1 = beta1_null;
+                res.p1 = 1.0;
+                res.beta_plus = beta1_null;
+                res.p_plus = 0.0;
                 res.log_l_meme = log_l_null;
                 res.lrt = 0.0;
                 res.p_value = 2.0 / 3.0;

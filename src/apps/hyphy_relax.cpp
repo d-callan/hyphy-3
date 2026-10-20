@@ -42,7 +42,7 @@ static void print_relax_usage(const char* prog) {
               << "  " << Console::brand("--output") << " <file>      Path to output JSON file (default: <alignment>.RELAX.json)\n"
               << "  " << Console::brand("--html") << " <file>        Also write a self-contained interactive HTML report\n"
               << "  " << Console::brand("--no-branch-opt") << "      Disable individual branch length refinement (use proportional scaling)\n"
-              << "  " << Console::brand("--joint-cycles") << " <N>   Max alternating (distribution <-> branch length) cycles (default: 5)\n"
+              << "  " << Console::brand("--joint-cycles") << " <N>   Max alternating (distribution <-> branch length) cycles (default: 15)\n"
               << "  " << Console::brand("--relax-normalization") << " <shared|per-class>  Omega-class rate normalization (default: shared =\n"
               << "                       one synonymous rate per branch, branch length = mixture expectation, as in HyPhy 2.5;\n"
               << "                       per-class = legacy hyphy-3 behavior, for comparison)\n"
@@ -252,6 +252,7 @@ int run_relax(int argc, char* argv[]) {
     });
 
     // Save JSON (and optional HTML)
+    bool write_failed = false;
     try {
         res.save_json(cli.output_file, tree, aln, cli.json_format, prov);
         std::string fmt_desc = (cli.json_format == JSONFormat::Legacy) ? "Legacy Datamonkey JSON" : "Modern HyPhy v3.0 JSON";
@@ -263,11 +264,16 @@ int run_relax(int argc, char* argv[]) {
                       << Console::brand(cli.html_file) << "\n\n";
         }
     } catch (const std::exception& e) {
-        std::cerr << Console::danger("Warning: Failed to write output: ") << e.what() << "\n";
+        std::cerr << Console::danger("Error: Failed to write output: ") << e.what() << "\n";
+        write_failed = true;
     }
 
     if (res.is_failed) {
         std::cerr << Console::danger("Error: RELAX analysis failed to converge or likelihood underflowed.\n");
+        return 1;
+    }
+
+    if (write_failed) {
         return 1;
     }
 

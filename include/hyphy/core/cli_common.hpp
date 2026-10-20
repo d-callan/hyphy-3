@@ -4,6 +4,7 @@
 #include "hyphy/core/genetic_code.hpp"
 #include "hyphy/core/alignment.hpp"
 #include "hyphy/core/tree.hpp"
+#include "hyphy/core/likelihood.hpp"
 #include "hyphy/core/ohmic_network.hpp"
 #include "hyphy/core/console.hpp"
 #include "hyphy/core/progress_bar.hpp"
@@ -20,6 +21,7 @@
 #endif
 
 #include <chrono>
+#include <cstdlib>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -51,6 +53,7 @@ struct CommonCLIOptions {
     std::string out_enewick_file;
 
     bool force_unaligned = false;
+    bool auto_align = false;
     bool use_ohmic = false;
     bool use_hyphaeon = false;
     bool full_model = true;
@@ -102,6 +105,10 @@ inline CommonArgParseStatus parse_common_cli_arg(int& i, int argc, char* argv[],
     if ((arg == "--unaligned" || arg == "-u" || arg == "--sequences") && i + 1 < argc) {
         opts.alignment_file = argv[++i];
         opts.force_unaligned = true;
+        return CommonArgParseStatus::Handled;
+    }
+    if (arg == "--auto-align") {
+        opts.auto_align = true;
         return CommonArgParseStatus::Handled;
     }
     if ((arg == "--out-poa" || arg == "--out-gfa") && i + 1 < argc) {
@@ -225,10 +232,21 @@ inline void finalize_common_cli_options(CommonCLIOptions& opts, const std::strin
 #ifdef _OPENMP
     if (opts.num_threads > 0) {
         omp_set_num_threads(opts.num_threads);
-    } else if (std::getenv("OMP_NUM_THREADS") == nullptr) {
+        LikelihoodEngine::set_user_requested_threads(opts.num_threads);
+    } else if (const char* env_t = std::getenv("OMP_NUM_THREADS")) {
+        int env_threads = std::atoi(env_t);
+        if (env_threads > 0) {
+            LikelihoodEngine::set_user_requested_threads(env_threads);
+        }
+    } else {
         // Default to at most 8 threads unless the user explicitly passed --threads N or OMP_NUM_THREADS
         int hw = omp_get_max_threads();
         omp_set_num_threads(std::min(hw, 8));
+        LikelihoodEngine::set_user_requested_threads(0);
+    }
+#else
+    if (opts.num_threads > 0) {
+        LikelihoodEngine::set_user_requested_threads(opts.num_threads);
     }
 #endif
     if (opts.output_file.empty() && !opts.alignment_file.empty()) {
@@ -251,7 +269,7 @@ struct LoadedCodonDataset {
 };
 
 /**
- * @brief Load GeneticCode, Codon Alignment (or automatically co-infer MSA + Ohmic Tree from unaligned CDS!),
+ * @brief Load GeneticCode, Codon Alignment (or co-infer MSA + Ohmic Tree from unaligned CDS when requested),
  *        and resolve Tree/OhmicNetwork with uniform error reporting.
  */
 inline bool load_codon_dataset(
@@ -278,9 +296,10 @@ inline bool load_codon_dataset(
             out.aln = Alignment::load(opts.alignment_file, out.gcode);
         } catch (const std::exception& e) {
             std::string err = e.what();
-            if (err.find("unequal lengths") != std::string::npos ||
-                err.find("length mismatch") != std::string::npos ||
-                err.find("multiple of 3") != std::string::npos) {
+            if (opts.auto_align &&
+                (err.find("unequal lengths") != std::string::npos ||
+                 err.find("length mismatch") != std::string::npos ||
+                 err.find("multiple of 3") != std::string::npos)) {
                 built_from_unaligned = true;
             } else {
                 std::cerr << Console::danger("Error loading alignment: ") << err << "\n";
@@ -332,12 +351,14 @@ inline bool load_codon_dataset(
             }
 
             out.aln = std::move(jres.map_alignment);
-            out.tree = std::move(jres.optimized_tree);
-            out.ohmic_net = std::move(jres.ohmic_network);
-            out.tree_source = "De Novo Ohmic Circuit + MG94 Codon Transducer + Coupled SPR (" +
-                              std::to_string(out.aln.num_codons) + " codons, " +
-                              std::to_string(out.ohmic_net.bridges.size()) + " Wheatstone bridges)";
-            return true;
+            if (opts.tree_file.empty()) {
+                out.tree = std::move(jres.optimized_tree);
+                out.ohmic_net = std::move(jres.ohmic_network);
+                out.tree_source = "De Novo Ohmic Circuit + MG94 Codon Transducer + Coupled SPR (" +
+                                  std::to_string(out.aln.num_codons) + " codons, " +
+                                  std::to_string(out.ohmic_net.bridges.size()) + " Wheatstone bridges)";
+                return true;
+            }
         } catch (const std::exception& e) {
             std::cerr << Console::danger("Error building de novo alignment & phylogeny from unaligned sequences: ")
                       << e.what() << "\n";

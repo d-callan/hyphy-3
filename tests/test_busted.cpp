@@ -219,9 +219,9 @@ TEST_CASE("BUSTED-E: Saturation Error Sink (Option A) Quarantines Misalignment A
     std::string nwk = "((T1:0.002,T2:0.002)N1:0.05,(T3:0.04,T4:0.04)N2:0.05,(T5:0.04,T6:0.04)N3:0.05);";
     auto tree = Tree::from_newick(nwk);
 
-    // Base ancestral sequence of 100 4-fold degenerate codons (GCT=Ala, GTT=Val, CCT=Pro, GGT=Gly)
-    std::vector<std::string> base_codons(100);
-    for (size_t s = 0; s < 100; ++s) {
+    // Base ancestral sequence of 300 4-fold degenerate codons (GCT=Ala, GTT=Val, CCT=Pro, GGT=Gly)
+    std::vector<std::string> base_codons(300);
+    for (size_t s = 0; s < 300; ++s) {
         if (s % 4 == 0) base_codons[s] = "GCT";
         else if (s % 4 == 1) base_codons[s] = "GTT";
         else if (s % 4 == 2) base_codons[s] = "CCT";
@@ -230,7 +230,7 @@ TEST_CASE("BUSTED-E: Saturation Error Sink (Option A) Quarantines Misalignment A
 
     auto make_seq = [&](int variant) {
         std::string seq;
-        for (size_t s = 0; s < 100; ++s) {
+        for (size_t s = 0; s < 300; ++s) {
             std::string c = base_codons[s];
             // Add realistic synonymous third-position variation across clades so omega < 1
             if (variant == 1 && (s % 5 == 0)) c[2] = 'C'; // T1, T2 share synonymous T->C

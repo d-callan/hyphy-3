@@ -84,7 +84,8 @@ public:
         VecType& out_L,
         double& out_child_scale_sum,
         const std::vector<std::array<MatType, 3>>* P_bridges = nullptr,
-        double* out_node_boost = nullptr
+        double* out_node_boost = nullptr,
+        int* out_node_boost_count = nullptr
     ) const {
         const double SCALER_THRESH = 1e-150;
         const double SCALER_UP = 1e150;
@@ -110,9 +111,14 @@ public:
                     return (*P_bridges)[static_cast<size_t>(b_idx)][r];
                 }
                 int32_t bid = wb.bridge_node_id;
-                if (bid >= 0 && bid != nid && static_cast<size_t>(bid) < P_branches.size() &&
+                if (r == 0 && bid >= 0 && bid != nid && static_cast<size_t>(bid) < P_branches.size() &&
                     P_branches[bid].rows() == M_A.size()) {
                     return P_branches[bid];
+                }
+                int32_t cid = wb.children[r % 3];
+                if (cid >= 0 && static_cast<size_t>(cid) < P_branches.size() &&
+                    P_branches[cid].rows() == M_A.size()) {
+                    return P_branches[cid];
                 }
                 return P_branches[id_A];
             };
@@ -159,6 +165,9 @@ public:
         out_child_scale_sum -= boost_count * LOG_SCALER;
         if (out_node_boost != nullptr) {
             *out_node_boost = boost_mult;
+        }
+        if (out_node_boost_count != nullptr) {
+            *out_node_boost_count = boost_count;
         }
     }
 
@@ -241,17 +250,17 @@ public:
         }
     }
 
-    static Tree from_newick_file(const std::string& filepath) {
+    static Tree from_newick_file(const std::string& filepath, bool keep_rooted = true) {
         std::ifstream file(filepath);
         if (!file.is_open()) {
             throw std::runtime_error("Could not open Newick file: " + filepath);
         }
         std::stringstream buffer;
         buffer << file.rdbuf();
-        return from_newick(buffer.str());
+        return from_newick(buffer.str(), keep_rooted);
     }
 
-    static Tree from_newick(std::string_view newick_sv) {
+    static Tree from_newick(std::string_view newick_sv, bool keep_rooted = true) {
         Tree tree;
         std::string newick(newick_sv);
 
@@ -397,6 +406,10 @@ public:
             }
         }
 
+        if (!keep_rooted) {
+            tree.unroot_if_bifurcating();
+        }
+
         // Build leaf map and compute post-order traversal
         tree.leaf_name_to_id.clear();
         for (const auto& node : tree.nodes) {
@@ -407,6 +420,111 @@ public:
 
         tree.compute_post_order();
         return tree;
+    }
+
+    /**
+     * @brief Collapse a degree-2 bifurcating root into an unrooted (trifurcating+) root,
+     *        matching HyPhy's _TreeTopology behavior under reversible models.
+     */
+    void unroot_if_bifurcating() {
+        if (root_id == INVALID_INDEX || nodes.size() <= 3) return;
+        if (nodes[root_id].children.size() != 2) return;
+
+        int32_t c0 = nodes[root_id].children[0];
+        int32_t c1 = nodes[root_id].children[1];
+
+        // Choose an internal child to absorb into the root; if both are internal,
+        // prefer the one without an explicit branch model tag so tagged clades stay intact.
+        int32_t absorb_id = INVALID_INDEX;
+        int32_t other_id = INVALID_INDEX;
+        if (!nodes[c0].is_leaf && !nodes[c1].is_leaf) {
+            if (nodes[c1].model_tag.empty() && !nodes[c0].model_tag.empty()) {
+                absorb_id = c1;
+                other_id = c0;
+            } else {
+                absorb_id = c0;
+                other_id = c1;
+            }
+        } else if (!nodes[c0].is_leaf) {
+            absorb_id = c0;
+            other_id = c1;
+        } else if (!nodes[c1].is_leaf) {
+            absorb_id = c1;
+            other_id = c0;
+        } else {
+            return;
+        }
+
+        // Merge branch lengths across the former root split into other_id
+        nodes[other_id].branch_length += nodes[absorb_id].branch_length;
+        if (nodes[other_id].model_tag.empty() && !nodes[absorb_id].model_tag.empty()) {
+            nodes[other_id].model_tag = nodes[absorb_id].model_tag;
+        }
+
+        // Replace absorb_id in root's children with absorb_id's children
+        std::vector<int32_t> new_root_children;
+        new_root_children.reserve(nodes[absorb_id].children.size() + 1);
+        if (absorb_id == c0) {
+            for (int32_t gc : nodes[absorb_id].children) {
+                new_root_children.push_back(gc);
+            }
+            new_root_children.push_back(other_id);
+        } else {
+            new_root_children.push_back(other_id);
+            for (int32_t gc : nodes[absorb_id].children) {
+                new_root_children.push_back(gc);
+            }
+        }
+        nodes[root_id].children = std::move(new_root_children);
+
+        // Compact nodes array by removing absorb_id and remapping all node IDs
+        int32_t old_n = static_cast<int32_t>(nodes.size());
+        std::vector<int32_t> old_to_new(old_n, INVALID_INDEX);
+        std::vector<TreeNode> new_nodes;
+        new_nodes.reserve(old_n - 1);
+        for (int32_t i = 0; i < old_n; ++i) {
+            if (i == absorb_id) continue;
+            int32_t new_id = static_cast<int32_t>(new_nodes.size());
+            old_to_new[i] = new_id;
+            TreeNode nd = std::move(nodes[i]);
+            nd.id = new_id;
+            new_nodes.push_back(std::move(nd));
+        }
+
+        root_id = old_to_new[root_id];
+        for (auto& nd : new_nodes) {
+            if (nd.id == root_id) {
+                nd.parent_id = INVALID_INDEX;
+                nd.branch_length = 0.0;
+            }
+            for (auto& cid : nd.children) {
+                cid = old_to_new[cid];
+                if (cid != INVALID_INDEX) {
+                    new_nodes[cid].parent_id = nd.id;
+                }
+            }
+        }
+        nodes = std::move(new_nodes);
+
+        // Update any Wheatstone bridge indices if present
+        for (auto& wb : bridges) {
+            if (wb.hub_node_id >= 0 && wb.hub_node_id < old_n) wb.hub_node_id = old_to_new[wb.hub_node_id];
+            if (wb.bridge_node_id >= 0 && wb.bridge_node_id < old_n) wb.bridge_node_id = old_to_new[wb.bridge_node_id];
+            for (int r = 0; r < 3; ++r) {
+                if (wb.children[r] >= 0 && wb.children[r] < old_n) wb.children[r] = old_to_new[wb.children[r]];
+            }
+        }
+        if (!bridges.empty()) {
+            rebuild_bridge_index();
+        }
+
+        leaf_name_to_id.clear();
+        for (const auto& nd : nodes) {
+            if (nd.is_leaf) {
+                leaf_name_to_id[nd.name] = nd.id;
+            }
+        }
+        compute_post_order();
     }
 
     size_t num_leaves() const {

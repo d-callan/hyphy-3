@@ -107,11 +107,15 @@ nlohmann::json BUSTEDAnalyzer::to_legacy_json(const BUSTEDResult& res) const {
             };
         }
 
+        nlohmann::json mg94_rates = {
+            {"non-synonymous/synonymous rate ratio for *test*", {{mg94_omega, 1.0}}}
+        };
+        if (mg94_background_omega >= 0.0) {
+            mg94_rates["non-synonymous/synonymous rate ratio for *background*"] = {{mg94_background_omega, 1.0}};
+        }
         fits["MG94xREV with separate rates for branch sets"] = {
             {"Log Likelihood", mg94_log_l},
-            {"Rate Distributions", {
-                {"non-synonymous/synonymous rate ratio for *test*", {{mg94_omega, 1.0}}}
-            }}
+            {"Rate Distributions", mg94_rates}
         };
 
         auto format_distro = [&](const BUSTEDRateDistribution& d) {
@@ -255,6 +259,14 @@ nlohmann::json BUSTEDAnalyzer::to_legacy_json(const BUSTEDResult& res) const {
                 if (!res.constrained.branch_lengths.empty() && node.id >= 0 && static_cast<size_t>(node.id) < res.constrained.branch_lengths.size()) {
                     b_entry["constrained"] = res.constrained.branch_lengths[node.id];
                 }
+                auto it_post = res.branch_posterior_probabilities.find(node.name);
+                if (it_post != res.branch_posterior_probabilities.end()) {
+                    b_entry["Posterior probability of positive selection"] = {it_post->second};
+                }
+                auto it_ebf = res.branch_empirical_bayes_factors.find(node.name);
+                if (it_ebf != res.branch_empirical_bayes_factors.end()) {
+                    b_entry["Empirical Bayes Factor for positive selection"] = {it_ebf->second};
+                }
                 branch_attr[node.name] = b_entry;
                 int part = (static_cast<size_t>(node.id) < branch_partition.size()) ? branch_partition[node.id] : (is_test_branch[node.id] ? 0 : 1);
                 tested_map[node.name] = (part == 0) ? "test" : ((part == 1) ? "background" : "unclassified");
@@ -264,9 +276,23 @@ nlohmann::json BUSTEDAnalyzer::to_legacy_json(const BUSTEDResult& res) const {
         j["tested"] = {{"0", tested_map}};
 
         j["Evidence Ratios"] = {
-            {"constrained", {res.evidence_ratios}},
+            {"constrained", {res.constrained_evidence_ratios.empty() ? res.evidence_ratios : res.constrained_evidence_ratios}},
             {"optimized null", {res.evidence_ratios}}
         };
+        if (!res.branch_er_2h.empty()) {
+            nlohmann::json er_2h = nlohmann::json::object();
+            for (const auto& [bname, vec] : res.branch_er_2h) {
+                er_2h[bname] = vec;
+            }
+            j["Evidence Ratios"]["2H"] = er_2h;
+        }
+        if (!res.branch_er_3h.empty()) {
+            nlohmann::json er_3h = nlohmann::json::object();
+            for (const auto& [bname, vec] : res.branch_er_3h) {
+                er_3h[bname] = vec;
+            }
+            j["Evidence Ratios"]["3H"] = er_3h;
+        }
         if (res.settings.error_sink) {
             j["Evidence Ratios"]["error_sink_max_bf"] = {res.site_error_bfs};
         }
@@ -653,9 +679,10 @@ nlohmann::json BUSTEDAnalyzer::to_modern_json(const BUSTEDResult& res, const Pro
         // Site results (columnar; ColumnarResults enforces equal-length)
         ColumnarResults table;
         std::vector<int> col_site;
-        std::vector<double> col_er, col_unc_ll, col_con_ll, col_err_bf;
+        std::vector<double> col_er, col_con_er, col_unc_ll, col_con_ll, col_err_bf;
         col_site.reserve(aln.num_codons);
         col_er.reserve(aln.num_codons);
+        col_con_er.reserve(aln.num_codons);
         col_unc_ll.reserve(aln.num_codons);
         col_con_ll.reserve(aln.num_codons);
         if (res.settings.error_sink) col_err_bf.reserve(aln.num_codons);
@@ -663,13 +690,13 @@ nlohmann::json BUSTEDAnalyzer::to_modern_json(const BUSTEDResult& res, const Pro
         for (size_t s = 0; s < aln.num_codons; ++s) {
             col_site.push_back(static_cast<int>(s + 1));
             col_er.push_back(res.evidence_ratios[s]);
+            col_con_er.push_back(s < res.constrained_evidence_ratios.size()
+                ? res.constrained_evidence_ratios[s]
+                : res.evidence_ratios[s]);
             const size_t p = aln.site_to_pattern[s];
             col_unc_ll.push_back(res.unconstrained.site_log_likelihoods[p]);
             col_con_ll.push_back(res.constrained.site_log_likelihoods[p]);
             if (res.settings.error_sink) {
-                // Out-of-range is impossible when error_sink ran (site_error_bfs
-                // is sized to num_sites), but emit null rather than crash if a
-                // caller hands in a shorter vector.
                 col_err_bf.push_back(s < res.site_error_bfs.size()
                     ? res.site_error_bfs[s]
                     : std::numeric_limits<double>::quiet_NaN());
@@ -677,13 +704,32 @@ nlohmann::json BUSTEDAnalyzer::to_modern_json(const BUSTEDResult& res, const Pro
         }
 
         table.add_column("site", {"integer", "Alignment codon site index (1-based)", "1-based codon position"}, col_site);
-        table.add_column("evidence_ratio", {"number", "Per-site Evidence Ratio (Bayes Factor) favoring positive selection (omega > 1)"}, col_er);
+        table.add_column("evidence_ratio", {"number", "Per-site Evidence Ratio favoring positive selection against optimized null model"}, col_er);
+        table.add_column("constrained_evidence_ratio", {"number", "Per-site Evidence Ratio favoring positive selection against constrained (omega_K=1) alternative model"}, col_con_er);
         table.add_column("unconstrained_log_l", {"number", "Site log-likelihood under unconstrained model"}, col_unc_ll);
         table.add_column("constrained_log_l", {"number", "Site log-likelihood under constrained null model"}, col_con_ll);
         if (res.settings.error_sink) {
             table.add_column("error_sink_max_bf", {"number", "Maximum branch-site Empirical Bayes Factor for the saturation error sink across branches at this site"}, col_err_bf);
         }
         j["site_results"] = table.to_json();
+
+        if (!res.branch_posterior_probabilities.empty()) {
+            nlohmann::json b_post = nlohmann::json::object();
+            for (const auto& [bname, vec] : res.branch_posterior_probabilities) {
+                b_post[bname]["posterior_probability"] = vec;
+                auto it_ebf = res.branch_empirical_bayes_factors.find(bname);
+                if (it_ebf != res.branch_empirical_bayes_factors.end()) {
+                    b_post[bname]["empirical_bayes_factor"] = it_ebf->second;
+                }
+            }
+            j["branch_site_posteriors"] = std::move(b_post);
+        }
+        if (!res.branch_er_2h.empty() || !res.branch_er_3h.empty()) {
+            nlohmann::json mh_er = nlohmann::json::object();
+            if (!res.branch_er_2h.empty()) mh_er["2H"] = res.branch_er_2h;
+            if (!res.branch_er_3h.empty()) mh_er["3H"] = res.branch_er_3h;
+            j["multiple_hit_branch_evidence_ratios"] = std::move(mh_er);
+        }
 
         return j;
     }

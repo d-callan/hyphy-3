@@ -137,12 +137,13 @@ std::string FUBARAnalyzer::to_modern_json(
         // Site results (columnar; ColumnarResults enforces equal-length)
         ColumnarResults table;
         std::vector<int> col_site;
-        std::vector<double> col_alpha, col_beta, col_bma, col_pneg, col_ppos, col_bf;
+        std::vector<double> col_alpha, col_beta, col_bma, col_pneg, col_ppos, col_bf, col_psrf, col_neff;
         std::vector<std::string> col_class;
         const size_t n = res.site_results.size();
         col_site.reserve(n); col_alpha.reserve(n); col_beta.reserve(n);
         col_bma.reserve(n); col_pneg.reserve(n); col_ppos.reserve(n);
-        col_bf.reserve(n); col_class.reserve(n);
+        col_bf.reserve(n); col_psrf.reserve(n); col_neff.reserve(n);
+        col_class.reserve(n);
         for (const auto& sr : res.site_results) {
             col_site.push_back(static_cast<int>(sr.site));
             col_alpha.push_back(sr.alpha);
@@ -151,6 +152,8 @@ std::string FUBARAnalyzer::to_modern_json(
             col_pneg.push_back(sr.prob_neg);
             col_ppos.push_back(sr.prob_pos);
             col_bf.push_back(sr.bayes_factor);
+            col_psrf.push_back(sr.psrf);
+            col_neff.push_back(sr.neff);
             col_class.push_back(sr.classification);
         }
         table.add_column("site", {"integer", "1-based codon site index"}, col_site);
@@ -160,6 +163,8 @@ std::string FUBARAnalyzer::to_modern_json(
         table.add_column("prob_neg", {"number", "Posterior probability of negative selection P(alpha > beta | Data)"}, col_pneg);
         table.add_column("prob_pos", {"number", "Posterior probability of positive selection P(beta > alpha | Data)"}, col_ppos);
         table.add_column("bayes_factor", {"number", "Empirical Bayes Factor for positive selection"}, col_bf);
+        table.add_column("psrf", {"number", "Potential Scale Reduction Factor (Gelman-Rubin R-hat)"}, col_psrf);
+        table.add_column("neff", {"number", "Effective sample size (N_eff)"}, col_neff);
         table.add_column("classification", {"string", "Selection classification: diversifying, purifying, or neutral"}, col_class);
         j["site_results"] = table.to_json();
 
@@ -237,7 +242,9 @@ std::string FUBARAnalyzer::to_legacy_json(const FUBARResult& res, const std::str
                 nlohmann::json::array({"beta-alpha", "Mean posterior beta-alpha"}),
                 nlohmann::json::array({"Prob[alpha>beta]", "Posterior probability of negative selection at a site"}),
                 nlohmann::json::array({"Prob[alpha<beta]", "Posterior probability of positive selection at a site"}),
-                nlohmann::json::array({"BayesFactor[alpha<beta]", "Empirical Bayes Factor for positive selection at a site"})
+                nlohmann::json::array({"BayesFactor[alpha<beta]", "Empirical Bayes Factor for positive selection at a site"}),
+                nlohmann::json::array({"PSRF", "Potential scale reduction factor - an MCMC mixing measure"}),
+                nlohmann::json::array({"Neff", "Estimated effective sample size for Prob[alpha<beta]"})
             })},
             {"content", {
                 {"0", nlohmann::json::array()}
@@ -252,8 +259,8 @@ std::string FUBARAnalyzer::to_legacy_json(const FUBARResult& res, const std::str
                 sr.prob_neg,
                 sr.prob_pos,
                 sr.bayes_factor,
-                0.0,
-                0.0
+                sr.psrf,
+                sr.neff
             });
         }
 

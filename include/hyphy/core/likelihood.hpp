@@ -17,14 +17,75 @@ namespace hyphy::core {
 
 class LikelihoodEngine {
 public:
+    static inline int& user_requested_threads_storage() {
+        static int val = 0;
+        return val;
+    }
+
+    static void set_user_requested_threads(int n) {
+        user_requested_threads_storage() = n;
+    }
+
+    static int get_user_requested_threads() {
+        return user_requested_threads_storage();
+    }
+
+    // Neumaier compensated summation for deterministic, high-precision reduction across site patterns
+    static Scalar neumaier_sum(const std::vector<Scalar>& terms) {
+        Scalar sum = 0.0;
+        Scalar c = 0.0;
+        for (Scalar x : terms) {
+            Scalar t = sum + x;
+            if (std::abs(sum) >= std::abs(x)) {
+                c += (sum - t) + x;
+            } else {
+                c += (x - t) + sum;
+            }
+            sum = t;
+        }
+        return sum + c;
+    }
+
+    template <typename VecType>
+    static inline void init_leaf_likelihood(
+        const SitePattern& pattern,
+        size_t t_idx,
+        int S,
+        VecType& out_L
+    ) {
+        if (t_idx == static_cast<size_t>(-1)) {
+            out_L.setOnes();
+            return;
+        }
+        int8_t state = pattern.states[t_idx];
+        if (state >= 0 && state < S) {
+            out_L.setZero();
+            out_L(state) = 1.0;
+        } else if (t_idx < pattern.ambiguous_masks.size() && pattern.ambiguous_masks[t_idx] != 0) {
+            uint64_t mask = pattern.ambiguous_masks[t_idx];
+            uint64_t all_sense = (S >= 64) ? ~uint64_t(0) : ((uint64_t(1) << S) - 1);
+            if ((mask & all_sense) == all_sense) {
+                out_L.setOnes();
+            } else {
+                out_L.setZero();
+                for (int s = 0; s < S; ++s) {
+                    if (mask & (uint64_t(1) << s)) {
+                        out_L(s) = 1.0;
+                    }
+                }
+            }
+        } else {
+            out_L.setOnes();
+        }
+    }
+
     // Workload-aware OpenMP thread cap to prevent thread oversubscription and allocator/barrier contention
     // on small alignments (e.g. 135 patterns on 48- or 64-core servers).
     static int optimal_omp_threads(size_t num_items, size_t min_items_per_thread = 16, int default_cap = 8) {
 #ifdef _OPENMP
         int max_t = omp_get_max_threads();
-        int cap = std::min(max_t, std::max(default_cap, 1));
-        // If user explicitly set OMP_NUM_THREADS or --threads <= max_t, respect smaller values;
-        // also never spawn more threads than floor(num_items / min_items_per_thread).
+        int user_t = get_user_requested_threads();
+        int cap = (user_t > 0) ? std::min(max_t, user_t) : std::min(max_t, std::max(default_cap, 1));
         int work_cap = static_cast<int>(std::max<size_t>(1, (num_items + min_items_per_thread - 1) / min_items_per_thread));
         return std::max(1, std::min({max_t, cap, work_cap}));
 #else
@@ -81,11 +142,27 @@ public:
         size_t num_patterns = aln.patterns.size();
 
         // Precompute transition matrices for all branches
-        std::vector<Matrix4> P_branches(num_nodes);
+        std::vector<Matrix4> P_branches(num_nodes, Matrix4::Identity());
         for (const auto& node : tree.nodes) {
             if (node.id != tree.root_id) {
                 P_branches[node.id] = gtr_model.transition_matrix(node.branch_length);
             }
+        }
+
+        std::vector<std::array<Matrix4, 3>> P_bridges;
+        const std::vector<std::array<Matrix4, 3>>* p_bridges_ptr = nullptr;
+        if (!tree.bridges.empty()) {
+            P_bridges.resize(tree.bridges.size());
+            for (size_t k = 0; k < tree.bridges.size(); ++k) {
+                for (int r = 0; r < 3; ++r) {
+                    if (tree.bridges[k].weights[r] > 0.0 || r == 0) {
+                        P_bridges[k][r] = gtr_model.transition_matrix(tree.bridges[k].branch_lengths[r]);
+                    } else {
+                        P_bridges[k][r] = Matrix4::Identity();
+                    }
+                }
+            }
+            p_bridges_ptr = &P_bridges;
         }
 
         std::vector<size_t> local_map;
@@ -109,21 +186,11 @@ public:
 
                     if (node.is_leaf) {
                         size_t t_idx = leaf_to_taxon[node_id];
-                        if (t_idx != static_cast<size_t>(-1)) {
-                            int8_t state = pattern.states[t_idx];
-                            if (state >= 0 && state < 4) {
-                                node_L[node_id].setZero();
-                                node_L[node_id](state) = 1.0;
-                            } else {
-                                node_L[node_id].setOnes();
-                            }
-                        } else {
-                            node_L[node_id].setOnes();
-                        }
+                        init_leaf_likelihood(pattern, t_idx, 4, node_L[node_id]);
                         node_log_scale[node_id] = 0.0;
                     } else {
                         double child_scale_sum = 0.0;
-                        tree.eval_internal_node(node_id, P_branches, node_L, node_log_scale, node_L[node_id], child_scale_sum);
+                        tree.eval_internal_node(node_id, P_branches, node_L, node_log_scale, node_L[node_id], child_scale_sum, p_bridges_ptr);
                         node_log_scale[node_id] = child_scale_sum;
                     }
                 }
@@ -137,11 +204,7 @@ public:
             }
         }
 
-        Scalar total_log_l = 0.0;
-        for (size_t p = 0; p < num_patterns; ++p) {
-            total_log_l += pattern_ll[p];
-        }
-        return total_log_l;
+        return neumaier_sum(pattern_ll);
     }
 
     // Codon MG94 Tree Likelihood
@@ -156,28 +219,459 @@ public:
         int S = mg94_model.pi.size();
 
         // Precompute transition matrices for all branches
-        std::vector<Matrix> P_branches(num_nodes);
+        std::vector<Matrix> P_branches(num_nodes, Matrix::Identity(S, S));
         for (const auto& node : tree.nodes) {
             if (node.id != tree.root_id) {
                 P_branches[node.id] = mg94_model.transition_matrix(node.branch_length * branch_scale);
             }
         }
 
-        return compute_tree_log_likelihood_from_P(tree, aln, P_branches, mg94_model.pi, S, custom_leaf_to_taxon);
+        std::vector<std::array<Matrix, 3>> P_bridges;
+        const std::vector<std::array<Matrix, 3>>* p_bridges_ptr = nullptr;
+        if (!tree.bridges.empty()) {
+            P_bridges.resize(tree.bridges.size());
+            for (size_t k = 0; k < tree.bridges.size(); ++k) {
+                for (int r = 0; r < 3; ++r) {
+                    if (tree.bridges[k].weights[r] > 0.0 || r == 0) {
+                        P_bridges[k][r] = mg94_model.transition_matrix(tree.bridges[k].branch_lengths[r] * branch_scale);
+                    } else {
+                        P_bridges[k][r] = Matrix::Identity(S, S);
+                    }
+                }
+            }
+            p_bridges_ptr = &P_bridges;
+        }
+
+        return compute_tree_log_likelihood_from_P(tree, aln, P_branches, mg94_model.pi, S, custom_leaf_to_taxon, p_bridges_ptr);
+    }
+
+    // Reusable thread-local workspace for batched 61 x B_tile Inside-only (Felsenstein pruning) GEMM traversals
+    struct BatchedInsideWorkspace {
+        std::vector<Matrix> D;              // [num_nodes] each S x B_cap
+        Matrix M_tmp;                       // S x B_cap scratch for P_branches[cid] * D[cid]
+        Eigen::MatrixXd node_log_scale;     // num_nodes x B_cap
+        Vector root_L;                      // B_cap
+        Vector root_log_L;                  // B_cap
+
+        void init(size_t num_nodes, int S, size_t B_cap) {
+            if (D.size() != num_nodes || (num_nodes > 0 && (D[0].rows() != S || static_cast<size_t>(D[0].cols()) < B_cap))) {
+                D.assign(num_nodes, Matrix::Zero(S, B_cap));
+                M_tmp.resize(S, B_cap);
+                node_log_scale.resize(num_nodes, B_cap);
+                root_L.resize(B_cap);
+                root_log_L.resize(B_cap);
+            }
+        }
+    };
+
+    // Reusable thread-local workspace for batched 61 x B_tile Inside-Outside GEMM traversals
+    struct BatchedInsideOutsideWorkspace {
+        std::vector<Matrix> D;              // [num_nodes] each S x B_cap
+        std::vector<Matrix> V;              // [num_nodes] each S x B_cap
+        std::vector<Matrix> P_D;            // [num_nodes] each S x B_cap
+        std::vector<Matrix> U;              // [num_nodes] each S x B_cap
+        Eigen::MatrixXi boost_counts;       // num_nodes x B_cap
+        Eigen::MatrixXd node_log_scale;     // num_nodes x B_cap
+        std::vector<Matrix> pref;           // [max_children] each S x B_cap
+        std::vector<Matrix> suff;           // [max_children] each S x B_cap
+        Eigen::MatrixXi pref_boost;         // max_children x B_cap
+        Eigen::MatrixXi suff_boost;         // max_children x B_cap
+        Vector likelihood;                  // B_cap
+        Vector log_likelihood;              // B_cap
+
+        void init(size_t num_nodes, int S, size_t B_cap) {
+            if (D.size() != num_nodes || (num_nodes > 0 && (D[0].rows() != S || static_cast<size_t>(D[0].cols()) < B_cap))) {
+                D.assign(num_nodes, Matrix::Zero(S, B_cap));
+                V.assign(num_nodes, Matrix::Zero(S, B_cap));
+                P_D.assign(num_nodes, Matrix::Zero(S, B_cap));
+                U.assign(num_nodes, Matrix::Zero(S, B_cap));
+                boost_counts.resize(num_nodes, B_cap);
+                node_log_scale.resize(num_nodes, B_cap);
+                likelihood.resize(B_cap);
+                log_likelihood.resize(B_cap);
+            }
+        }
+    };
+
+    // Batched Inside-only (Felsenstein pruning) pass over pattern range [p_start, p_end) using S x B GEMM
+    static void compute_inside_batch_in_place(
+        const Tree& tree,
+        const Alignment& aln,
+        size_t p_start,
+        size_t p_end,
+        const std::vector<size_t>& leaf_to_taxon,
+        const std::vector<Matrix>& P_branches,
+        const Vector& pi,
+        int S,
+        BatchedInsideWorkspace& ws,
+        const std::vector<std::array<Matrix, 3>>* P_bridges = nullptr
+    ) {
+        const double SCALER_THRESH = 1e-150;
+        const double SCALER_UP = 1e150;
+        const double LOG_SCALER = 345.38776394910684;
+
+        const Eigen::Index B = static_cast<Eigen::Index>(p_end - p_start);
+        if (B <= 0) return;
+        size_t num_nodes = tree.num_nodes();
+        ws.init(num_nodes, S, static_cast<size_t>(B));
+
+        for (int32_t nid : tree.post_order) {
+            const auto& node = tree.nodes[nid];
+            auto D_nid = ws.D[nid].leftCols(B);
+
+            if (node.is_leaf) {
+                size_t t_idx = leaf_to_taxon[nid];
+                for (Eigen::Index b = 0; b < B; ++b) {
+                    auto col = D_nid.col(b);
+                    init_leaf_likelihood(aln.patterns[p_start + b], t_idx, S, col);
+                    ws.node_log_scale(nid, b) = 0.0;
+                }
+            } else {
+                int32_t b_idx = tree.bridge_index(nid);
+                if (b_idx >= 0) {
+                    const auto& wb = tree.bridges[static_cast<size_t>(b_idx)];
+                    int32_t id_A = wb.children[0];
+                    int32_t id_B = wb.children[1];
+                    int32_t id_C = wb.children[2];
+
+                    Matrix M_A(S, B), M_B(S, B), M_C(S, B);
+                    M_A.noalias() = P_branches[id_A] * ws.D[id_A].leftCols(B);
+                    M_B.noalias() = P_branches[id_B] * ws.D[id_B].leftCols(B);
+                    M_C.noalias() = P_branches[id_C] * ws.D[id_C].leftCols(B);
+                    ws.node_log_scale.row(nid).head(B) =
+                        ws.node_log_scale.row(id_A).head(B) +
+                        ws.node_log_scale.row(id_B).head(B) +
+                        ws.node_log_scale.row(id_C).head(B);
+
+                    auto get_P_br = [&](int r) -> const Matrix& {
+                        if (P_bridges != nullptr) {
+                            return (*P_bridges)[static_cast<size_t>(b_idx)][r];
+                        }
+                        int32_t bid = wb.bridge_node_id;
+                        if (r == 0 && bid >= 0 && bid != nid && static_cast<size_t>(bid) < P_branches.size() &&
+                            P_branches[bid].rows() == S) {
+                            return P_branches[bid];
+                        }
+                        int32_t cid = wb.children[r % 3];
+                        if (cid >= 0 && static_cast<size_t>(cid) < P_branches.size() &&
+                            P_branches[cid].rows() == S) {
+                            return P_branches[cid];
+                        }
+                        return P_branches[id_A];
+                    };
+
+                    D_nid.setZero();
+                    Matrix Y_tmp(S, B), PB_Y(S, B);
+                    if (wb.weights[0] > 0.0) {
+                        Y_tmp.array() = M_A.array() * M_B.array();
+                        PB_Y.noalias() = get_P_br(0) * Y_tmp;
+                        D_nid.array() += wb.weights[0] * (PB_Y.array() * M_C.array());
+                    }
+                    if (wb.weights[1] > 0.0) {
+                        Y_tmp.array() = M_A.array() * M_C.array();
+                        PB_Y.noalias() = get_P_br(1) * Y_tmp;
+                        D_nid.array() += wb.weights[1] * (PB_Y.array() * M_B.array());
+                    }
+                    if (wb.weights[2] > 0.0) {
+                        Y_tmp.array() = M_B.array() * M_C.array();
+                        PB_Y.noalias() = get_P_br(2) * Y_tmp;
+                        D_nid.array() += wb.weights[2] * (PB_Y.array() * M_A.array());
+                    }
+                    for (Eigen::Index b = 0; b < B; ++b) {
+                        double max_val = D_nid.col(b).maxCoeff();
+                        int boost_count = 0;
+                        while (max_val < SCALER_THRESH && max_val > 0.0) {
+                            D_nid.col(b) *= SCALER_UP;
+                            max_val *= SCALER_UP;
+                            boost_count++;
+                        }
+                        ws.node_log_scale(nid, b) -= boost_count * LOG_SCALER;
+                    }
+                } else {
+                    D_nid.setOnes();
+                    ws.node_log_scale.row(nid).head(B).setZero();
+                    auto M_sub = ws.M_tmp.leftCols(B);
+
+                    for (int32_t cid : node.children) {
+                        // Single BLAS GEMM: (S x S) * (S x B) -> (S x B)
+                        M_sub.noalias() = P_branches[cid] * ws.D[cid].leftCols(B);
+                        D_nid.array() *= M_sub.array();
+                        ws.node_log_scale.row(nid).head(B) += ws.node_log_scale.row(cid).head(B);
+
+                        for (Eigen::Index b = 0; b < B; ++b) {
+                            double cur_max = D_nid.col(b).maxCoeff();
+                            int boost_count = 0;
+                            while (cur_max < SCALER_THRESH && cur_max > 0.0) {
+                                D_nid.col(b) *= SCALER_UP;
+                                cur_max *= SCALER_UP;
+                                boost_count++;
+                            }
+                            if (boost_count > 0) {
+                                ws.node_log_scale(nid, b) -= boost_count * LOG_SCALER;
+                            }
+                        }
+                    }
+
+                    for (Eigen::Index b = 0; b < B; ++b) {
+                        double max_val = D_nid.col(b).maxCoeff();
+                        int boost_count = 0;
+                        while (max_val < SCALER_THRESH && max_val > 0.0) {
+                            D_nid.col(b) *= SCALER_UP;
+                            max_val *= SCALER_UP;
+                            boost_count++;
+                        }
+                        if (boost_count > 0) {
+                            ws.node_log_scale(nid, b) -= boost_count * LOG_SCALER;
+                        }
+                    }
+                }
+            }
+        }
+
+        ws.root_L.head(B).noalias() = ws.D[tree.root_id].leftCols(B).transpose() * pi;
+        for (Eigen::Index b = 0; b < B; ++b) {
+            Scalar L_b = ws.root_L(b);
+            if (L_b > 0.0) {
+                ws.root_log_L(b) = std::log(L_b) + ws.node_log_scale(tree.root_id, b);
+            } else {
+                ws.root_log_L(b) = -1e20;
+            }
+        }
+    }
+
+    // Batched Inside-Outside two-pass traversal over pattern range [p_start, p_end) using S x B GEMM
+    static void compute_inside_outside_batch_in_place(
+        const Tree& tree,
+        const Alignment& aln,
+        size_t p_start,
+        size_t p_end,
+        const std::vector<size_t>& leaf_to_taxon,
+        const std::vector<Matrix>& P_branches,
+        const Vector& pi,
+        int S,
+        BatchedInsideOutsideWorkspace& ws,
+        const std::vector<std::array<Matrix, 3>>* P_bridges = nullptr
+    ) {
+        const double SCALER_THRESH = 1e-150;
+        const double SCALER_UP = 1e150;
+        const double SCALER_DOWN = 1e-150;
+        const double LOG_SCALER = 345.38776394910684;
+
+        const Eigen::Index B = static_cast<Eigen::Index>(p_end - p_start);
+        if (B <= 0) return;
+        size_t num_nodes = tree.num_nodes();
+        ws.init(num_nodes, S, static_cast<size_t>(B));
+
+        // 1. Post-order (bottom-up) pass: compute D[nid] (S x B) and cache P_D[cid] = P_branches[cid] * D[cid] via GEMM
+        for (int32_t nid : tree.post_order) {
+            const auto& node = tree.nodes[nid];
+            auto D_nid = ws.D[nid].leftCols(B);
+
+            if (node.is_leaf) {
+                size_t t_idx = leaf_to_taxon[nid];
+                for (Eigen::Index b = 0; b < B; ++b) {
+                    auto col = D_nid.col(b);
+                    init_leaf_likelihood(aln.patterns[p_start + b], t_idx, S, col);
+                    ws.node_log_scale(nid, b) = 0.0;
+                    ws.boost_counts(nid, b) = 0;
+                }
+            } else {
+                for (int32_t cid : node.children) {
+                    // Single BLAS GEMM: (S x S) * (S x B) -> (S x B)
+                    ws.P_D[cid].leftCols(B).noalias() = P_branches[cid] * ws.D[cid].leftCols(B);
+                }
+
+                int32_t b_idx = tree.bridge_index(nid);
+                if (b_idx >= 0) {
+                    const auto& wb = tree.bridges[static_cast<size_t>(b_idx)];
+                    int32_t id_A = wb.children[0];
+                    int32_t id_B = wb.children[1];
+                    int32_t id_C = wb.children[2];
+
+                    auto M_A = ws.P_D[id_A].leftCols(B);
+                    auto M_B = ws.P_D[id_B].leftCols(B);
+                    auto M_C = ws.P_D[id_C].leftCols(B);
+                    ws.node_log_scale.row(nid).head(B) =
+                        ws.node_log_scale.row(id_A).head(B) +
+                        ws.node_log_scale.row(id_B).head(B) +
+                        ws.node_log_scale.row(id_C).head(B);
+
+                    auto get_P_br = [&](int r) -> const Matrix& {
+                        if (P_bridges != nullptr) {
+                            return (*P_bridges)[static_cast<size_t>(b_idx)][r];
+                        }
+                        int32_t bid = wb.bridge_node_id;
+                        if (r == 0 && bid >= 0 && bid != nid && static_cast<size_t>(bid) < P_branches.size() &&
+                            P_branches[bid].rows() == S) {
+                            return P_branches[bid];
+                        }
+                        int32_t cid = wb.children[r % 3];
+                        if (cid >= 0 && static_cast<size_t>(cid) < P_branches.size() &&
+                            P_branches[cid].rows() == S) {
+                            return P_branches[cid];
+                        }
+                        return P_branches[id_A];
+                    };
+
+                    D_nid.setZero();
+                    Matrix Y_tmp(S, B), PB_Y(S, B);
+                    if (wb.weights[0] > 0.0) {
+                        Y_tmp.array() = M_A.array() * M_B.array();
+                        PB_Y.noalias() = get_P_br(0) * Y_tmp;
+                        D_nid.array() += wb.weights[0] * (PB_Y.array() * M_C.array());
+                    }
+                    if (wb.weights[1] > 0.0) {
+                        Y_tmp.array() = M_A.array() * M_C.array();
+                        PB_Y.noalias() = get_P_br(1) * Y_tmp;
+                        D_nid.array() += wb.weights[1] * (PB_Y.array() * M_B.array());
+                    }
+                    if (wb.weights[2] > 0.0) {
+                        Y_tmp.array() = M_B.array() * M_C.array();
+                        PB_Y.noalias() = get_P_br(2) * Y_tmp;
+                        D_nid.array() += wb.weights[2] * (PB_Y.array() * M_A.array());
+                    }
+                    for (Eigen::Index b = 0; b < B; ++b) {
+                        double max_val = D_nid.col(b).maxCoeff();
+                        int boost_count = 0;
+                        while (max_val < SCALER_THRESH && max_val > 0.0) {
+                            D_nid.col(b) *= SCALER_UP;
+                            max_val *= SCALER_UP;
+                            boost_count++;
+                        }
+                        ws.boost_counts(nid, b) = boost_count;
+                        ws.node_log_scale(nid, b) -= boost_count * LOG_SCALER;
+                    }
+                } else {
+                    D_nid.setOnes();
+                    ws.node_log_scale.row(nid).head(B).setZero();
+                    ws.boost_counts.row(nid).head(B).setZero();
+
+                    for (int32_t cid : node.children) {
+                        D_nid.array() *= ws.P_D[cid].leftCols(B).array();
+                        ws.node_log_scale.row(nid).head(B) += ws.node_log_scale.row(cid).head(B);
+
+                        for (Eigen::Index b = 0; b < B; ++b) {
+                            double cur_max = D_nid.col(b).maxCoeff();
+                            while (cur_max < SCALER_THRESH && cur_max > 0.0) {
+                                D_nid.col(b) *= SCALER_UP;
+                                cur_max *= SCALER_UP;
+                                ws.boost_counts(nid, b) += 1;
+                            }
+                        }
+                    }
+
+                    for (Eigen::Index b = 0; b < B; ++b) {
+                        double max_val = D_nid.col(b).maxCoeff();
+                        while (max_val < SCALER_THRESH && max_val > 0.0) {
+                            D_nid.col(b) *= SCALER_UP;
+                            max_val *= SCALER_UP;
+                            ws.boost_counts(nid, b) += 1;
+                        }
+                        ws.node_log_scale(nid, b) -= ws.boost_counts(nid, b) * LOG_SCALER;
+                    }
+                }
+            }
+        }
+
+        ws.likelihood.head(B).noalias() = ws.D[tree.root_id].leftCols(B).transpose() * pi;
+        for (Eigen::Index b = 0; b < B; ++b) {
+            Scalar L_b = ws.likelihood(b);
+            if (L_b > 0.0) {
+                ws.log_likelihood(b) = std::log(L_b) + ws.node_log_scale(tree.root_id, b);
+            } else {
+                ws.log_likelihood(b) = -1e20;
+            }
+        }
+
+        // 2. Pre-order (top-down) pass: compute V[vid] and U[vid] = P_branches[vid]^T * V[vid] via GEMM
+        ws.U[tree.root_id].leftCols(B).colwise() = pi;
+
+        for (auto it = tree.post_order.rbegin(); it != tree.post_order.rend(); ++it) {
+            int32_t uid = *it;
+            const auto& node = tree.nodes[uid];
+            if (node.is_leaf) continue;
+
+            size_t num_children = node.children.size();
+            if (num_children == 0) continue;
+
+            if (ws.pref.size() < num_children || (num_children > 0 && static_cast<size_t>(ws.pref[0].cols()) < static_cast<size_t>(B))) {
+                ws.pref.assign(num_children, Matrix::Ones(S, ws.D[0].cols()));
+                ws.suff.assign(num_children, Matrix::Ones(S, ws.D[0].cols()));
+                ws.pref_boost.resize(num_children, ws.D[0].cols());
+                ws.suff_boost.resize(num_children, ws.D[0].cols());
+            }
+
+            // Prefix products across children (with per-column dynamic rescaling)
+            ws.pref[0].leftCols(B).setOnes();
+            ws.pref_boost.row(0).head(B).setZero();
+            for (size_t i = 1; i < num_children; ++i) {
+                int32_t prev_cid = node.children[i - 1];
+                ws.pref[i].leftCols(B).array() = ws.pref[i - 1].leftCols(B).array() * ws.P_D[prev_cid].leftCols(B).array();
+                for (Eigen::Index b = 0; b < B; ++b) {
+                    int b_cnt = ws.pref_boost(i - 1, b);
+                    double cur_max = ws.pref[i].col(b).maxCoeff();
+                    while (cur_max < SCALER_THRESH && cur_max > 0.0) {
+                        ws.pref[i].col(b) *= SCALER_UP;
+                        cur_max *= SCALER_UP;
+                        b_cnt++;
+                    }
+                    ws.pref_boost(i, b) = b_cnt;
+                }
+            }
+
+            // Suffix products across children (with per-column dynamic rescaling)
+            ws.suff[num_children - 1].leftCols(B).setOnes();
+            ws.suff_boost.row(num_children - 1).head(B).setZero();
+            for (size_t i = num_children - 1; i > 0; --i) {
+                int32_t next_cid = node.children[i];
+                ws.suff[i - 1].leftCols(B).array() = ws.suff[i].leftCols(B).array() * ws.P_D[next_cid].leftCols(B).array();
+                for (Eigen::Index b = 0; b < B; ++b) {
+                    int b_cnt = ws.suff_boost(i, b);
+                    double cur_max = ws.suff[i - 1].col(b).maxCoeff();
+                    while (cur_max < SCALER_THRESH && cur_max > 0.0) {
+                        ws.suff[i - 1].col(b) *= SCALER_UP;
+                        cur_max *= SCALER_UP;
+                        b_cnt++;
+                    }
+                    ws.suff_boost(i - 1, b) = b_cnt;
+                }
+            }
+
+            for (size_t i = 0; i < num_children; ++i) {
+                int32_t vid = node.children[i];
+                auto V_vid = ws.V[vid].leftCols(B);
+                V_vid.array() = ws.U[uid].leftCols(B).array() * ws.pref[i].leftCols(B).array() * ws.suff[i].leftCols(B).array();
+                for (Eigen::Index b = 0; b < B; ++b) {
+                    int net_boost = ws.boost_counts(uid, b) - ws.pref_boost(i, b) - ws.suff_boost(i, b);
+                    while (net_boost > 0) {
+                        V_vid.col(b) *= SCALER_UP;
+                        net_boost--;
+                    }
+                    while (net_boost < 0) {
+                        V_vid.col(b) *= SCALER_DOWN;
+                        net_boost++;
+                    }
+                }
+                // Single BLAS GEMM: (S x S)^T * (S x B) -> (S x B)
+                ws.U[vid].leftCols(B).noalias() = P_branches[vid].transpose() * V_vid;
+            }
+        }
     }
 
     // Fast single-pass codon tree likelihood from precomputed transition matrices P_branches
-    // Eliminates pre-order traversal, intermediate heap allocations, and thread-order non-determinism
+    // Uses batched 61 x B_tile GEMM across site patterns while preserving exact deterministic Neumaier summation
     static Scalar compute_tree_log_likelihood_from_P(
         const Tree& tree,
         const Alignment& aln,
         const std::vector<Matrix>& P_branches,
         const Vector& pi,
         int S,
-        const std::vector<size_t>* custom_leaf_to_taxon = nullptr
+        const std::vector<size_t>* custom_leaf_to_taxon = nullptr,
+        const std::vector<std::array<Matrix, 3>>* P_bridges = nullptr
     ) {
         size_t num_nodes = tree.num_nodes();
         size_t num_patterns = aln.patterns.size();
+        if (num_patterns == 0) return 0.0;
 
         std::vector<size_t> local_map;
         const std::vector<size_t>& leaf_to_taxon = custom_leaf_to_taxon
@@ -185,55 +679,27 @@ public:
             : (local_map = build_leaf_to_taxon_map(tree, aln));
 
         std::vector<Scalar> pattern_ll(num_patterns, 0.0);
-        int n_threads = optimal_omp_threads(num_patterns, 16);
+        int n_threads = optimal_omp_threads(num_patterns, 32);
+        const size_t tile_size = std::max<size_t>(16, std::min<size_t>(256, (num_patterns + n_threads - 1) / n_threads));
+        const size_t num_tiles = (num_patterns + tile_size - 1) / tile_size;
 
         #pragma omp parallel num_threads(n_threads)
         {
-            std::vector<Vector> node_L(num_nodes, Vector::Zero(S));
-            std::vector<double> node_log_scale(num_nodes, 0.0);
+            BatchedInsideWorkspace ws;
+            ws.init(num_nodes, S, tile_size);
 
             #pragma omp for schedule(static)
-            for (size_t p = 0; p < num_patterns; ++p) {
-                const auto& pattern = aln.patterns[p];
-
-                for (int32_t node_id : tree.post_order) {
-                    const auto& node = tree.nodes[node_id];
-
-                    if (node.is_leaf) {
-                        size_t t_idx = leaf_to_taxon[node_id];
-                        if (t_idx != static_cast<size_t>(-1)) {
-                            int8_t state = pattern.states[t_idx];
-                            if (state >= 0 && state < S) {
-                                node_L[node_id].setZero();
-                                node_L[node_id](state) = 1.0;
-                            } else {
-                                node_L[node_id].setOnes();
-                            }
-                        } else {
-                            node_L[node_id].setOnes();
-                        }
-                        node_log_scale[node_id] = 0.0;
-                    } else {
-                        double child_scale_sum = 0.0;
-                        tree.eval_internal_node(node_id, P_branches, node_L, node_log_scale, node_L[node_id], child_scale_sum);
-                        node_log_scale[node_id] = child_scale_sum;
-                    }
-                }
-
-                Scalar pattern_likelihood = pi.dot(node_L[tree.root_id]);
-                if (pattern_likelihood > 0.0) {
-                    pattern_ll[p] = pattern.weight * (std::log(pattern_likelihood) + node_log_scale[tree.root_id]);
-                } else {
-                    pattern_ll[p] = pattern.weight * (-1e20);
+            for (size_t t = 0; t < num_tiles; ++t) {
+                size_t p_start = t * tile_size;
+                size_t p_end = std::min(num_patterns, p_start + tile_size);
+                compute_inside_batch_in_place(tree, aln, p_start, p_end, leaf_to_taxon, P_branches, pi, S, ws, P_bridges);
+                for (size_t p = p_start; p < p_end; ++p) {
+                    pattern_ll[p] = aln.patterns[p].weight * ws.root_log_L(static_cast<Eigen::Index>(p - p_start));
                 }
             }
         }
 
-        Scalar total_log_l = 0.0;
-        for (size_t p = 0; p < num_patterns; ++p) {
-            total_log_l += pattern_ll[p];
-        }
-        return total_log_l;
+        return neumaier_sum(pattern_ll);
     }
 
     // Inside-Outside two-pass traversal for a single site pattern
@@ -252,7 +718,12 @@ public:
         std::vector<Vector> P_D;
         std::vector<Vector> U;
         std::vector<double> B;
+        std::vector<int> boost_counts;
         std::vector<double> node_log_scale;
+        std::vector<Vector> pref;
+        std::vector<Vector> suff;
+        std::vector<int> pref_boost;
+        std::vector<int> suff_boost;
         Vector v_msg;
         Scalar likelihood = 0.0;
         Scalar log_likelihood = 0.0;
@@ -264,6 +735,7 @@ public:
                 P_D.assign(num_nodes, Vector::Zero(S));
                 U.assign(num_nodes, Vector::Zero(S));
                 B.assign(num_nodes, 1.0);
+                boost_counts.assign(num_nodes, 0);
                 node_log_scale.assign(num_nodes, 0.0);
                 v_msg.resize(S);
             }
@@ -277,8 +749,13 @@ public:
         const std::vector<Matrix>& P_branches,
         const Vector& pi,
         int S,
-        InsideOutsideWorkspace& ws
+        InsideOutsideWorkspace& ws,
+        const std::vector<std::array<Matrix, 3>>* P_bridges = nullptr
     ) {
+        const double SCALER_THRESH = 1e-150;
+        const double SCALER_UP = 1e150;
+        const double SCALER_DOWN = 1e-150;
+
         size_t num_nodes = tree.num_nodes();
         ws.init(num_nodes, S);
 
@@ -287,28 +764,20 @@ public:
             const auto& node = tree.nodes[nid];
             if (node.is_leaf) {
                 size_t t_idx = leaf_to_taxon[nid];
-                if (t_idx != static_cast<size_t>(-1)) {
-                    int8_t state = pattern.states[t_idx];
-                    if (state >= 0 && state < S) {
-                        ws.D[nid].setZero();
-                        ws.D[nid](state) = 1.0;
-                    } else {
-                        ws.D[nid].setOnes();
-                    }
-                } else {
-                    ws.D[nid].setOnes();
-                }
+                init_leaf_likelihood(pattern, t_idx, S, ws.D[nid]);
                 ws.node_log_scale[nid] = 0.0;
                 ws.B[nid] = 1.0;
+                ws.boost_counts[nid] = 0;
             } else {
                 double child_scale_sum = 0.0;
                 for (int32_t cid : node.children) {
                     ws.P_D[cid].noalias() = P_branches[cid] * ws.D[cid];
                 }
                 double boost_mult = 1.0;
-                const std::vector<std::array<Matrix, 3>>* no_bridges = nullptr;
-                tree.eval_internal_node(nid, P_branches, ws.D, ws.node_log_scale, ws.D[nid], child_scale_sum, no_bridges, &boost_mult);
+                int boost_cnt = 0;
+                tree.eval_internal_node(nid, P_branches, ws.D, ws.node_log_scale, ws.D[nid], child_scale_sum, P_bridges, &boost_mult, &boost_cnt);
                 ws.B[nid] = boost_mult;
+                ws.boost_counts[nid] = boost_cnt;
                 ws.node_log_scale[nid] = child_scale_sum;
             }
         }
@@ -321,6 +790,8 @@ public:
         }
 
         // 2. Pre-order (top-down) pass to compute U and V reusing cached P_D
+        // Uses scaled prefix/suffix sibling products + integer boost counts to prevent
+        // both sibling underflow and B[uid] = (1e150)^k overflow on high-degree polytomies.
         ws.U[tree.root_id] = pi;
 
         for (auto it = tree.post_order.rbegin(); it != tree.post_order.rend(); ++it) {
@@ -329,15 +800,60 @@ public:
             if (node.is_leaf) continue;
 
             size_t num_children = node.children.size();
+            if (num_children == 0) continue;
+
+            if (ws.pref.size() < num_children) {
+                ws.pref.resize(num_children, Vector::Ones(S));
+                ws.suff.resize(num_children, Vector::Ones(S));
+                ws.pref_boost.resize(num_children, 0);
+                ws.suff_boost.resize(num_children, 0);
+            }
+
+            // Prefix products: pref[i] = prod_{j < i} P_D[children[j]] (with dynamic rescaling)
+            ws.pref[0].setOnes(S);
+            ws.pref_boost[0] = 0;
+            for (size_t i = 1; i < num_children; ++i) {
+                int32_t prev_cid = node.children[i - 1];
+                ws.pref[i] = ws.pref[i - 1].cwiseProduct(ws.P_D[prev_cid]);
+                int b_cnt = ws.pref_boost[i - 1];
+                double cur_max = ws.pref[i].maxCoeff();
+                while (cur_max < SCALER_THRESH && cur_max > 0.0) {
+                    ws.pref[i] *= SCALER_UP;
+                    cur_max *= SCALER_UP;
+                    b_cnt++;
+                }
+                ws.pref_boost[i] = b_cnt;
+            }
+
+            // Suffix products: suff[i] = prod_{j > i} P_D[children[j]] (with dynamic rescaling)
+            ws.suff[num_children - 1].setOnes(S);
+            ws.suff_boost[num_children - 1] = 0;
+            for (size_t i = num_children - 1; i > 0; --i) {
+                int32_t next_cid = node.children[i];
+                ws.suff[i - 1] = ws.suff[i].cwiseProduct(ws.P_D[next_cid]);
+                int b_cnt = ws.suff_boost[i];
+                double cur_max = ws.suff[i - 1].maxCoeff();
+                while (cur_max < SCALER_THRESH && cur_max > 0.0) {
+                    ws.suff[i - 1] *= SCALER_UP;
+                    cur_max *= SCALER_UP;
+                    b_cnt++;
+                }
+                ws.suff_boost[i - 1] = b_cnt;
+            }
+
+            int total_boost = ws.boost_counts[uid];
             for (size_t i = 0; i < num_children; ++i) {
                 int32_t vid = node.children[i];
-                ws.v_msg = ws.U[uid];
-                for (size_t j = 0; j < num_children; ++j) {
-                    if (i != j) {
-                        ws.v_msg.array() *= ws.P_D[node.children[j]].array();
-                    }
+                ws.v_msg = ws.U[uid].cwiseProduct(ws.pref[i]).cwiseProduct(ws.suff[i]);
+                int net_boost = total_boost - ws.pref_boost[i] - ws.suff_boost[i];
+                while (net_boost > 0) {
+                    ws.v_msg *= SCALER_UP;
+                    net_boost--;
                 }
-                ws.v_msg *= ws.B[uid];
+                while (net_boost < 0) {
+                    ws.v_msg *= SCALER_DOWN;
+                    net_boost++;
+                }
                 ws.V[vid] = ws.v_msg;
                 ws.U[vid].noalias() = P_branches[vid].transpose() * ws.v_msg;
             }
@@ -350,78 +866,16 @@ public:
         const std::vector<size_t>& leaf_to_taxon,
         const std::vector<Matrix>& P_branches,
         const Vector& pi,
-        int S
+        int S,
+        const std::vector<std::array<Matrix, 3>>* P_bridges = nullptr
     ) {
-        size_t num_nodes = tree.num_nodes();
+        InsideOutsideWorkspace ws;
+        compute_inside_outside_in_place(tree, pattern, leaf_to_taxon, P_branches, pi, S, ws, P_bridges);
         InsideOutsideResult res;
-        res.D.assign(num_nodes, Vector::Zero(S));
-        res.V.assign(num_nodes, Vector::Zero(S));
-        std::vector<Vector> P_D(num_nodes, Vector::Zero(S));
-        std::vector<double> B(num_nodes, 1.0);
-        std::vector<double> node_log_scale(num_nodes, 0.0);
-
-        // 1. Post-order (bottom-up) pass to compute D and cache P_D
-        for (int32_t nid : tree.post_order) {
-            const auto& node = tree.nodes[nid];
-            if (node.is_leaf) {
-                size_t t_idx = leaf_to_taxon[nid];
-                if (t_idx != static_cast<size_t>(-1)) {
-                    int8_t state = pattern.states[t_idx];
-                    if (state >= 0 && state < S) {
-                        res.D[nid].setZero();
-                        res.D[nid](state) = 1.0;
-                    } else {
-                        res.D[nid].setOnes();
-                    }
-                } else {
-                    res.D[nid].setOnes();
-                }
-                node_log_scale[nid] = 0.0;
-                B[nid] = 1.0;
-            } else {
-                double child_scale_sum = 0.0;
-                for (int32_t cid : node.children) {
-                    P_D[cid] = P_branches[cid] * res.D[cid];
-                }
-                double boost_mult = 1.0;
-                const std::vector<std::array<Matrix, 3>>* no_bridges = nullptr;
-                tree.eval_internal_node(nid, P_branches, res.D, node_log_scale, res.D[nid], child_scale_sum, no_bridges, &boost_mult);
-                B[nid] = boost_mult;
-                node_log_scale[nid] = child_scale_sum;
-            }
-        }
-
-        res.likelihood = res.D[tree.root_id].dot(pi);
-        if (res.likelihood > 0.0) {
-            res.log_likelihood = std::log(res.likelihood) + node_log_scale[tree.root_id];
-        } else {
-            res.log_likelihood = -1e20;
-        }
-
-        // 2. Pre-order (top-down) pass to compute U and V reusing cached P_D
-        std::vector<Vector> U(num_nodes, Vector::Zero(S));
-        U[tree.root_id] = pi;
-
-        for (auto it = tree.post_order.rbegin(); it != tree.post_order.rend(); ++it) {
-            int32_t uid = *it;
-            const auto& node = tree.nodes[uid];
-            if (node.is_leaf) continue;
-
-            size_t num_children = node.children.size();
-            for (size_t i = 0; i < num_children; ++i) {
-                int32_t vid = node.children[i];
-                Vector v_msg = U[uid];
-                for (size_t j = 0; j < num_children; ++j) {
-                    if (i != j) {
-                        v_msg.array() *= P_D[node.children[j]].array();
-                    }
-                }
-                v_msg *= B[uid];
-                res.V[vid] = v_msg;
-                U[vid] = P_branches[vid].transpose() * v_msg;
-            }
-        }
-
+        res.D = std::move(ws.D);
+        res.V = std::move(ws.V);
+        res.likelihood = ws.likelihood;
+        res.log_likelihood = ws.log_likelihood;
         return res;
     }
 
@@ -481,7 +935,7 @@ public:
     }
 
     // Evaluates log-likelihood and exact analytical branch gradients d ln L / d t_b
-    // using the 2-pass Inside-Outside adjoint state formulation
+    // using the batched 2-pass Inside-Outside GEMM formulation
     static std::pair<Scalar, std::vector<Scalar>> compute_branch_length_gradients(
         const Tree& tree,
         const Alignment& aln,
@@ -498,8 +952,8 @@ public:
         mg.update(params, aln.pos_nuc_frequencies, aln.codon_frequencies_f3x4, gcode);
 
         bool use_custom_bl = !branch_lengths.empty();
-        std::vector<Matrix> P_branches(num_nodes);
-        std::vector<Matrix> dP_branches(num_nodes);
+        std::vector<Matrix> P_branches(num_nodes, Matrix::Identity(S, S));
+        std::vector<Matrix> dP_branches(num_nodes, Matrix::Zero(S, S));
         for (const auto& node : tree.nodes) {
             if (node.id != tree.root_id) {
                 Scalar bl = (use_custom_bl && static_cast<size_t>(node.id) < branch_lengths.size())
@@ -509,6 +963,22 @@ public:
             }
         }
 
+        std::vector<std::array<Matrix, 3>> P_bridges;
+        const std::vector<std::array<Matrix, 3>>* p_bridges_ptr = nullptr;
+        if (!tree.bridges.empty()) {
+            P_bridges.resize(tree.bridges.size());
+            for (size_t k = 0; k < tree.bridges.size(); ++k) {
+                for (int r = 0; r < 3; ++r) {
+                    if (tree.bridges[k].weights[r] > 0.0 || r == 0) {
+                        P_bridges[k][r] = mg.transition_matrix(tree.bridges[k].branch_lengths[r]);
+                    } else {
+                        P_bridges[k][r] = Matrix::Identity(S, S);
+                    }
+                }
+            }
+            p_bridges_ptr = &P_bridges;
+        }
+
         std::vector<size_t> local_map;
         const std::vector<size_t>& leaf_to_taxon = custom_leaf_to_taxon
             ? *custom_leaf_to_taxon
@@ -516,47 +986,62 @@ public:
 
         std::vector<Scalar> pattern_ll(num_patterns, 0.0);
         Matrix pattern_grad = Matrix::Zero(num_nodes, num_patterns);
-        int n_threads = optimal_omp_threads(num_patterns, 16);
+        int n_threads = optimal_omp_threads(num_patterns, 32);
+        const size_t tile_size = std::max<size_t>(16, std::min<size_t>(256, (num_patterns + std::max(1, n_threads) - 1) / std::max(1, n_threads)));
+        const size_t num_tiles = (num_patterns + tile_size - 1) / tile_size;
 
         #pragma omp parallel num_threads(n_threads)
         {
-            InsideOutsideWorkspace ws;
-            ws.init(num_nodes, S);
-            Vector tmp_vec(S);
+            BatchedInsideOutsideWorkspace ws;
+            ws.init(num_nodes, S, tile_size);
+            Matrix dP_D(S, tile_size);
+            Vector inv_L_vec(tile_size);
 
             #pragma omp for schedule(static)
-            for (size_t p = 0; p < num_patterns; ++p) {
-                const auto& pattern = aln.patterns[p];
-                compute_inside_outside_in_place(
-                    tree, pattern, leaf_to_taxon, P_branches, aln.codon_frequencies_f3x4, S, ws
+            for (size_t t = 0; t < num_tiles; ++t) {
+                size_t p_start = t * tile_size;
+                size_t p_end = std::min(num_patterns, p_start + tile_size);
+                Eigen::Index B = static_cast<Eigen::Index>(p_end - p_start);
+
+                compute_inside_outside_batch_in_place(
+                    tree, aln, p_start, p_end, leaf_to_taxon, P_branches, aln.codon_frequencies_f3x4, S, ws, p_bridges_ptr
                 );
-                Scalar L = ws.likelihood;
-                if (L > 0.0) {
-                    pattern_ll[p] = pattern.weight * ws.log_likelihood;
-                    Scalar inv_L = pattern.weight / L;
-                    for (const auto& node : tree.nodes) {
-                        if (node.id != tree.root_id) {
-                            int32_t vid = node.id;
-                            tmp_vec.noalias() = dP_branches[vid] * ws.D[vid];
-                            Scalar dL_dt = ws.V[vid].dot(tmp_vec);
-                            pattern_grad(vid, p) = inv_L * dL_dt;
+
+                for (Eigen::Index b = 0; b < B; ++b) {
+                    size_t p = p_start + b;
+                    Scalar L = ws.likelihood(b);
+                    if (L > 0.0) {
+                        pattern_ll[p] = aln.patterns[p].weight * ws.log_likelihood(b);
+                        inv_L_vec(b) = aln.patterns[p].weight / L;
+                    } else {
+                        inv_L_vec(b) = 0.0;
+                    }
+                }
+
+                for (const auto& node : tree.nodes) {
+                    if (node.id != tree.root_id) {
+                        int32_t vid = node.id;
+                        auto dP_D_sub = dP_D.leftCols(B);
+                        // Batched GEMM: (S x S) * (S x B) -> (S x B)
+                        dP_D_sub.noalias() = dP_branches[vid] * ws.D[vid].leftCols(B);
+                        for (Eigen::Index b = 0; b < B; ++b) {
+                            if (inv_L_vec(b) > 0.0) {
+                                pattern_grad(vid, p_start + b) = inv_L_vec(b) * ws.V[vid].col(b).dot(dP_D_sub.col(b));
+                            }
                         }
                     }
                 }
             }
         }
 
-        Scalar total_log_l = 0.0;
-        for (size_t p = 0; p < num_patterns; ++p) {
-            total_log_l += pattern_ll[p];
-        }
+        Scalar total_log_l = neumaier_sum(pattern_ll);
         std::vector<Scalar> grad_b(num_nodes, 0.0);
+        std::vector<Scalar> row_terms(num_patterns, 0.0);
         for (size_t i = 0; i < num_nodes; ++i) {
-            Scalar s = 0.0;
             for (size_t p = 0; p < num_patterns; ++p) {
-                s += pattern_grad(i, p);
+                row_terms[p] = pattern_grad(i, p);
             }
-            grad_b[i] = s;
+            grad_b[i] = neumaier_sum(row_terms);
         }
 
         return {total_log_l, grad_b};
@@ -565,7 +1050,8 @@ public:
     struct JointMG94Gradients {
         Scalar log_likelihood = 0.0;
         std::vector<Scalar> grad_branches; // d ln L / d t_b (in substitutions/site)
-        Scalar grad_omega = 0.0;           // d ln L / d omega
+        Scalar grad_omega = 0.0;           // d ln L / d omega (or omega_test when branch partition is active)
+        Scalar grad_omega_bg = 0.0;        // d ln L / d omega_bg (when branch partition is active)
         Scalar grad_theta_AC = 0.0;        // d ln L / d theta_AC
         Scalar grad_theta_AT = 0.0;        // d ln L / d theta_AT
         Scalar grad_theta_CG = 0.0;        // d ln L / d theta_CG
@@ -574,40 +1060,71 @@ public:
     };
 
     // Evaluates log-likelihood and exact joint analytical gradients for all branch lengths
-    // and all 6 global parameters (omega, theta_AC, theta_AT, theta_CG, theta_CT, theta_GT)
-    // using the 2-pass Inside-Outside adjoint state and spectral Fréchet derivatives of the matrix exponential.
+    // and global parameters (omega [or omega_test + omega_bg], theta_AC, theta_AT, theta_CG, theta_CT, theta_GT)
+    // using the batched 2-pass Inside-Outside GEMM and spectral Fréchet derivatives of the matrix exponential.
     static JointMG94Gradients compute_joint_frechet_gradients(
         const Tree& tree,
         const Alignment& aln,
         const MG94Parameters& params,
         const std::vector<Scalar>& branch_lengths = {},
-        const std::vector<size_t>* custom_leaf_to_taxon = nullptr
+        const std::vector<size_t>* custom_leaf_to_taxon = nullptr,
+        const std::vector<bool>* is_test_branch = nullptr,
+        Scalar omega_bg = -1.0
     ) {
         const auto& gcode = *(aln.code ? aln.code : GeneticCode::universal());
         int S = gcode.num_sense_codons;
         size_t num_nodes = tree.num_nodes();
         size_t num_patterns = aln.patterns.size();
 
-        MG94Matrix mg;
-        mg.update(params, aln.pos_nuc_frequencies, aln.codon_frequencies_f3x4, gcode);
+        bool has_partition = (is_test_branch != nullptr && is_test_branch->size() == num_nodes && omega_bg >= 0.0);
 
-        Scalar mu = mg.scale_factor;
-        Scalar conv = (mu > 1e-12) ? (3.0 / mu) : 1.0;
+        MG94Matrix mg_test;
+        mg_test.update(params, aln.pos_nuc_frequencies, aln.codon_frequencies_f3x4, gcode);
+        Scalar mu_test = std::max(mg_test.scale_factor, Scalar(1e-12));
+        Scalar conv_test = 3.0 / mu_test;
+
+        MG94Parameters params_bg = params;
+        params_bg.beta = has_partition ? omega_bg : params.beta;
+        MG94Matrix mg_bg;
+        if (has_partition) {
+            mg_bg.update(params_bg, aln.pos_nuc_frequencies, aln.codon_frequencies_f3x4, gcode);
+        }
+        Scalar mu_bg = has_partition ? std::max(mg_bg.scale_factor, Scalar(1e-12)) : mu_test;
+        Scalar conv_bg = 3.0 / mu_bg;
 
         std::vector<Scalar> tau(num_nodes, 0.0);
-        std::vector<Matrix> P_branches(num_nodes);
-        std::vector<Matrix> dP_branches(num_nodes);
+        std::vector<Matrix> P_branches(num_nodes, Matrix::Identity(S, S));
+        std::vector<Matrix> dP_branches(num_nodes, Matrix::Zero(S, S));
 
         bool use_custom_bl = !branch_lengths.empty();
         for (const auto& node : tree.nodes) {
             if (node.id != tree.root_id) {
                 int32_t bid = node.id;
+                bool is_test = (!has_partition || (*is_test_branch)[bid]);
+                const MG94Matrix& mg_b = is_test ? mg_test : mg_bg;
+                Scalar conv_b = is_test ? conv_test : conv_bg;
                 Scalar bl = (use_custom_bl && static_cast<size_t>(bid) < branch_lengths.size())
                     ? branch_lengths[bid] : node.branch_length;
-                tau[bid] = bl * conv;
-                P_branches[bid] = mg.transition_matrix(tau[bid]);
-                dP_branches[bid] = mg.Q * P_branches[bid];
+                tau[bid] = bl * conv_b;
+                P_branches[bid] = mg_b.transition_matrix(tau[bid]);
+                dP_branches[bid] = mg_b.Q * P_branches[bid];
             }
+        }
+
+        std::vector<std::array<Matrix, 3>> P_bridges;
+        const std::vector<std::array<Matrix, 3>>* p_bridges_ptr = nullptr;
+        if (!tree.bridges.empty()) {
+            P_bridges.resize(tree.bridges.size());
+            for (size_t k = 0; k < tree.bridges.size(); ++k) {
+                for (int r = 0; r < 3; ++r) {
+                    if (tree.bridges[k].weights[r] > 0.0 || r == 0) {
+                        P_bridges[k][r] = mg_test.transition_matrix(tree.bridges[k].branch_lengths[r] * conv_test);
+                    } else {
+                        P_bridges[k][r] = Matrix::Identity(S, S);
+                    }
+                }
+            }
+            p_bridges_ptr = &P_bridges;
         }
 
         std::vector<size_t> local_map;
@@ -620,92 +1137,116 @@ public:
         // Pack V and D across patterns for each branch so A_branches[bid] = V_mat[bid] * D_mat[bid]^T is a single deterministic BLAS GEMM!
         std::vector<Matrix> V_mat(num_nodes, Matrix::Zero(S, num_patterns));
         std::vector<Matrix> D_mat(num_nodes, Matrix::Zero(S, num_patterns));
-        int n_threads = optimal_omp_threads(num_patterns, 16);
+        int n_threads = optimal_omp_threads(num_patterns, 32);
+        const size_t tile_size = std::max<size_t>(16, std::min<size_t>(256, (num_patterns + std::max(1, n_threads) - 1) / std::max(1, n_threads)));
+        const size_t num_tiles = (num_patterns + tile_size - 1) / tile_size;
 
         #pragma omp parallel num_threads(n_threads)
         {
-            InsideOutsideWorkspace ws;
-            ws.init(num_nodes, S);
-            Vector tmp_vec(S);
+            BatchedInsideOutsideWorkspace ws;
+            ws.init(num_nodes, S, tile_size);
+            Matrix dP_D(S, tile_size);
+            Vector inv_L_vec(tile_size);
 
             #pragma omp for schedule(static)
-            for (size_t p = 0; p < num_patterns; ++p) {
-                const auto& pattern = aln.patterns[p];
-                compute_inside_outside_in_place(
-                    tree, pattern, leaf_to_taxon, P_branches, aln.codon_frequencies_f3x4, S, ws
-                );
-                Scalar L = ws.likelihood;
-                if (L > 0.0) {
-                    pattern_ll[p] = pattern.weight * ws.log_likelihood;
-                    Scalar inv_L = pattern.weight / L;
+            for (size_t t = 0; t < num_tiles; ++t) {
+                size_t p_start = t * tile_size;
+                size_t p_end = std::min(num_patterns, p_start + tile_size);
+                Eigen::Index B = static_cast<Eigen::Index>(p_end - p_start);
 
-                    for (const auto& node : tree.nodes) {
-                        if (node.id != tree.root_id) {
-                            int32_t bid = node.id;
-                            tmp_vec.noalias() = dP_branches[bid] * ws.D[bid];
-                            Scalar dL_dt = ws.V[bid].dot(tmp_vec);
-                            pattern_dL(bid, p) = inv_L * dL_dt;
-                            V_mat[bid].col(p) = inv_L * ws.V[bid];
-                            D_mat[bid].col(p) = ws.D[bid];
+                compute_inside_outside_batch_in_place(
+                    tree, aln, p_start, p_end, leaf_to_taxon, P_branches, aln.codon_frequencies_f3x4, S, ws, p_bridges_ptr
+                );
+
+                for (Eigen::Index b = 0; b < B; ++b) {
+                    size_t p = p_start + b;
+                    Scalar L = ws.likelihood(b);
+                    if (L > 0.0) {
+                        pattern_ll[p] = aln.patterns[p].weight * ws.log_likelihood(b);
+                        inv_L_vec(b) = aln.patterns[p].weight / L;
+                    } else {
+                        inv_L_vec(b) = 0.0;
+                    }
+                }
+
+                for (const auto& node : tree.nodes) {
+                    if (node.id != tree.root_id) {
+                        int32_t bid = node.id;
+                        auto D_sub = ws.D[bid].leftCols(B);
+                        auto V_sub = ws.V[bid].leftCols(B);
+                        auto dP_D_sub = dP_D.leftCols(B);
+                        dP_D_sub.noalias() = dP_branches[bid] * D_sub;
+                        for (Eigen::Index b = 0; b < B; ++b) {
+                            Scalar w_inv_L = inv_L_vec(b);
+                            if (w_inv_L > 0.0) {
+                                size_t p = p_start + b;
+                                pattern_dL(bid, p) = w_inv_L * V_sub.col(b).dot(dP_D_sub.col(b));
+                                V_mat[bid].col(p) = w_inv_L * V_sub.col(b);
+                                D_mat[bid].col(p) = D_sub.col(b);
+                            }
                         }
                     }
                 }
             }
         }
 
-        Scalar total_log_l = 0.0;
-        for (size_t p = 0; p < num_patterns; ++p) {
-            total_log_l += pattern_ll[p];
-        }
+        Scalar total_log_l = neumaier_sum(pattern_ll);
         std::vector<Scalar> dL_dtau(num_nodes, 0.0);
         std::vector<Matrix> A_branches(num_nodes);
+        std::vector<Scalar> row_terms(num_patterns, 0.0);
         for (const auto& node : tree.nodes) {
             if (node.id != tree.root_id) {
                 int32_t bid = node.id;
-                Scalar s = 0.0;
                 for (size_t p = 0; p < num_patterns; ++p) {
-                    s += pattern_dL(bid, p);
+                    row_terms[p] = pattern_dL(bid, p);
                 }
-                dL_dtau[bid] = s;
+                dL_dtau[bid] = neumaier_sum(row_terms);
                 A_branches[bid].noalias() = V_mat[bid] * D_mat[bid].transpose();
             }
         }
 
-        Matrix H = Matrix::Zero(S, S);
-        Scalar sum_tau_dL_dtau = 0.0;
+        Matrix H_test = Matrix::Zero(S, S);
+        Scalar sum_tau_dL_dtau_test = 0.0;
+        Matrix H_bg = Matrix::Zero(S, S);
+        Scalar sum_tau_dL_dtau_bg = 0.0;
 
         for (const auto& node : tree.nodes) {
             if (node.id != tree.root_id) {
                 int32_t bid = node.id;
-                Scalar tb = tau[bid];
-                sum_tau_dL_dtau += tb * dL_dtau[bid];
+                bool is_test = (!has_partition || (*is_test_branch)[bid]);
+                const MG94Matrix& mg_b = is_test ? mg_test : mg_bg;
+                Matrix& H_target = is_test ? H_test : H_bg;
+                Scalar& sum_target = is_test ? sum_tau_dL_dtau_test : sum_tau_dL_dtau_bg;
 
-                Matrix A_tilde = mg.U_pi.transpose() * A_branches[bid] * mg.V_pi.transpose();
+                Scalar tb = tau[bid];
+                sum_target += tb * dL_dtau[bid];
+
+                Matrix A_tilde = mg_b.U_pi.transpose() * A_branches[bid] * mg_b.V_pi.transpose();
 
                 Matrix E(S, S);
                 for (int i = 0; i < S; ++i) {
                     for (int j = 0; j < S; ++j) {
-                        Scalar diff = mg.eigenvalues(i) - mg.eigenvalues(j);
+                        Scalar diff = mg_b.eigenvalues(i) - mg_b.eigenvalues(j);
                         if (std::abs(diff) < 1e-9) {
-                            E(i, j) = tb * std::exp(mg.eigenvalues(i) * tb);
+                            E(i, j) = tb * std::exp(mg_b.eigenvalues(i) * tb);
                         } else {
-                            E(i, j) = (std::exp(mg.eigenvalues(i) * tb) - std::exp(mg.eigenvalues(j) * tb)) / diff;
+                            E(i, j) = (std::exp(mg_b.eigenvalues(i) * tb) - std::exp(mg_b.eigenvalues(j) * tb)) / diff;
                         }
                     }
                 }
 
-                H.noalias() += A_tilde.cwiseProduct(E);
+                H_target.noalias() += A_tilde.cwiseProduct(E);
             }
         }
 
-        auto compute_global_grad = [&](const Matrix& dQ_k) -> Scalar {
-            Matrix M_k = mg.V_pi * dQ_k * mg.U_pi;
-            Scalar part1 = (M_k.cwiseProduct(H)).sum();
+        auto compute_part_grad = [&](const MG94Matrix& mg_part, Scalar mu_part, const Matrix& H_part, Scalar sum_part, const Matrix& dQ_k) -> Scalar {
+            Matrix M_k = mg_part.V_pi * dQ_k * mg_part.U_pi;
+            Scalar part1 = (M_k.cwiseProduct(H_part)).sum();
             Scalar dmu_k = 0.0;
             for (int i = 0; i < S; ++i) {
-                dmu_k -= mg.pi(i) * dQ_k(i, i);
+                dmu_k -= mg_part.pi(i) * dQ_k(i, i);
             }
-            Scalar part2 = -(dmu_k / mu) * sum_tau_dL_dtau;
+            Scalar part2 = -(dmu_k / mu_part) * sum_part;
             return part1 + part2;
         };
 
@@ -730,7 +1271,7 @@ public:
             dQ_omega(i, i) = -dQ_omega.row(i).sum();
         }
 
-        auto build_dQ_nuc = [&](int u, int v) -> Matrix {
+        auto build_dQ_nuc = [&](int u, int v, Scalar beta_val) -> Matrix {
             Matrix dQ = Matrix::Zero(S, S);
             for (int i = 0; i < S; ++i) {
                 for (int j = 0; j < S; ++j) {
@@ -740,7 +1281,7 @@ public:
                         int from = diff.diff_from[0];
                         int to = diff.diff_to[0];
                         if ((from == u && to == v) || (from == v && to == u)) {
-                            Scalar rate_mod = diff.synonymous ? params.alpha : params.beta;
+                            Scalar rate_mod = diff.synonymous ? params.alpha : beta_val;
                             Scalar target_nuc_freq = aln.pos_nuc_frequencies(diff.diff_pos[0], to);
                             dQ(i, j) = rate_mod * 1.0 * target_nuc_freq;
                         }
@@ -751,21 +1292,34 @@ public:
             return dQ;
         };
 
+        auto compute_theta_grad = [&](int u, int v) -> Scalar {
+            Scalar g = compute_part_grad(mg_test, mu_test, H_test, sum_tau_dL_dtau_test, build_dQ_nuc(u, v, params.beta));
+            if (has_partition) {
+                g += compute_part_grad(mg_bg, mu_bg, H_bg, sum_tau_dL_dtau_bg, build_dQ_nuc(u, v, omega_bg));
+            }
+            return g;
+        };
+
         JointMG94Gradients res;
         res.log_likelihood = total_log_l;
         res.grad_branches.resize(num_nodes, 0.0);
         for (const auto& node : tree.nodes) {
             if (node.id != tree.root_id) {
-                res.grad_branches[node.id] = conv * dL_dtau[node.id];
+                bool is_test = (!has_partition || (*is_test_branch)[node.id]);
+                Scalar conv_b = is_test ? conv_test : conv_bg;
+                res.grad_branches[node.id] = conv_b * dL_dtau[node.id];
             }
         }
 
-        res.grad_omega = compute_global_grad(dQ_omega);
-        res.grad_theta_AC = compute_global_grad(build_dQ_nuc(0, 1));
-        res.grad_theta_AT = compute_global_grad(build_dQ_nuc(0, 3));
-        res.grad_theta_CG = compute_global_grad(build_dQ_nuc(1, 2));
-        res.grad_theta_CT = compute_global_grad(build_dQ_nuc(1, 3));
-        res.grad_theta_GT = compute_global_grad(build_dQ_nuc(2, 3));
+        res.grad_omega = compute_part_grad(mg_test, mu_test, H_test, sum_tau_dL_dtau_test, dQ_omega);
+        if (has_partition) {
+            res.grad_omega_bg = compute_part_grad(mg_bg, mu_bg, H_bg, sum_tau_dL_dtau_bg, dQ_omega);
+        }
+        res.grad_theta_AC = compute_theta_grad(0, 1);
+        res.grad_theta_AT = compute_theta_grad(0, 3);
+        res.grad_theta_CG = compute_theta_grad(1, 2);
+        res.grad_theta_CT = compute_theta_grad(1, 3);
+        res.grad_theta_GT = compute_theta_grad(2, 3);
 
         return res;
     }

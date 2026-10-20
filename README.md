@@ -259,7 +259,7 @@ Q_ij = (α or β) × ψ × ∏_{p ∈ D} r_{i_p → j_p} π_{j_p}^(p)    (|D|K =
   - Jointly estimates δ and ψ and reports flux-weighted instantaneous substitution rates and substitution fractions (frac_δ, frac_ψ).
 - **BUSTED-E (`--error-sink`, Saturation Replacement Kernel)**:
   - Formulates a Huber ε-contaminated transition probability model P̃_b(t_b) = (1 - ε_sink) P_bio(t_b) + ε_sink P_sink, where P_sink(i, j) = π_j / (1 - π_i) for i ≠ j and 0 for i = j.
-  - Evaluates the rank-1 + diagonal bilinear form in O(S) per branch-site, estimates ε_sink via exact EM responsibility accumulation, and flags anomalous misaligned or frameshifted branch-sites via Empirical Bayes Factors (BF ≥ 20).
+  - Evaluates the rank-1 + diagonal bilinear form in O(S) per branch-site, estimates ε_sink (≤ 0.01 by default) via exact EM responsibility accumulation + 2-state Markov HMM along adjacent codons, and flags anomalous misaligned or frameshifted branch-sites via Empirical Bayes Factors (BF ≥ 100).
 - **BUSTED-PH (`hyphy3 busted-ph` or `--phenotype`, Phenotype-Associated Selection + Coupled-$k$ RELAX)**:
   - Tests whether episodic positive selection is specifically associated with a designated **Foreground/Phenotype** branch set (`--branches`) relative to a **Background/Comparison** branch set (`--comparison`, defaulting to the complement of foreground branches), with optional **Unclassified/Nuisance** branches modeled via a third independent $\omega$ distribution.
   - Fits a 5-model nested hierarchy ($M_{\text{shared}} \subset M_{\text{RELAX}} \subset M_{\text{unc}}$ and $M_{\text{null,FG}}, M_{\text{null,BG}} \subset M_{\text{unc}}$) using analytical Inside-Outside two-set EM and L-BFGS branch refinement, inheriting full support for `+S` (`--srv`), `+MH` (`--multiple-hits`), `-E` (`--error-sink`), and `--auto`:
@@ -273,10 +273,10 @@ Q_ij = (α or β) × ψ × ∏_{p ∈ D} r_{i_p → j_p} π_{j_p}^(p)    (|D|K =
     2. **Lack of Evidence for Background Selection ($\text{AIC}_c$ Screen)**: Requires that the background-neutral model is supported by $\text{AIC}_c$, $\Delta\text{AIC}_c^{(BG)} = \text{AIC}_c(M_{\text{null,BG}}) - \text{AIC}_c(M_{\text{unc}}) \le 2.0$ (asymptotically equivalent to $\text{LRT}_{BG} \le 4.0 \iff p_{BG} > 0.068$), plus a composite ranking score $-\log_{10}(\max(10^{-8}, p_{FG})) - \log_{10}(\max(10^{-8}, p_{\text{diff}})) + \log_{10}(\max(10^{-8}, p_{BG}))$.
 - **BUSTED-Auto (`--auto`, 4-Gate Surprisal & Score Model Selector)**:
   - Eliminates combinatorial 36-model grid searches by diagnosing and selecting the optimal model configuration from a single fast baseline fit:
-    - **Gate 1 (Error Sink):** Evaluates branch-site surprisal gain ΔI_sink (in bits) and spatial adjacency, activating `--error-sink` only if a 3-step EM probe yields Δ ln L > 2.0.
+    - **Gate 1 (Error Sink):** Evaluates branch-site surprisal gain ΔI_sink (in bits) and spatial adjacency, activating `--error-sink` only if the EM probe yields Δ ln L > 2.2 (with max surprisal ≥ 14.0 bits or adjacent clusters with ≥ 11.5 bits).
     - **Gate 2 (Multi-Hits):** Computes error-quarantined tangent scores for 2-hit (δ) and 3-hit (ψ) transitions weighted by (1 - Pr(sink | b, s)), preventing alignment errors from masquerading as biological multi-hits.
-    - **Gate 3 (Synonymous Rate Variation):** Evaluates the Neyman-Scott synonymous overdispersion statistic Z_SRV across sites and selects M ∈ {1, 2, 3}.
-    - **Gate 4 (Omega Rate Classes):** Compares K = 2 vs. K = 3 under the Null model and prunes collapsed or over-parameterized rate classes.
+    - **Gate 3 (Synonymous Rate Variation):** Evaluates the Neyman-Scott synonymous overdispersion statistic Z_SRV across sites along with SQUAREM/Nelder-Mead rate optimization and selects M ∈ {1, 2, 3}.
+    - **Gate 4 (Omega Rate Classes):** Compares K ∈ {2, 3} under the Null model via AICc step-up and prunes collapsed or over-parameterized rate classes.
 - **BUSTED Auto-K**:
   - Automatically identifies the optimal number of selection categories K ∈ {1, 2, ..., K_max} via step-up AICc optimization, avoiding over-parameterization on simpler datasets.
 
@@ -301,7 +301,7 @@ Null ~ ½ χ²₀ + ½(0.4 χ²₁ + 0.6 χ²₂)
   2. **Phase 2 (MG94 with Separate Rates)**: Fits distinct global ω_R and ω_T across branch sets, alternating per-branch length refinement (L-BFGS, exact gradients), (ω_R, ω_T), and the nucleotide exchangeabilities (as in HyPhy 2.5's full MG94 refit).
   3. **Phase 3 (RELAX Null Model)**: Constrains K = 1.0 so Test and Reference branches share the exact same ω distribution.
   4. **Phase 4 (RELAX Alternative Model)**: Fits a 3-category discrete distribution of rates for Reference branches (ω_{R, 0} ≤ ω_{R, 1} ≤ 1 ≤ ω_{R, 2} with weights p₀, p₁, p₂). Test branches are parameterized as ω_{T, i} = (ω_{R, i})^K, where K ∈ [0, 50] is the selection exponent parameter. The alternative is started both from a grid and from the null MLE (K = 1), and the null is re-fit from the alternative MLE, so the fits are nested (ln L_alt ≥ ln L_null).
-  5. Both RELAX fits alternate (distribution, K) ↔ per-branch lengths until the cycle gain is < 10⁻³ (`--joint-cycles`, default 5).
+  5. Both RELAX fits alternate (distribution, K, GTR θ) ↔ per-branch lengths until the cycle gain is < 10⁻³ (`--joint-cycles`, default 15).
   6. **Phase 5 (Hypothesis Testing)**: Compares alternative and null fits using the asymptotic χ²₁ LRT test statistic LRT = 2(ln L_alt - ln L_null).
      - K < 1 with p ≤ 0.05: Significant **relaxation of selection** (rates contract toward neutrality ω = 1).
      - K > 1 with p ≤ 0.05: Significant **intensification of selection** (rates diverge from neutrality).

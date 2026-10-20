@@ -87,6 +87,16 @@ if(OpenMP_CXX_FOUND)
     target_link_libraries(hyphy3_core INTERFACE OpenMP::OpenMP_CXX)
 endif()
 
+# Apple Accelerate (AMX / vDSP) hardware BLAS backend for batched 61xP GEMM Inside-Outside
+if(APPLE)
+    find_library(ACCELERATE_FRAMEWORK Accelerate)
+    if(ACCELERATE_FRAMEWORK)
+        message(STATUS "Apple Accelerate framework found: ${ACCELERATE_FRAMEWORK}")
+        target_link_libraries(hyphy3_core INTERFACE ${ACCELERATE_FRAMEWORK})
+        target_compile_definitions(hyphy3_core INTERFACE EIGEN_USE_BLAS ACCELERATE_NEW_LAPACK)
+    endif()
+endif()
+
 # HTML results viewer (viz/fel-viewer), embedded into the binaries at build time so hyphy3 can
 # write self-contained reports with no Node, Python or companion files (cmake/EmbedViewer.cmake)
 set(HYPHY3_VIEWER_DIR ${CMAKE_CURRENT_SOURCE_DIR}/viz/fel-viewer)

@@ -38,7 +38,8 @@ public:
     void update(const GTRParameters& params, const Vector4& frequencies) {
         pi = frequencies;
         for (int i = 0; i < 4; ++i) {
-            sqrt_pi(i) = std::sqrt(pi(i));
+            Scalar p = std::max(pi(i), Scalar(1e-12));
+            sqrt_pi(i) = std::sqrt(p);
             inv_sqrt_pi(i) = 1.0 / sqrt_pi(i);
         }
 
@@ -85,7 +86,7 @@ public:
             throw std::runtime_error("GTR eigendecomposition failed");
         }
 
-        eigenvalues = solver.eigenvalues();
+        eigenvalues = solver.eigenvalues().cwiseMin(0.0);
         eigenvectors = solver.eigenvectors(); // V
         inv_eigenvectors = eigenvectors.transpose(); // V^T
         U_pi = inv_sqrt_pi.asDiagonal() * eigenvectors;

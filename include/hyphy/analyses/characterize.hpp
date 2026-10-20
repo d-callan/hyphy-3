@@ -1571,14 +1571,143 @@ private:
         }
 
         // Build the 3D Branch-Site-Omega Relative Likelihood Sufficiency Tensor W[c][bi][g]
+        // paired with Principles 2 + 3: 2-State Spatial Markov Error-Sink HMM along each branch (bi, c = 0..C-1)
+        // and Sink-Quarantined Branch-Length & Tensor Sanitization.
         std::vector<std::vector<std::array<Scalar, 16>>> W_tensor(
             C, std::vector<std::array<Scalar, 16>>(B)
         );
+        std::vector<std::vector<Scalar>> W_sink(C, std::vector<Scalar>(B, 0.0));
+        std::vector<std::vector<Scalar>> markov_sink_gamma(C, std::vector<Scalar>(B, 0.0));
+
+        Vector inv_one_minus_pi = Vector::Zero(S);
+        for (int i = 0; i < S; ++i) {
+            inv_one_minus_pi(i) = 1.0 / std::max<Scalar>(1e-12, 1.0 - pi_codon(i));
+        }
+
+        std::vector<Scalar> pos_bls;
+        for (size_t bi = 0; bi < B; ++bi) {
+            int32_t bid = active_branches[bi];
+            if (work_tree.nodes[bid].branch_length > 1e-6) {
+                pos_bls.push_back(work_tree.nodes[bid].branch_length * conv);
+            }
+        }
+        std::sort(pos_bls.begin(), pos_bls.end());
+        Scalar med_bl_conv = pos_bls.empty() ? 0.05 : pos_bls[pos_bls.size() / 2];
 
         for (size_t bi = 0; bi < B; ++bi) {
             int32_t bid = active_branches[bi];
-            Scalar bl = work_tree.nodes[bid].branch_length * conv;
+            Scalar raw_bl = work_tree.nodes[bid].branch_length * conv;
+            Scalar ref_bl = raw_bl;
 
+            // Principle 3 (Pass 0): If a terminal branch is >2.5x longer than its sibling, evaluate R_sink at 1.5x sibling length
+            // so a 10-codon contamination stretch that stretched t_b 3x in Stage 1 doesn't mask its own Bayes Factor!
+            const auto& nd_b = work_tree.nodes[bid];
+            if (nd_b.is_leaf && nd_b.parent_id >= 0) {
+                const auto& par = work_tree.nodes[nd_b.parent_id];
+                Scalar min_sib = 1e9;
+                for (int32_t ch : par.children) {
+                    if (ch != bid && work_tree.nodes[ch].branch_length > 1e-6) {
+                        min_sib = std::min(min_sib, work_tree.nodes[ch].branch_length * conv);
+                    }
+                }
+                if (min_sib < 1e8 && raw_bl > 2.5 * std::max(min_sib, 0.5 * med_bl_conv)) {
+                    ref_bl = 1.5 * std::max(min_sib, 0.5 * med_bl_conv);
+                }
+            }
+
+            for (int pass = 0; pass < 2; ++pass) {
+                Scalar eval_bl = (pass == 0) ? ref_bl : (work_tree.nodes[bid].branch_length * conv);
+                Matrix P_ref_sink = branch_grid_transition_matrix(bid, 6, eval_bl);
+                for (size_t c = 0; c < C; ++c) {
+                    const Vector& U = site_outside[c][bid];
+                    const Vector& L = site_inside[c][bid];
+                    Scalar ref_val = std::max<Scalar>(1e-30, U.dot(P_ref_sink * L));
+                    Scalar pi_dot_L = pi_codon.dot(L);
+                    Scalar sink_val = 0.0;
+                    for (int i = 0; i < S; ++i) {
+                        Scalar p_sink_L_i = (pi_dot_L - pi_codon(i) * L(i)) * inv_one_minus_pi(i);
+                        sink_val += U(i) * std::max<Scalar>(0.0, p_sink_L_i);
+                    }
+                    W_sink[c][bi] = std::max<Scalar>(0.0, sink_val / ref_val);
+                }
+
+                // Principle 2: 2-State Forward-Backward Markov HMM along sites c = 0..C-1 on branch bi
+                if (C >= 2) {
+                    const Scalar eps_entry = 0.0005;
+                    const Scalar rho_stay = 0.80;
+                    const Scalar log_A00 = std::log(1.0 - eps_entry);
+                    const Scalar log_A01 = std::log(eps_entry);
+                    const Scalar log_A10 = std::log(1.0 - rho_stay);
+                    const Scalar log_A11 = std::log(rho_stay);
+                    auto lse = [](Scalar a, Scalar b) -> Scalar {
+                        Scalar mx = std::max(a, b);
+                        return mx + std::log(std::exp(a - mx) + std::exp(b - mx));
+                    };
+                    std::vector<Scalar> f0(C, 0.0), f1(C, 0.0), b0(C, 0.0), b1(C, 0.0), log_em1(C, -30.0);
+                    for (size_t c = 0; c < C; ++c) {
+                        log_em1[c] = std::min<Scalar>(8.0, std::log(std::max<Scalar>(1e-15, W_sink[c][bi])));
+                    }
+                    f0[0] = log_A00;
+                    f1[0] = log_A01 + log_em1[0];
+                    for (size_t c = 1; c < C; ++c) {
+                        f0[c] = lse(f0[c - 1] + log_A00, f1[c - 1] + log_A10);
+                        f1[c] = log_em1[c] + lse(f0[c - 1] + log_A01, f1[c - 1] + log_A11);
+                    }
+                    for (int c = static_cast<int>(C) - 2; c >= 0; --c) {
+                        b0[c] = lse(log_A00 + b0[c + 1], log_A01 + log_em1[c + 1] + b1[c + 1]);
+                        b1[c] = lse(log_A10 + b0[c + 1], log_A11 + log_em1[c + 1] + b1[c + 1]);
+                    }
+                    Scalar log_Z = lse(f0[C - 1], f1[C - 1]);
+                    for (size_t c = 0; c < C; ++c) {
+                        Scalar g1 = std::exp(std::clamp<Scalar>(f1[c] + b1[c] - log_Z, -50.0, 0.0));
+                        markov_sink_gamma[c][bi] = std::clamp<Scalar>(g1, 0.0, 1.0);
+                    }
+
+                    // Retain only contiguous Markov sink contamination runs of >= 3 codons (run_sum >= 2.6)
+                    std::vector<Scalar> filtered_gamma(C, 0.0);
+                    size_t c_idx = 0;
+                    while (c_idx < C) {
+                        if (markov_sink_gamma[c_idx][bi] >= 0.50) {
+                            size_t run_start = c_idx;
+                            Scalar run_sum = 0.0;
+                            while (c_idx < C && (markov_sink_gamma[c_idx][bi] >= 0.50 ||
+                                   (c_idx + 1 < C && markov_sink_gamma[c_idx + 1][bi] >= 0.50))) {
+                                run_sum += markov_sink_gamma[c_idx][bi];
+                                ++c_idx;
+                            }
+                            if (c_idx - run_start >= 3 && run_sum >= 2.6) {
+                                for (size_t k = run_start; k < c_idx; ++k) {
+                                    filtered_gamma[k] = markov_sink_gamma[k][bi];
+                                }
+                            }
+                        } else {
+                            ++c_idx;
+                        }
+                    }
+                    Scalar sum_gamma = 0.0;
+                    for (size_t c = 0; c < C; ++c) {
+                        markov_sink_gamma[c][bi] = filtered_gamma[c];
+                        sum_gamma += filtered_gamma[c];
+                    }
+
+                    // Principle 3 (Pass 0 -> Pass 1): If branch bi has a contiguous Markov error-sink tract (sum_gamma >= 1.8 codons),
+                    // sanitize its inflated branch length before Pass 1 and before building W_tensor!
+                    if (pass == 0 && sum_gamma >= 1.8) {
+                        Scalar frac_contam = sum_gamma / static_cast<Scalar>(C);
+                        Scalar est_spurious_bl = 2.2 * frac_contam;
+                        Scalar clean_bl = raw_bl;
+                        if (raw_bl > est_spurious_bl + 0.005) {
+                            clean_bl = std::min(clean_bl, std::max<Scalar>(0.005, raw_bl - est_spurious_bl));
+                        }
+                        if (ref_bl < raw_bl) {
+                            clean_bl = std::min(clean_bl, ref_bl);
+                        }
+                        work_tree.nodes[bid].branch_length = clean_bl / conv;
+                    }
+                }
+            }
+
+            Scalar bl = work_tree.nodes[bid].branch_length * conv;
             Matrix U_mat(S, C), L_mat(S, C);
             for (size_t c = 0; c < C; ++c) {
                 U_mat.col(static_cast<Eigen::Index>(c)) = site_outside[c][bid];
@@ -1597,6 +1726,43 @@ private:
                 Scalar ref = std::max<Scalar>(1e-30, W_tensor[c][bi][6]); // ω = 0.50 reference
                 for (size_t g = 0; g < G; ++g) {
                     W_tensor[c][bi][g] /= ref;
+                }
+                Scalar g_mkt = markov_sink_gamma[c][bi];
+                if (g_mkt >= 0.50) {
+                    for (size_t g = 0; g < G; ++g) {
+                        W_tensor[c][bi][g] = (1.0 - g_mkt) * W_tensor[c][bi][g] + g_mkt * 1.0;
+                    }
+                    W_sink[c][bi] = 1.0;
+                }
+            }
+        }
+
+        // Post-pass: if any branch bi had a contiguous Markov error-sink tract (sum_gamma >= 1.8 codons),
+        // also quarantine its sibling branches at those exact codons so the contaminated leaf does not
+        // leak spurious substitutions into its sister branch via the parent node!
+        for (size_t bi = 0; bi < B; ++bi) {
+            Scalar branch_gamma_sum = 0.0;
+            for (size_t c = 0; c < C; ++c) branch_gamma_sum += markov_sink_gamma[c][bi];
+            if (branch_gamma_sum < 1.8) continue;
+            int32_t bid = active_branches[bi];
+            const auto& nd_b = work_tree.nodes[bid];
+            if (nd_b.parent_id < 0) continue;
+            const auto& par = work_tree.nodes[nd_b.parent_id];
+            for (size_t c = 0; c < C; ++c) {
+                Scalar g_mkt = markov_sink_gamma[c][bi];
+                if (g_mkt >= 0.50) {
+                    for (int32_t sib_id : par.children) {
+                        if (sib_id != bid) {
+                            for (size_t s_bi = 0; s_bi < B; ++s_bi) {
+                                if (active_branches[s_bi] == sib_id) {
+                                    for (size_t g = 0; g < G; ++g) {
+                                        W_tensor[c][s_bi][g] = (1.0 - g_mkt) * W_tensor[c][s_bi][g] + g_mkt * 1.0;
+                                    }
+                                    W_sink[c][s_bi] *= (1.0 - g_mkt);
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -1828,7 +1994,12 @@ private:
                 entry.weight_plus = wp_opt;
             }
 
-            entry.meme_lrt = raw_meme_lrt * entry.column_homology_posterior;
+            Scalar max_site_sink_gamma = 0.0;
+            for (size_t bi = 0; bi < B; ++bi) {
+                max_site_sink_gamma = std::max(max_site_sink_gamma, markov_sink_gamma[c][bi]);
+            }
+            Scalar clean_site_factor = (max_site_sink_gamma >= 0.50) ? (1.0 - max_site_sink_gamma) : 1.0;
+            entry.meme_lrt = raw_meme_lrt * entry.column_homology_posterior * clean_site_factor;
             if (entry.meme_lrt <= 1e-6) {
                 entry.meme_p_value = 1.0;
             } else {
@@ -1881,29 +2052,15 @@ private:
         //     mismatches where all biological 1-nt transition probabilities are ~O(t^2..t^3).
         // ---------------------------------------------------------------------
         {
-            // Precompute rank-1 off-diagonal sink relative likelihood W_sink[c][bi]
-            Vector inv_one_minus_pi = Vector::Zero(S);
-            for (int i = 0; i < S; ++i) {
-                inv_one_minus_pi(i) = 1.0 / std::max<Scalar>(1e-12, 1.0 - pi_codon(i));
-            }
-            std::vector<std::vector<Scalar>> W_sink(C, std::vector<Scalar>(B, 0.0));
-            for (size_t bi = 0; bi < B; ++bi) {
-                int32_t bid = active_branches[bi];
-                Scalar bl = work_tree.nodes[bid].branch_length * conv;
-                Matrix P_ref = branch_grid_transition_matrix(bid, 6, bl); // ω = 0.50 reference
-                for (size_t c = 0; c < C; ++c) {
-                    const Vector& U = site_outside[c][bid];
-                    const Vector& L = site_inside[c][bid];
-                    Scalar ref_val = std::max<Scalar>(1e-30, U.dot(P_ref * L));
-                    Scalar pi_dot_L = pi_codon.dot(L);
-                    Scalar sink_val = 0.0;
-                    for (int i = 0; i < S; ++i) {
-                        Scalar p_sink_L_i = (pi_dot_L - pi_codon(i) * L(i)) * inv_one_minus_pi(i);
-                        sink_val += U(i) * std::max<Scalar>(0.0, p_sink_L_i);
+            Scalar total_markov_sink_gamma = 0.0;
+            for (size_t c = 0; c < C; ++c) {
+                for (size_t bi = 0; bi < B; ++bi) {
+                    if (markov_sink_gamma[c][bi] >= 0.50) {
+                        total_markov_sink_gamma += markov_sink_gamma[c][bi];
                     }
-                    W_sink[c][bi] = std::max<Scalar>(0.0, sink_val / ref_val);
                 }
             }
+            Scalar markov_sink_frac = total_markov_sink_gamma / static_cast<Scalar>(std::max<size_t>(1, B * C));
 
             auto fit_busted_em_model = [&](bool use_sink,
                                            size_t& best_g1, size_t& best_g2, size_t& best_g3,
@@ -1911,41 +2068,54 @@ private:
                                            Scalar& out_null_ll, Scalar& out_alt_ll) {
                 auto run_em = [&](size_t g1, size_t g2, size_t g3, bool allow_w3,
                                   std::array<Scalar, 3>& out_w, Scalar& out_w_err) -> Scalar {
-                    std::array<Scalar, 4> w = allow_w3
-                        ? std::array<Scalar, 4>{0.70, 0.25, 0.049, use_sink ? 0.001 : 0.0}
-                        : std::array<Scalar, 4>{0.75, 0.249, 0.00, use_sink ? 0.001 : 0.0};
-                    Scalar total_ll = -1e18;
-                    for (int iter = 0; iter < 25; ++iter) {
-                        std::array<Scalar, 4> accum = {1e-6, 1e-6, allow_w3 ? 1e-6 : 0.0, use_sink ? 1e-9 : 0.0};
-                        total_ll = 0.0;
-                        for (size_t c = 0; c < C; ++c) {
-                            Scalar pp = res.site_atlas[c].column_homology_posterior;
-                            for (size_t bi = 0; bi < B; ++bi) {
-                                Scalar l0 = w[0] * W_tensor[c][bi][g1];
-                                Scalar l1 = w[1] * W_tensor[c][bi][g2];
-                                Scalar l2 = allow_w3 ? (w[2] * W_tensor[c][bi][g3]) : 0.0;
-                                Scalar l_err = use_sink ? (w[3] * W_sink[c][bi]) : 0.0;
-                                Scalar s = std::max<Scalar>(1e-30, l0 + l1 + l2 + l_err);
-                                total_ll += pp * std::log(s);
-                                accum[0] += pp * (l0 / s);
-                                accum[1] += pp * (l1 / s);
-                                if (allow_w3) accum[2] += pp * (l2 / s);
-                                if (use_sink) accum[3] += pp * (l_err / s);
+                    Scalar best_run_ll = -1e18;
+                    std::array<Scalar, 3> best_run_w = {0.75, 0.25, 0.0};
+                    Scalar best_run_err = 0.0;
+                    std::vector<Scalar> init_eps_list = use_sink
+                        ? std::vector<Scalar>{0.0005, 0.0025, 0.008}
+                        : std::vector<Scalar>{0.0};
+                    for (Scalar init_eps : init_eps_list) {
+                        std::array<Scalar, 4> w = allow_w3
+                            ? std::array<Scalar, 4>{0.72, 0.24 - 0.5 * init_eps, 0.04 - 0.5 * init_eps, init_eps}
+                            : std::array<Scalar, 4>{0.75, 0.25 - init_eps, 0.00, init_eps};
+                        Scalar total_ll = -1e18;
+                        for (int iter = 0; iter < 25; ++iter) {
+                            std::array<Scalar, 4> accum = {1e-6, 1e-6, allow_w3 ? 1e-6 : 0.0, use_sink ? 1e-9 : 0.0};
+                            total_ll = 0.0;
+                            for (size_t c = 0; c < C; ++c) {
+                                Scalar pp = res.site_atlas[c].column_homology_posterior;
+                                for (size_t bi = 0; bi < B; ++bi) {
+                                    Scalar l0 = w[0] * W_tensor[c][bi][g1];
+                                    Scalar l1 = w[1] * W_tensor[c][bi][g2];
+                                    Scalar l2 = allow_w3 ? (w[2] * W_tensor[c][bi][g3]) : 0.0;
+                                    Scalar l_err = use_sink ? (w[3] * W_sink[c][bi]) : 0.0;
+                                    Scalar s = std::max<Scalar>(1e-30, l0 + l1 + l2 + l_err);
+                                    total_ll += pp * std::log(s);
+                                    accum[0] += pp * (l0 / s);
+                                    accum[1] += pp * (l1 / s);
+                                    if (allow_w3) accum[2] += pp * (l2 / s);
+                                    if (use_sink) accum[3] += pp * (l_err / s);
+                                }
+                            }
+                            Scalar sum_a = accum[0] + accum[1] + accum[2] + accum[3];
+                            for (int k = 0; k < 4; ++k) w[k] = accum[k] / sum_a;
+                            if (use_sink && w[3] > 0.015) {
+                                Scalar excess = w[3] - 0.015;
+                                w[3] = 0.015;
+                                w[0] += 0.5 * excess;
+                                w[1] += 0.5 * excess;
                             }
                         }
-                        Scalar sum_a = accum[0] + accum[1] + accum[2] + accum[3];
-                        for (int k = 0; k < 4; ++k) w[k] = accum[k] / sum_a;
-                        if (use_sink && w[3] > 0.01) {
-                            Scalar excess = w[3] - 0.01;
-                            w[3] = 0.01;
-                            w[0] += 0.5 * excess;
-                            w[1] += 0.5 * excess;
+                        if (total_ll > best_run_ll) {
+                            best_run_ll = total_ll;
+                            Scalar bio_sum = std::max<Scalar>(1e-12, w[0] + w[1] + w[2]);
+                            best_run_w = {w[0] / bio_sum, w[1] / bio_sum, w[2] / bio_sum};
+                            best_run_err = use_sink ? w[3] : 0.0;
                         }
                     }
-                    Scalar bio_sum = std::max<Scalar>(1e-12, w[0] + w[1] + w[2]);
-                    out_w = {w[0] / bio_sum, w[1] / bio_sum, w[2] / bio_sum};
-                    out_w_err = use_sink ? w[3] : 0.0;
-                    return total_ll;
+                    out_w = best_run_w;
+                    out_w_err = best_run_err;
+                    return best_run_ll;
                 };
 
                 out_null_ll = -1e18;
@@ -1991,6 +2161,7 @@ private:
 
             // Fit standard 3-class BUSTED (no sink) and rank-1 P_sink BUSTED-E;
             // only retain the error sink if it improves unconstrained log-likelihood by >= 0.5 * ln(B*C) (BIC check)
+            // or if a contiguous Markov error-sink tract was quarantined.
             size_t g1_std = 1, g2_std = 6, g3_std = 8;
             std::array<Scalar, 3> w_std = {0.75, 0.25, 0.0};
             Scalar err_std = 0.0, null_std = -1e18, alt_std = -1e18;
@@ -2002,13 +2173,14 @@ private:
             fit_busted_em_model(true, g1_sk, g2_sk, g3_sk, w_sk, err_sk, null_sk, alt_sk);
 
             Scalar sink_bic_threshold = 0.5 * std::log(static_cast<Scalar>(std::max<size_t>(2, B * C)));
-            bool sink_supported = (2.0 * (alt_sk - alt_std) > 2.0 * sink_bic_threshold) && (err_sk >= 1e-4);
+            bool sink_supported = ((2.0 * (alt_sk - alt_std) > 2.0 * sink_bic_threshold) && (err_sk >= 1e-4))
+                                  || (total_markov_sink_gamma >= 1.5);
 
             size_t best_g1 = sink_supported ? g1_sk : g1_std;
             size_t best_g2 = sink_supported ? g2_sk : g2_std;
             size_t best_g3 = sink_supported ? g3_sk : g3_std;
             std::array<Scalar, 3> weights = sink_supported ? w_sk : w_std;
-            Scalar best_err_w = sink_supported ? err_sk : 0.0;
+            Scalar best_err_w = sink_supported ? std::max(err_sk, markov_sink_frac) : 0.0;
             Scalar best_null = sink_supported ? null_sk : null_std;
             Scalar best_alt = sink_supported ? alt_sk : alt_std;
 

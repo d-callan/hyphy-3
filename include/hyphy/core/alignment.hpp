@@ -19,10 +19,12 @@ struct Sequence {
     std::string name;
     std::string raw_seq;
     std::vector<int8_t> codons; // sense codon indices (or -1 for gap/stop/ambiguous)
+    std::vector<uint64_t> codon_masks; // resolved sense-codon bitmask for each codon site
 };
 
 struct SitePattern {
     std::vector<int8_t> states; // State per taxon (size = num_taxa)
+    std::vector<uint64_t> ambiguous_masks; // Bitmask of compatible states when states[t] < 0
     size_t weight = 0;          // Number of alignment sites matching this pattern
     std::vector<size_t> sites;  // Original site indices
 };
@@ -56,6 +58,10 @@ public:
     // Codon frequencies (sense codons)
     Vector codon_frequencies_f1x4;
     Vector codon_frequencies_f3x4;
+
+    // Optional alignment quality & Partial Order Alignment (POA) metadata from JointAlignEngine
+    std::vector<Scalar> site_homology_posteriors; // Posterior column confidence in [0, 1] per codon site
+    std::string poa_gfa;                          // GFAv1 Partial Order Alignment codon DAG representation
 
     static std::string read_file_or_gzip(const std::string& filepath) {
         std::ifstream test_f(filepath, std::ios::binary);
@@ -421,11 +427,18 @@ public:
         // Convert raw sequence to codons using genetic code
         for (auto& s : sequences) {
             s.codons.resize(num_codons, -1);
+            s.codon_masks.resize(num_codons, 0);
             for (size_t c = 0; c < num_codons; ++c) {
                 char c1 = s.raw_seq[c * 3];
                 char c2 = s.raw_seq[c * 3 + 1];
                 char c3 = s.raw_seq[c * 3 + 2];
-                s.codons[c] = code->triplet_to_sense(c1, c2, c3);
+                int8_t st = code->triplet_to_sense(c1, c2, c3);
+                s.codons[c] = st;
+                if (st >= 0) {
+                    s.codon_masks[c] = (uint64_t(1) << st);
+                } else {
+                    s.codon_masks[c] = code->resolve_triplet_mask(c1, c2, c3);
+                }
             }
         }
 
@@ -470,11 +483,14 @@ public:
         for (size_t site = 0; site < num_nucleotides; ++site) {
             std::string col(num_taxa, 'N');
             std::vector<int8_t> states(num_taxa, -1);
+            std::vector<uint64_t> masks(num_taxa, 0);
 
             for (size_t t = 0; t < num_taxa; ++t) {
                 char nuc = sequences[t].raw_seq[site];
-                col[t] = nuc;
+                uint8_t m = char_to_iupac_mask(nuc);
+                col[t] = static_cast<char>('A' + m);
                 states[t] = char_to_nuc(nuc);
+                masks[t] = static_cast<uint64_t>(m);
             }
 
             auto it = pattern_map.find(col);
@@ -489,6 +505,7 @@ public:
 
                 SitePattern p;
                 p.states = std::move(states);
+                p.ambiguous_masks = std::move(masks);
                 p.weight = 1;
                 p.sites.push_back(site);
                 patterns.push_back(std::move(p));
@@ -549,11 +566,14 @@ public:
         for (size_t site = 0; site < num_nucleotides; ++site) {
             std::string col(num_taxa, 'N');
             std::vector<int8_t> states(num_taxa, -1);
+            std::vector<uint64_t> masks(num_taxa, 0);
 
             for (size_t t = 0; t < num_taxa; ++t) {
                 char nuc = sequences[t].raw_seq[site];
-                col[t] = nuc;
+                uint8_t m = char_to_iupac_mask(nuc);
+                col[t] = static_cast<char>('A' + m);
                 states[t] = char_to_nuc(nuc);
+                masks[t] = static_cast<uint64_t>(m);
             }
 
             auto it = pattern_map.find(col);
@@ -567,10 +587,11 @@ public:
                 pattern_map[col] = p_idx;
 
                 SitePattern p;
-                p.states = states;
+                p.states = std::move(states);
+                p.ambiguous_masks = std::move(masks);
                 p.weight = 1;
                 p.sites.push_back(site);
-                nuc_aln.patterns.push_back(p);
+                nuc_aln.patterns.push_back(std::move(p));
                 nuc_aln.site_to_pattern[site] = p_idx;
             }
         }
@@ -602,11 +623,31 @@ private:
         if (total_nucs > 0.0) {
             nuc_frequencies = nuc_counts / total_nucs;
         }
+        bool padded_nuc = false;
+        for (int b = 0; b < 4; ++b) {
+            if (nuc_frequencies(b) < 1e-8) {
+                nuc_frequencies(b) = 1e-8;
+                padded_nuc = true;
+            }
+        }
+        if (padded_nuc) {
+            nuc_frequencies /= nuc_frequencies.sum();
+        }
 
         for (int pos = 0; pos < 3; ++pos) {
             Scalar pos_total = pos_counts.row(pos).sum();
             if (pos_total > 0.0) {
                 pos_nuc_frequencies.row(pos) = pos_counts.row(pos) / pos_total;
+            }
+            bool padded_pos = false;
+            for (int b = 0; b < 4; ++b) {
+                if (pos_nuc_frequencies(pos, b) < 1e-8) {
+                    pos_nuc_frequencies(pos, b) = 1e-8;
+                    padded_pos = true;
+                }
+            }
+            if (padded_pos) {
+                pos_nuc_frequencies.row(pos) /= pos_nuc_frequencies.row(pos).sum();
             }
         }
 
@@ -630,7 +671,8 @@ private:
 
         // Compute Corrected F3x4 (CF3x4) using fixed-point iteration matching HyPhy
         Eigen::Matrix<Scalar, 3, 4> p_cur = pos_nuc_frequencies;
-        for (int it = 0; it < 50; ++it) {
+        for (int it = 0; it < 200; ++it) {
+            Eigen::Matrix<Scalar, 3, 4> p_prev = p_cur;
             Scalar sum_cf3x4 = 0.0;
             for (int idx = 0; idx < S; ++idx) {
                 const auto& codon = code->sense_codons[idx];
@@ -664,6 +706,10 @@ private:
                     p_cur.row(pos) /= s;
                 }
             }
+
+            if ((p_cur - p_prev).cwiseAbs().maxCoeff() < 1e-14) {
+                break;
+            }
         }
 
         // Final CF3x4 normalize
@@ -686,31 +732,48 @@ private:
         patterns.clear();
         site_to_pattern.resize(num_codons);
 
-        // Pattern hash map
+        struct PatternKey {
+            std::vector<int8_t> states;
+            std::vector<uint64_t> masks;
+            bool operator==(const PatternKey& o) const {
+                return states == o.states && masks == o.masks;
+            }
+        };
+
         struct PatternHash {
-            size_t operator()(const std::vector<int8_t>& v) const {
-                size_t h = v.size();
-                for (auto x : v) {
-                    h ^= static_cast<size_t>(x + 1) + 0x9e3779b9 + (h << 6) + (h >> 2);
+            size_t operator()(const PatternKey& k) const {
+                size_t h = k.states.size();
+                for (size_t i = 0; i < k.states.size(); ++i) {
+                    size_t v = (k.states[i] >= 0)
+                        ? static_cast<size_t>(k.states[i] + 1)
+                        : static_cast<size_t>(k.masks[i] ^ (k.masks[i] >> 32));
+                    h ^= v + 0x9e3779b9 + (h << 6) + (h >> 2);
                 }
                 return h;
             }
         };
 
-        std::unordered_map<std::vector<int8_t>, size_t, PatternHash> pattern_map;
+        std::unordered_map<PatternKey, size_t, PatternHash> pattern_map;
 
-        std::vector<int8_t> col_states(num_taxa);
+        PatternKey key;
+        key.states.resize(num_taxa);
+        key.masks.resize(num_taxa);
+
         for (size_t c = 0; c < num_codons; ++c) {
             for (size_t t = 0; t < num_taxa; ++t) {
-                col_states[t] = sequences[t].codons[c];
+                key.states[t] = sequences[t].codons[c];
+                key.masks[t] = (sequences[t].codon_masks.size() > c)
+                    ? sequences[t].codon_masks[c]
+                    : ((key.states[t] >= 0) ? (uint64_t(1) << key.states[t]) : ~uint64_t(0));
             }
 
-            auto it = pattern_map.find(col_states);
+            auto it = pattern_map.find(key);
             if (it == pattern_map.end()) {
                 size_t new_idx = patterns.size();
-                pattern_map[col_states] = new_idx;
+                pattern_map[key] = new_idx;
                 SitePattern p;
-                p.states = col_states;
+                p.states = key.states;
+                p.ambiguous_masks = key.masks;
                 p.weight = 1;
                 p.sites.push_back(c);
                 patterns.push_back(std::move(p));

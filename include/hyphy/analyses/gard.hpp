@@ -1036,7 +1036,7 @@ public:
             std::cout << "[GARD] Fitting baseline (single-partition; no breakpoints) model...\n";
         }
 
-        core::Tree baseline_tree = (settings.tree_method == GARDTreeMethod::Ohmic)
+        core::Tree baseline_tree = (settings.tree_method == GARDTreeMethod::Ohmic && result.num_taxa > 50)
             ? TreeEngine::build_spectral_scaffold(alignment)
             : core::NeighborJoining::infer(alignment);
         opt::GTRFitter baseline_fitter(baseline_tree, alignment);
@@ -1130,7 +1130,7 @@ public:
             }
 
             core::Alignment slice = alignment.slice_nucleotide(start, end);
-            core::Tree seg_tree = (settings.tree_method == GARDTreeMethod::Ohmic)
+            core::Tree seg_tree = (settings.tree_method == GARDTreeMethod::Ohmic && result.num_taxa > 50)
                 ? TreeEngine::build_spectral_scaffold(slice)
                 : core::NeighborJoining::infer(slice);
             int passes = (settings.run_mode == "Faster") ? 1 : 2;
@@ -1634,7 +1634,7 @@ public:
                         } else {
                             auto [opt_t, _] = fit_gtr_segment_srv(
                                 best_overall_model.partitions[t].tree, slice, result.baseline_rates, result.baseline_frequencies,
-                                result.gamma_rates, result.gamma_weights, passes
+                                result.gamma_rates, result.gamma_weights, std::max(passes, 3)
                             );
                             tree_to_eval = std::move(opt_t);
                         }
@@ -1691,15 +1691,17 @@ public:
                     bp_test.kh_p_value_right = kh_R.p_rell;
                     bp_test.sh_p_value_right = (sh_R.best_index == 0) ? sh_R.p_values[1] : sh_R.p_values[0];
 
-                    // Significance decision
-                    bool sig_kh = (bp_test.kh_p_value_left < 0.05 || bp_test.kh_p_value_right < 0.05);
-                    bool sig_sh = (bp_test.sh_p_value_left < 0.05 || bp_test.sh_p_value_right < 0.05);
+                    // Significance decision (Kosakovsky Pond et al. 2006: both flanking segments must
+                    // significantly reject congruence after Bonferroni correction for 2 * num_bp tests)
+                    Scalar bonf_alpha = 0.05 / static_cast<Scalar>(2 * std::max<size_t>(1, num_bp));
+                    bool sig_kh = (bp_test.kh_p_value_left <= bonf_alpha && bp_test.kh_p_value_right <= bonf_alpha);
+                    bool sig_sh = (bp_test.sh_p_value_left <= bonf_alpha && bp_test.sh_p_value_right <= bonf_alpha);
                     if (settings.topology_test_mode == GARDTopologyTestMode::KH) {
                         bp_test.statistically_significant = sig_kh;
                     } else if (settings.topology_test_mode == GARDTopologyTestMode::SH) {
                         bp_test.statistically_significant = sig_sh;
                     } else { // Both
-                        bp_test.statistically_significant = sig_sh || sig_kh;
+                        bp_test.statistically_significant = sig_kh || sig_sh;
                     }
 
                     if (bp_test.statistically_significant) any_sig = true;

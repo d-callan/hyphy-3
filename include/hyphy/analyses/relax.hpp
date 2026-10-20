@@ -46,8 +46,11 @@ struct RELAXModelFit {
     size_t parameters = 0;
     Scalar tree_scale = 1.0;
     Scalar k = 1.0;
+    int realized_cycles = 0;
+    bool converged = false;
     RELAXRateDistribution reference_distribution;
     RELAXRateDistribution test_distribution;
+    RELAXRateDistribution unclassified_distribution;
     std::vector<Scalar> branch_lengths;
     std::vector<Scalar> site_log_likelihoods;
 };
@@ -92,7 +95,7 @@ struct RELAXSettings {
     bool reference_is_regex = false;
     bool refine_branch_lengths = true;
     // Alternating (distribution <-> branch lengths) optimization after the tree-scale fit.
-    int max_joint_cycles = 5;
+    int max_joint_cycles = 15;
     Scalar joint_tolerance = 1e-3;
     bool verbose = false;
 };
@@ -118,6 +121,7 @@ struct RELAXResult {
     // Phase 3 & 4: RELAX fits
     RELAXModelFit alternative_fit;
     RELAXModelFit null_fit;
+    std::vector<Scalar> branch_switched_evidence_ratios;
 
     // Phase 5: Hypothesis testing
     Scalar lrt = 0.0;
@@ -184,6 +188,24 @@ public:
     std::vector<std::string> unclassified_branch_names;
     std::unordered_map<std::string, std::string> branch_class;
     Scalar unclassified_omega = 1.0;
+    std::vector<Scalar> omegas_uncl = {0.05, 0.50, 2.0};
+    std::vector<Scalar> weights_uncl = {0.50, 0.40, 0.10};
+
+    // Neumaier compensated summation helper for deterministic across-thread reductions
+    static Scalar neumaier_sum(const std::vector<Scalar>& vals) {
+        Scalar sum = 0.0;
+        Scalar c = 0.0;
+        for (Scalar v : vals) {
+            Scalar t = sum + v;
+            if (std::abs(sum) >= std::abs(v)) {
+                c += (sum - t) + v;
+            } else {
+                c += (v - t) + sum;
+            }
+            sum = t;
+        }
+        return sum + c;
+    }
 
     RELAXAnalyzer(
         Tree t,
@@ -299,13 +321,16 @@ public:
         // Tags present in the tree
         std::vector<std::string> tags_present;
         for (const auto& node : tree.nodes) {
+            if (node.id != tree.root_id) continue;
+        }
+        for (const auto& node : tree.nodes) {
             if (node.id == tree.root_id) continue;
             std::string tl = node_tag(node);
             if (!tl.empty() && std::find(tags_present.begin(), tags_present.end(), tl) == tags_present.end()) {
                 tags_present.push_back(tl);
             }
         }
-        // Selects branches carrying tag `q` (exact) or, failing that, any tag of q's alias group.
+        // Selects branches carrying tag `q` (exact, case-insensitive) or, failing that, any tag of q's alias group.
         auto select_tag = [&](const std::string& q) -> bool {
             bool exact = std::find(tags_present.begin(), tags_present.end(), q) != tags_present.end();
             int grp = alias_group(q);
@@ -354,9 +379,10 @@ public:
                 std::string t = trim_ws(tok);
                 if (t.empty()) continue;
                 bool hit = false;
+                std::string tl_tok = to_lower(t);
                 for (const auto& node : tree.nodes) {
                     if (node.id == tree.root_id) continue;
-                    if (node.name == t) { sel[node.id] = true; hit = true; }
+                    if (node.name == t || to_lower(node.name) == tl_tok) { sel[node.id] = true; hit = true; }
                 }
                 if (!hit) hit = select_keyword(to_lower(trim_tag(t)));
                 if (!hit) hit = select_tag(to_lower(trim_tag(t)));
@@ -392,18 +418,28 @@ public:
             while (!s.empty() && (std::isspace(static_cast<unsigned char>(s.back())) || s.back() == '}')) s.pop_back();
             return s;
         };
+        auto canonical_group = [](const std::string& tl) -> std::string {
+            if (tl.empty()) return "";
+            if (tl == "t" || tl == "test" || tl == "fg" || tl == "foreground") return "__test__";
+            if (tl == "r" || tl == "ref" || tl == "reference" || tl == "bg" || tl == "background") return "__ref__";
+            return tl;
+        };
 
         bool has_tagged_test = false;
         bool has_tagged_ref = false;
+        std::vector<std::string> distinct_tag_groups;
 
         for (const auto& node : tree.nodes) {
-            if (node.id != tree.root_id && !node.model_tag.empty()) {
-                std::string tl = to_lower(trim(node.model_tag));
-                if (tl == "t" || tl == "test" || tl == "fg" || tl == "foreground") {
-                    has_tagged_test = true;
-                } else if (tl == "r" || tl == "ref" || tl == "reference" || tl == "bg" || tl == "background") {
-                    has_tagged_ref = true;
-                }
+            if (node.id == tree.root_id) continue;
+            std::string tl = to_lower(trim(node.model_tag));
+            std::string grp = canonical_group(tl);
+            if (std::find(distinct_tag_groups.begin(), distinct_tag_groups.end(), grp) == distinct_tag_groups.end()) {
+                distinct_tag_groups.push_back(grp);
+            }
+            if (grp == "__test__") {
+                has_tagged_test = true;
+            } else if (grp == "__ref__") {
+                has_tagged_ref = true;
             }
         }
 
@@ -419,6 +455,8 @@ public:
             ref_sel = resolve_branch_spec(settings.reference_branch_regex, settings.reference_branch_names,
                                           settings.reference_is_regex, "--reference");
         }
+
+        const bool multi_group_tree = (distinct_tag_groups.size() > 2);
 
         for (const auto& node : tree.nodes) {
             if (node.id == tree.root_id) continue;
@@ -438,7 +476,7 @@ public:
                 } else if (has_tagged_ref) {
                     std::string tl = to_lower(trim(node.model_tag));
                     is_ref = (tl == "r" || tl == "ref" || tl == "reference" || tl == "bg" || tl == "background");
-                } else {
+                } else if (!multi_group_tree) {
                     is_ref = true;
                 }
             }
@@ -499,12 +537,19 @@ public:
         Scalar k,
         Scalar tree_scale,
         std::vector<Scalar>* out_site_ll = nullptr,
-        const std::vector<Scalar>* custom_branch_lengths = nullptr
+        const std::vector<Scalar>* custom_branch_lengths = nullptr,
+        const MG94Parameters* custom_base_params = nullptr,
+        const std::vector<Scalar>* custom_omegas_uncl = nullptr,
+        const std::vector<Scalar>* custom_weights_uncl = nullptr
     ) const {
         size_t num_patterns = aln.patterns.size();
         size_t num_nodes = t.num_nodes();
         size_t S = code->num_sense_codons;
         const Vector& eq_freqs = aln.codon_frequencies_f3x4;
+        const MG94Parameters& bp = custom_base_params ? *custom_base_params : base_params;
+        const bool has_unclassified = !unclassified_branch_names.empty();
+        const std::vector<Scalar>& om_U = custom_omegas_uncl ? *custom_omegas_uncl : omegas_uncl;
+        const std::vector<Scalar>& wt_U = custom_weights_uncl ? *custom_weights_uncl : weights_uncl;
 
         // Derive Test branch omegas: omega_T,i = (omega_R,i)^k
         std::vector<Scalar> omegas_T(3);
@@ -519,32 +564,27 @@ public:
         // Precompute transition matrices for all 3 classes across all tree branches
         std::vector<std::vector<Matrix>> P_branches(3, std::vector<Matrix>(num_nodes));
 
-        MG94Matrix mat_U;
-        Scalar conv_U = 1.0;
-        if (!unclassified_branch_names.empty()) {
-            MG94Parameters p_U = base_params;
-            p_U.alpha = 1.0;
-            p_U.beta = unclassified_omega;
-            mat_U.update(p_U, aln.pos_nuc_frequencies, aln.codon_frequencies_f3x4, *code);
-            conv_U = (mat_U.scale_factor > 1e-12) ? (3.0 / mat_U.scale_factor) : 1.0;
-        }
-
-        std::vector<MG94Matrix> mats_R(3), mats_T(3);
+        std::vector<MG94Matrix> mats_R(3), mats_T(3), mats_U(3);
+        const int n_mat_jobs = has_unclassified ? 9 : 6;
         #pragma omp parallel for schedule(static)
-        for (int job = 0; job < 6; ++job) {
+        for (int job = 0; job < n_mat_jobs; ++job) {
             const int c = job % 3;
-            MG94Parameters p = base_params;
+            MG94Parameters p = bp;
             p.alpha = 1.0;
             if (job < 3) {
                 p.beta = omegas_R[c];
                 mats_R[c].update(p, aln.pos_nuc_frequencies, aln.codon_frequencies_f3x4, *code);
-            } else {
+            } else if (job < 6) {
                 p.beta = omegas_T[c];
                 mats_T[c].update(p, aln.pos_nuc_frequencies, aln.codon_frequencies_f3x4, *code);
+            } else {
+                p.beta = om_U[c];
+                mats_U[c].update(p, aln.pos_nuc_frequencies, aln.codon_frequencies_f3x4, *code);
             }
         }
         const std::vector<Scalar> convs_R = class_conversion_factors(mats_R, weights);
         const std::vector<Scalar> convs_T = class_conversion_factors(mats_T, weights);
+        const std::vector<Scalar> convs_U = has_unclassified ? class_conversion_factors(mats_U, wt_U) : std::vector<Scalar>{1.0, 1.0, 1.0};
 
         const bool branch_site = (settings.mixture_level == RELAXMixtureLevel::BranchSite);
         std::vector<int> branch_ids;
@@ -556,17 +596,19 @@ public:
         // Transition matrices for every (class, branch); classes with zero weight are never used
         // by the pruning below and are skipped. In BranchSite mode the classes are mixed inside
         // each branch matrix (stored in slot 0), so pruning runs once with a single class.
-        #pragma omp parallel for schedule(dynamic)
+        #pragma omp parallel for schedule(static)
         for (size_t bi = 0; bi < branch_ids.size(); ++bi) {
             const int nid = branch_ids[bi];
             const auto& node = t.nodes[nid];
             Scalar bl = custom_branch_lengths ? (*custom_branch_lengths)[nid] : (node.branch_length * tree_scale);
+            const int part = branch_partition[nid];
+            const std::vector<Scalar>& br_w = (part == 2) ? wt_U : weights;
             for (int c = 0; c < 3; ++c) {
-                if (weights[c] <= 1e-12) continue;
-                if (branch_partition[nid] == 1) {
+                if (br_w[c] <= 1e-12 && (branch_site || weights[c] <= 1e-12)) continue;
+                if (part == 1) {
                     P_branches[c][nid] = mats_T[c].transition_matrix(bl * convs_T[c]);
-                } else if (branch_partition[nid] == 2) {
-                    P_branches[c][nid] = mat_U.transition_matrix(bl * conv_U);
+                } else if (part == 2) {
+                    P_branches[c][nid] = mats_U[c].transition_matrix(bl * convs_U[c]);
                 } else {
                     P_branches[c][nid] = mats_R[c].transition_matrix(bl * convs_R[c]);
                 }
@@ -574,8 +616,8 @@ public:
             if (branch_site) {
                 Matrix P_mix = Matrix::Zero(S, S);
                 for (int c = 0; c < 3; ++c) {
-                    if (weights[c] <= 1e-12) continue;
-                    P_mix.noalias() += weights[c] * P_branches[c][nid];
+                    if (br_w[c] <= 1e-12) continue;
+                    P_mix.noalias() += br_w[c] * P_branches[c][nid];
                 }
                 P_branches[0][nid] = std::move(P_mix);
             }
@@ -586,103 +628,71 @@ public:
             class_w = {1.0, 0.0, 0.0};
         }
 
-        std::vector<Scalar> pattern_ll(num_patterns, 0.0);
-        Scalar total_lnl = 0.0;
+        std::vector<Scalar> pattern_ll(num_patterns, -1e20);
+        std::vector<Scalar> weighted_pattern_ll(num_patterns, 0.0);
+        int n_threads = LikelihoodEngine::optimal_omp_threads(num_patterns, 32);
+        const size_t tile_size = std::max<size_t>(16, std::min<size_t>(256, (num_patterns + std::max(1, n_threads) - 1) / std::max(1, n_threads)));
+        const size_t num_tiles = (num_patterns + tile_size - 1) / tile_size;
 
-        #pragma omp parallel
+        #pragma omp parallel num_threads(n_threads)
         {
-            std::vector<Vector> node_L(num_nodes, Vector::Zero(S));
-            std::vector<double> node_log_scale(num_nodes, 0.0);
+            LikelihoodEngine::BatchedInsideWorkspace ws;
+            ws.init(num_nodes, S, tile_size);
+            Eigen::MatrixXd terms_mat(3, tile_size);
 
-            #pragma omp for reduction(+:total_lnl) schedule(dynamic)
-            for (size_t p = 0; p < num_patterns; ++p) {
-                const auto& pattern = aln.patterns[p];
-                Scalar pll = -1e20;
+            #pragma omp for schedule(static)
+            for (size_t tile = 0; tile < num_tiles; ++tile) {
+                size_t p_start = tile * tile_size;
+                size_t p_end = std::min(num_patterns, p_start + tile_size);
+                Eigen::Index B = static_cast<Eigen::Index>(p_end - p_start);
 
                 if (branch_site) {
-                    for (int32_t nid : t.post_order) {
-                        const auto& node = t.nodes[nid];
-                        if (node.is_leaf) {
-                            size_t t_idx = leaf_to_taxon[nid];
-                            if (t_idx != static_cast<size_t>(-1)) {
-                                int code_val = pattern.states[t_idx];
-                                if (code_val >= 0 && code_val < static_cast<int>(S)) {
-                                    node_L[nid].setZero();
-                                    node_L[nid](code_val) = 1.0;
-                                } else {
-                                    node_L[nid].setOnes();
-                                }
-                            } else {
-                                node_L[nid].setOnes();
-                            }
-                            node_log_scale[nid] = 0.0;
-                        } else {
-                            double child_scale_sum = 0.0;
-                            t.eval_internal_node(nid, P_branches[0], node_L, node_log_scale, node_L[nid], child_scale_sum);
-                            node_log_scale[nid] = child_scale_sum;
-                        }
-                    }
-
-                    Scalar class_L = eq_freqs.dot(node_L[t.root_id]);
-                    if (class_L > 0.0) {
-                        pll = std::log(class_L) + node_log_scale[t.root_id];
+                    LikelihoodEngine::compute_inside_batch_in_place(
+                        t, aln, p_start, p_end, leaf_to_taxon, P_branches[0], eq_freqs, S, ws
+                    );
+                    for (Eigen::Index b = 0; b < B; ++b) {
+                        size_t p = p_start + b;
+                        Scalar pll = ws.root_log_L(b);
+                        weighted_pattern_ll[p] = aln.patterns[p].weight * pll;
+                        if (out_site_ll) pattern_ll[p] = pll;
                     }
                 } else {
-                    Scalar max_term = -std::numeric_limits<Scalar>::infinity();
-                    std::array<Scalar, 3> terms;
-                    std::array<bool, 3> valid = {false, false, false};
-
+                    terms_mat.leftCols(B).setConstant(-std::numeric_limits<Scalar>::infinity());
                     for (int c = 0; c < 3; ++c) {
                         if (class_w[c] <= 1e-12) continue;
-
-                        for (int32_t nid : t.post_order) {
-                            const auto& node = t.nodes[nid];
-                            if (node.is_leaf) {
-                                size_t t_idx = leaf_to_taxon[nid];
-                                if (t_idx != static_cast<size_t>(-1)) {
-                                    int code_val = pattern.states[t_idx];
-                                    if (code_val >= 0 && code_val < static_cast<int>(S)) {
-                                        node_L[nid].setZero();
-                                        node_L[nid](code_val) = 1.0;
-                                    } else {
-                                        node_L[nid].setOnes();
-                                    }
-                                } else {
-                                    node_L[nid].setOnes();
-                                }
-                                node_log_scale[nid] = 0.0;
-                            } else {
-                                double child_scale_sum = 0.0;
-                                t.eval_internal_node(nid, P_branches[c], node_L, node_log_scale, node_L[nid], child_scale_sum);
-                                node_log_scale[nid] = child_scale_sum;
+                        Scalar log_cw = std::log(class_w[c]);
+                        LikelihoodEngine::compute_inside_batch_in_place(
+                            t, aln, p_start, p_end, leaf_to_taxon, P_branches[c], eq_freqs, S, ws
+                        );
+                        for (Eigen::Index b = 0; b < B; ++b) {
+                            if (ws.root_L(b) > 0.0) {
+                                terms_mat(c, b) = log_cw + ws.root_log_L(b);
                             }
                         }
-
-                        Scalar class_L = eq_freqs.dot(node_L[t.root_id]);
-                        if (class_L > 0.0) {
-                            Scalar term = std::log(class_w[c]) + std::log(class_L) + node_log_scale[t.root_id];
-                            terms[c] = term;
-                            valid[c] = true;
-                            if (term > max_term) max_term = term;
-                        }
                     }
-
-                    if (max_term > -1e19) {
-                        Scalar sum_exp = 0.0;
-                        for (int c = 0; c < 3; ++c) {
-                            if (valid[c]) sum_exp += std::exp(terms[c] - max_term);
+                    for (Eigen::Index b = 0; b < B; ++b) {
+                        Scalar max_term = terms_mat.col(b).maxCoeff();
+                        Scalar pll = -1e20;
+                        if (max_term > -1e19) {
+                            Scalar sum_exp = 0.0;
+                            for (int c = 0; c < 3; ++c) {
+                                if (terms_mat(c, b) > -1e19) {
+                                    sum_exp += std::exp(terms_mat(c, b) - max_term);
+                                }
+                            }
+                            if (sum_exp > 0.0) {
+                                pll = max_term + std::log(sum_exp);
+                            }
                         }
-                        if (sum_exp > 0.0) {
-                            pll = max_term + std::log(sum_exp);
-                        }
+                        size_t p = p_start + b;
+                        weighted_pattern_ll[p] = aln.patterns[p].weight * pll;
+                        if (out_site_ll) pattern_ll[p] = pll;
                     }
-                }
-                total_lnl += pattern.weight * pll;
-                if (out_site_ll) {
-                    pattern_ll[p] = pll;
                 }
             }
         }
+
+        Scalar total_lnl = neumaier_sum(weighted_pattern_ll);
 
         if (out_site_ll) {
             out_site_ll->resize(aln.num_codons);
@@ -695,17 +705,24 @@ public:
     }
 
     // Evaluates log-likelihood and exact analytical branch gradients d ln L / d t_b
-    // under the 3-category RELAX mixture model using Inside-Outside adjoints
+    // under the 3-category RELAX mixture model using batched Inside-Outside GEMM adjoints
     std::pair<Scalar, std::vector<Scalar>> compute_relax_branch_gradients(
         const std::vector<Scalar>& branch_lengths,
         const std::vector<Scalar>& omegas_R,
         const std::vector<Scalar>& weights,
-        Scalar k
+        Scalar k,
+        const MG94Parameters* custom_base_params = nullptr,
+        const std::vector<Scalar>* custom_omegas_uncl = nullptr,
+        const std::vector<Scalar>* custom_weights_uncl = nullptr
     ) const {
         size_t num_nodes = tree.num_nodes();
         size_t num_patterns = aln.patterns.size();
         int S = code->num_sense_codons;
         const Vector& eq_freqs = aln.codon_frequencies_f3x4;
+        const MG94Parameters& bp = custom_base_params ? *custom_base_params : base_params;
+        const bool has_unclassified = !unclassified_branch_names.empty();
+        const std::vector<Scalar>& om_U = custom_omegas_uncl ? *custom_omegas_uncl : omegas_uncl;
+        const std::vector<Scalar>& wt_U = custom_weights_uncl ? *custom_weights_uncl : weights_uncl;
 
         // Derive Test branch omegas: omega_T,i = (omega_R,i)^k
         std::vector<Scalar> omegas_T(3);
@@ -721,37 +738,33 @@ public:
         std::vector<std::vector<Matrix>> P_c(3, std::vector<Matrix>(num_nodes));
         std::vector<std::vector<Matrix>> dP_c(3, std::vector<Matrix>(num_nodes));
 
-        MG94Matrix mat_U;
-        Scalar conv_U = 1.0;
-        if (!unclassified_branch_names.empty()) {
-            MG94Parameters p_U = base_params;
-            p_U.alpha = 1.0;
-            p_U.beta = unclassified_omega;
-            mat_U.update(p_U, aln.pos_nuc_frequencies, aln.codon_frequencies_f3x4, *code);
-            conv_U = (mat_U.scale_factor > 1e-12) ? (3.0 / mat_U.scale_factor) : 1.0;
-        }
-
         const bool shared_norm = (settings.normalization == RELAXNormalization::SharedMixture);
         const bool branch_site = (settings.mixture_level == RELAXMixtureLevel::BranchSite);
-        std::vector<MG94Matrix> mats_R(3), mats_T(3);
+        std::vector<MG94Matrix> mats_R(3), mats_T(3), mats_U(3);
+        const int n_mat_jobs = has_unclassified ? 9 : 6;
         #pragma omp parallel for schedule(static)
-        for (int job = 0; job < 6; ++job) {
+        for (int job = 0; job < n_mat_jobs; ++job) {
             const int c = job % 3;
             // PerClass only needs matrices for classes that contribute; SharedMixture needs
             // every class's mean rate for the mixture normalization.
-            if (weights[c] <= 1e-12 && !shared_norm) continue;
-            MG94Parameters p = base_params;
+            const std::vector<Scalar>& jw = (job >= 6) ? wt_U : weights;
+            if (jw[c] <= 1e-12 && !shared_norm) continue;
+            MG94Parameters p = bp;
             p.alpha = 1.0;
             if (job < 3) {
                 p.beta = omegas_R[c];
                 mats_R[c].update(p, aln.pos_nuc_frequencies, aln.codon_frequencies_f3x4, *code);
-            } else {
+            } else if (job < 6) {
                 p.beta = omegas_T[c];
                 mats_T[c].update(p, aln.pos_nuc_frequencies, aln.codon_frequencies_f3x4, *code);
+            } else {
+                p.beta = om_U[c];
+                mats_U[c].update(p, aln.pos_nuc_frequencies, aln.codon_frequencies_f3x4, *code);
             }
         }
         const std::vector<Scalar> convs_R = class_conversion_factors(mats_R, weights);
         const std::vector<Scalar> convs_T = class_conversion_factors(mats_T, weights);
+        const std::vector<Scalar> convs_U = has_unclassified ? class_conversion_factors(mats_U, wt_U) : std::vector<Scalar>{1.0, 1.0, 1.0};
 
         std::vector<int> branch_ids;
         branch_ids.reserve(num_nodes);
@@ -762,19 +775,21 @@ public:
         // P and dP/dt for every contributing (class, branch), built in parallel over branches.
         // In BranchSite mode the classes are mixed into slot 0:
         //   P_mix = sum_c w_c P_c,  dP_mix = sum_c w_c conv_c Q_c P_c.
-        #pragma omp parallel for schedule(dynamic)
+        #pragma omp parallel for schedule(static)
         for (size_t bi = 0; bi < branch_ids.size(); ++bi) {
             const int nid = branch_ids[bi];
             const Scalar bl = branch_lengths[nid];
+            const int part = branch_partition[nid];
+            const std::vector<Scalar>& br_w = (part == 2) ? wt_U : weights;
             for (int c = 0; c < 3; ++c) {
-                if (weights[c] <= 1e-12) continue;
-                if (branch_partition[nid] == 1) {
+                if (br_w[c] <= 1e-12 && (branch_site || weights[c] <= 1e-12)) continue;
+                if (part == 1) {
                     Matrix P = mats_T[c].transition_matrix(bl * convs_T[c]);
                     dP_c[c][nid] = convs_T[c] * (mats_T[c].Q * P);
                     P_c[c][nid] = std::move(P);
-                } else if (branch_partition[nid] == 2) {
-                    Matrix P = mat_U.transition_matrix(bl * conv_U);
-                    dP_c[c][nid] = conv_U * (mat_U.Q * P);
+                } else if (part == 2) {
+                    Matrix P = mats_U[c].transition_matrix(bl * convs_U[c]);
+                    dP_c[c][nid] = convs_U[c] * (mats_U[c].Q * P);
                     P_c[c][nid] = std::move(P);
                 } else {
                     Matrix P = mats_R[c].transition_matrix(bl * convs_R[c]);
@@ -786,9 +801,9 @@ public:
                 Matrix P_mix = Matrix::Zero(S, S);
                 Matrix dP_mix = Matrix::Zero(S, S);
                 for (int c = 0; c < 3; ++c) {
-                    if (weights[c] <= 1e-12) continue;
-                    P_mix.noalias() += weights[c] * P_c[c][nid];
-                    dP_mix.noalias() += weights[c] * dP_c[c][nid];
+                    if (br_w[c] <= 1e-12) continue;
+                    P_mix.noalias() += br_w[c] * P_c[c][nid];
+                    dP_mix.noalias() += br_w[c] * dP_c[c][nid];
                 }
                 P_c[0][nid] = std::move(P_mix);
                 dP_c[0][nid] = std::move(dP_mix);
@@ -800,86 +815,115 @@ public:
             class_w = {1.0, 0.0, 0.0};
         }
 
-        Scalar total_log_l = 0.0;
-        std::vector<Scalar> grad_b(num_nodes, 0.0);
+        std::vector<Scalar> pattern_ll(num_patterns, 0.0);
+        Matrix pattern_grad = Matrix::Zero(num_nodes, num_patterns);
+        int n_threads = LikelihoodEngine::optimal_omp_threads(num_patterns, 32);
+        const size_t tile_size = std::max<size_t>(16, std::min<size_t>(256, (num_patterns + std::max(1, n_threads) - 1) / std::max(1, n_threads)));
+        const size_t num_tiles = (num_patterns + tile_size - 1) / tile_size;
 
-        #pragma omp parallel
+        #pragma omp parallel num_threads(n_threads)
         {
-            std::vector<Scalar> local_grad(num_nodes, 0.0);
-            Scalar local_ll = 0.0;
+            std::array<LikelihoodEngine::BatchedInsideOutsideWorkspace, 3> io_c;
+            int n_active_ws = branch_site ? 1 : 3;
+            for (int c = 0; c < n_active_ws; ++c) io_c[c].init(num_nodes, S, tile_size);
+            Eigen::MatrixXd post_w(3, tile_size);
+            Matrix dP_D(S, tile_size);
 
-            #pragma omp for schedule(dynamic)
-            for (size_t p = 0; p < num_patterns; ++p) {
-                const auto& pattern = aln.patterns[p];
+            #pragma omp for schedule(static)
+            for (size_t tile = 0; tile < num_tiles; ++tile) {
+                size_t p_start = tile * tile_size;
+                size_t p_end = std::min(num_patterns, p_start + tile_size);
+                Eigen::Index B = static_cast<Eigen::Index>(p_end - p_start);
+
                 if (branch_site) {
-                    auto io = LikelihoodEngine::compute_inside_outside(
-                        tree, pattern, leaf_to_taxon, P_c[0], eq_freqs, S
+                    LikelihoodEngine::compute_inside_outside_batch_in_place(
+                        tree, aln, p_start, p_end, leaf_to_taxon, P_c[0], eq_freqs, S, io_c[0]
                     );
-                    if (io.likelihood > 0.0) {
-                        local_ll += pattern.weight * io.log_likelihood;
-                        Scalar inv_L = pattern.weight / io.likelihood;
-                        for (const auto& node : tree.nodes) {
-                            if (node.id != tree.root_id) {
-                                int32_t vid = node.id;
-                                Scalar dL_dt = io.V[vid].dot(dP_c[0][vid] * io.D[vid]);
-                                local_grad[vid] += inv_L * dL_dt;
+                    for (Eigen::Index b = 0; b < B; ++b) {
+                        size_t p = p_start + b;
+                        if (io_c[0].likelihood(b) > 0.0) {
+                            pattern_ll[p] = aln.patterns[p].weight * io_c[0].log_likelihood(b);
+                        }
+                    }
+                    auto dP_D_sub = dP_D.leftCols(B);
+                    for (const auto& node : tree.nodes) {
+                        if (node.id != tree.root_id) {
+                            int32_t vid = node.id;
+                            dP_D_sub.noalias() = dP_c[0][vid] * io_c[0].D[vid].leftCols(B);
+                            auto V_sub = io_c[0].V[vid].leftCols(B);
+                            for (Eigen::Index b = 0; b < B; ++b) {
+                                Scalar L_b = io_c[0].likelihood(b);
+                                if (L_b > 0.0) {
+                                    size_t p = p_start + b;
+                                    pattern_grad(vid, p) = (aln.patterns[p].weight / L_b) * V_sub.col(b).dot(dP_D_sub.col(b));
+                                }
                             }
                         }
                     }
                 } else {
-                    std::array<LikelihoodEngine::InsideOutsideResult, 3> io_c;
-                    Scalar max_ll = -std::numeric_limits<Scalar>::infinity();
+                    post_w.leftCols(B).setZero();
                     for (int c = 0; c < 3; ++c) {
                         if (class_w[c] <= 1e-12) continue;
-                        io_c[c] = LikelihoodEngine::compute_inside_outside(
-                            tree, pattern, leaf_to_taxon, P_c[c], eq_freqs, S
+                        LikelihoodEngine::compute_inside_outside_batch_in_place(
+                            tree, aln, p_start, p_end, leaf_to_taxon, P_c[c], eq_freqs, S, io_c[c]
                         );
-                        if (io_c[c].likelihood > 0.0) {
-                            Scalar term = std::log(class_w[c]) + io_c[c].log_likelihood;
-                            if (term > max_ll) max_ll = term;
-                        }
                     }
-
-                    if (max_ll > -1e19) {
-                        Scalar sum_exp = 0.0;
-                        std::array<Scalar, 3> post_w = {0.0, 0.0, 0.0};
+                    for (Eigen::Index b = 0; b < B; ++b) {
+                        Scalar max_ll = -std::numeric_limits<Scalar>::infinity();
                         for (int c = 0; c < 3; ++c) {
-                            if (class_w[c] > 1e-12 && io_c[c].likelihood > 0.0) {
-                                Scalar e = std::exp(std::log(class_w[c]) + io_c[c].log_likelihood - max_ll);
-                                post_w[c] = e;
-                                sum_exp += e;
+                            if (class_w[c] > 1e-12 && io_c[c].likelihood(b) > 0.0) {
+                                Scalar term = std::log(class_w[c]) + io_c[c].log_likelihood(b);
+                                if (term > max_ll) max_ll = term;
                             }
                         }
-                        if (sum_exp > 0.0) {
-                            Scalar pat_ll = max_ll + std::log(sum_exp);
-                            local_ll += pattern.weight * pat_ll;
-                            Scalar inv_sum = 1.0 / sum_exp;
-                            for (int c = 0; c < 3; ++c) post_w[c] *= inv_sum;
-
-                            for (const auto& node : tree.nodes) {
-                                if (node.id != tree.root_id) {
-                                    int32_t vid = node.id;
-                                    Scalar d_lnL_dt = 0.0;
-                                    for (int c = 0; c < 3; ++c) {
-                                        if (post_w[c] > 1e-12 && io_c[c].likelihood > 0.0) {
-                                            d_lnL_dt += post_w[c] * (io_c[c].V[vid].dot(dP_c[c][vid] * io_c[c].D[vid]) / io_c[c].likelihood);
-                                        }
+                        if (max_ll > -1e19) {
+                            Scalar sum_exp = 0.0;
+                            for (int c = 0; c < 3; ++c) {
+                                if (class_w[c] > 1e-12 && io_c[c].likelihood(b) > 0.0) {
+                                    Scalar e = std::exp(std::log(class_w[c]) + io_c[c].log_likelihood(b) - max_ll);
+                                    post_w(c, b) = e;
+                                    sum_exp += e;
+                                }
+                            }
+                            if (sum_exp > 0.0) {
+                                size_t p = p_start + b;
+                                pattern_ll[p] = aln.patterns[p].weight * (max_ll + std::log(sum_exp));
+                                post_w.col(b) /= sum_exp;
+                            }
+                        }
+                    }
+                    auto dP_D_sub = dP_D.leftCols(B);
+                    for (const auto& node : tree.nodes) {
+                        if (node.id != tree.root_id) {
+                            int32_t vid = node.id;
+                            for (int c = 0; c < 3; ++c) {
+                                if (class_w[c] <= 1e-12) continue;
+                                dP_D_sub.noalias() = dP_c[c][vid] * io_c[c].D[vid].leftCols(B);
+                                auto V_sub = io_c[c].V[vid].leftCols(B);
+                                for (Eigen::Index b = 0; b < B; ++b) {
+                                    Scalar pw = post_w(c, b);
+                                    Scalar L_b = io_c[c].likelihood(b);
+                                    if (pw > 1e-12 && L_b > 0.0) {
+                                        size_t p = p_start + b;
+                                        pattern_grad(vid, p) += aln.patterns[p].weight * pw * (V_sub.col(b).dot(dP_D_sub.col(b)) / L_b);
                                     }
-                                    local_grad[vid] += pattern.weight * d_lnL_dt;
                                 }
                             }
                         }
                     }
                 }
             }
+        }
 
-            #pragma omp critical
-            {
-                total_log_l += local_ll;
-                for (size_t i = 0; i < num_nodes; ++i) {
-                    grad_b[i] += local_grad[i];
-                }
+        Scalar total_log_l = neumaier_sum(pattern_ll);
+        std::vector<Scalar> grad_b(num_nodes, 0.0);
+        std::vector<Scalar> row_vals(num_patterns, 0.0);
+        for (size_t i = 0; i < num_nodes; ++i) {
+            if (i == static_cast<size_t>(tree.root_id)) continue;
+            for (size_t p = 0; p < num_patterns; ++p) {
+                row_vals[p] = pattern_grad(i, p);
             }
+            grad_b[i] = neumaier_sum(row_vals);
         }
 
         return {total_log_l, grad_b};
@@ -891,13 +935,16 @@ public:
         const std::vector<Scalar>& omegas_R,
         const std::vector<Scalar>& weights,
         Scalar k,
-        int max_iters = 10
+        int max_iters = 10,
+        const MG94Parameters* custom_base_params = nullptr,
+        const std::vector<Scalar>* custom_omegas_uncl = nullptr,
+        const std::vector<Scalar>* custom_weights_uncl = nullptr
     ) const {
         size_t num_nodes = tree.num_nodes();
         std::vector<Scalar> bl = init_bl;
         for (size_t i = 0; i < num_nodes; ++i) {
             if (i != static_cast<size_t>(tree.root_id)) {
-                bl[i] = std::clamp(bl[i], 1e-6, 10.0);
+                bl[i] = std::clamp(bl[i], 1e-6, 1000.0);
             }
         }
 
@@ -906,7 +953,8 @@ public:
         std::vector<std::vector<Scalar>> y_hist;
         std::vector<Scalar> rho_hist;
 
-        auto [curr_ll, curr_grad] = compute_relax_branch_gradients(bl, omegas_R, weights, k);
+        auto [curr_ll, curr_grad] = compute_relax_branch_gradients(
+            bl, omegas_R, weights, k, custom_base_params, custom_omegas_uncl, custom_weights_uncl);
 
         Scalar best_ll = curr_ll;
         std::vector<Scalar> best_bl = bl;
@@ -1005,12 +1053,13 @@ public:
             for (int ls = 0; ls < 8; ++ls) {
                 for (size_t i = 0; i < num_nodes; ++i) {
                     if (i != static_cast<size_t>(tree.root_id)) {
-                        new_bl[i] = std::clamp(bl[i] + step_size * d[i], 1e-6, 10.0);
+                        new_bl[i] = std::clamp(bl[i] + step_size * d[i], 1e-6, 1000.0);
                     } else {
                         new_bl[i] = 0.0;
                     }
                 }
-                auto [test_ll, test_grad] = compute_relax_branch_gradients(new_bl, omegas_R, weights, k);
+                auto [test_ll, test_grad] = compute_relax_branch_gradients(
+                    new_bl, omegas_R, weights, k, custom_base_params, custom_omegas_uncl, custom_weights_uncl);
                 if (test_ll > curr_ll + 1e-4 * step_size * dir_dot_grad) {
                     new_ll = test_ll;
                     new_grad = test_grad;
@@ -1062,7 +1111,7 @@ public:
     // Distribution parametrization used by the optimizers (box-bounded, no penalty walls):
     //   theta = [r0, w1, u2, a0, a1 (, lk)]
     //   w1 in [0,1], w0 = r0 * w1 (r0 in [0,1])        -> 0 <= w0 <= w1 <= 1
-    //   w2 = exp(u2), u2 in [0, ln 50]                  -> 1 <= w2 <= 50
+    //   w2 = exp(u2), u2 in [0, ln 10000]               -> 1 <= w2 <= 10000
     //   p0 = a0, p1 = (1-a0) a1, p2 = (1-a0)(1-a1)      (stick-breaking, a0, a1 in [0,1])
     //   K = exp(lk), lk in [ln 1e-5, ln 50]             (alternative model only)
     // ---------------------------------------------------------------------------------
@@ -1074,7 +1123,7 @@ public:
 
     static constexpr Scalar kMinK = 1e-5;
     static constexpr Scalar kMaxK = 50.0;
-    static constexpr Scalar kMaxOmega = 50.0;
+    static constexpr Scalar kMaxOmega = 10000.0;
 
     static RELAXDist make_dist(Scalar w0, Scalar w1, Scalar w2, Scalar p0, Scalar p1, Scalar k = 1.0) {
         RELAXDist d;
@@ -1108,30 +1157,43 @@ public:
         return th;
     }
 
-    static void theta_bounds(bool has_k, std::vector<Scalar>& lb, std::vector<Scalar>& ub) {
+    static void theta_bounds(bool has_k, std::vector<Scalar>& lb, std::vector<Scalar>& ub,
+                             Scalar min_k = kMinK, Scalar max_k = kMaxK) {
         lb = {0.0, 0.0, 0.0, 0.0, 0.0};
         ub = {1.0, 1.0, std::log(kMaxOmega), 1.0, 1.0};
         if (has_k) {
-            lb.push_back(std::log(kMinK));
-            ub.push_back(std::log(kMaxK));
+            lb.push_back(std::log(min_k));
+            ub.push_back(std::log(max_k));
         }
     }
 
     Scalar loglik_at(const RELAXDist& d, const std::vector<Scalar>& bl,
-                     std::vector<Scalar>* site_ll = nullptr) const {
-        return evaluate_relax_mixture(tree, d.omegas, d.weights, d.k, 1.0, site_ll, &bl);
+                     std::vector<Scalar>* site_ll = nullptr,
+                     const MG94Parameters* custom_base_params = nullptr,
+                     const std::vector<Scalar>* custom_omegas_uncl = nullptr,
+                     const std::vector<Scalar>* custom_weights_uncl = nullptr) const {
+        return evaluate_relax_mixture(tree, d.omegas, d.weights, d.k, 1.0, site_ll, &bl,
+                                      custom_base_params, custom_omegas_uncl, custom_weights_uncl);
     }
 
     // Nelder-Mead over theta at fixed branch lengths, restarted from the incumbent while it
     // keeps improving. `ll` must hold the log-likelihood at `th` on entry; never decreases.
     std::vector<Scalar> optimize_theta(std::vector<Scalar> th, bool has_k,
-                                       const std::vector<Scalar>& bl, Scalar& ll) const {
+                                       const std::vector<Scalar>& bl, Scalar& ll,
+                                       const MG94Parameters* custom_base_params = nullptr,
+                                       const std::vector<Scalar>* custom_omegas_uncl = nullptr,
+                                       const std::vector<Scalar>* custom_weights_uncl = nullptr,
+                                       Scalar min_k = kMinK, Scalar max_k = kMaxK) const {
         std::vector<Scalar> lb, ub;
-        theta_bounds(has_k, lb, ub);
+        theta_bounds(has_k, lb, ub, min_k, max_k);
+        if (has_k) {
+            th[5] = std::clamp(th[5], lb[5], ub[5]);
+        }
         auto f = [&](const std::vector<Scalar>& x) -> Scalar {
-            return -loglik_at(decode_theta(x, has_k), bl);
+            return -loglik_at(decode_theta(x, has_k), bl, nullptr,
+                              custom_base_params, custom_omegas_uncl, custom_weights_uncl);
         };
-        Scalar best = -ll;
+        Scalar best = f(th);
         for (int restart = 0; restart < 3; ++restart) {
             auto o = NelderMeadDynamic::minimize(f, th, lb, ub, 1e-4, 200);
             Scalar gain = best - o.f;
@@ -1171,34 +1233,122 @@ public:
     struct RELAXJointFit {
         std::vector<Scalar> theta;
         std::vector<Scalar> bl;
+        MG94Parameters fit_base;
+        std::vector<Scalar> omegas_uncl = {0.05, 0.50, 2.0};
+        std::vector<Scalar> weights_uncl = {0.50, 0.40, 0.10};
         Scalar ll = -std::numeric_limits<Scalar>::infinity();
         int cycles = 0;
+        bool converged = false;
     };
 
     // Alternates per-branch length refinement (L-BFGS, exact gradients) with re-optimization of
-    // the distribution (and K) at the refined lengths, until the cycle gain < joint_tolerance or
+    // the distribution (and K), unclassified distribution (if present), and GTR exchangeabilities
+    // at the refined lengths, until the cycle gain < joint_tolerance (for cycle >= 2) or
     // max_joint_cycles is reached. Monotone: the log-likelihood never decreases.
-    RELAXJointFit joint_optimize(std::vector<Scalar> th, std::vector<Scalar> bl, bool has_k) const {
+    RELAXJointFit joint_optimize(
+        std::vector<Scalar> th,
+        std::vector<Scalar> bl,
+        bool has_k,
+        const MG94Parameters* init_base = nullptr,
+        const std::vector<Scalar>* init_om_u = nullptr,
+        const std::vector<Scalar>* init_wt_u = nullptr,
+        Scalar min_k = kMinK,
+        Scalar max_k = kMaxK
+    ) const {
         RELAXJointFit J;
         J.theta = std::move(th);
+        if (has_k) {
+            J.theta[5] = std::clamp(J.theta[5], std::log(min_k), std::log(max_k));
+        }
         J.bl = std::move(bl);
-        J.ll = loglik_at(decode_theta(J.theta, has_k), J.bl);
+        J.fit_base = init_base ? *init_base : base_params;
+        J.omegas_uncl = init_om_u ? *init_om_u : omegas_uncl;
+        J.weights_uncl = init_wt_u ? *init_wt_u : weights_uncl;
+
+        const bool has_unclassified = !unclassified_branch_names.empty();
+        J.ll = loglik_at(decode_theta(J.theta, has_k), J.bl, nullptr,
+                         &J.fit_base, &J.omegas_uncl, &J.weights_uncl);
+
         const int cycles = std::max(1, settings.max_joint_cycles);
         for (int cycle = 0; cycle < cycles; ++cycle) {
             Scalar start_ll = J.ll;
             if (settings.refine_branch_lengths) {
                 RELAXDist d = decode_theta(J.theta, has_k);
-                auto nbl = refine_branch_lengths(J.bl, d.omegas, d.weights, d.k, 30);
-                Scalar nll = loglik_at(d, nbl);
+                auto nbl = refine_branch_lengths(J.bl, d.omegas, d.weights, d.k, 30,
+                                                 &J.fit_base, &J.omegas_uncl, &J.weights_uncl);
+                Scalar nll = loglik_at(d, nbl, nullptr, &J.fit_base, &J.omegas_uncl, &J.weights_uncl);
                 if (nll > J.ll) {
                     J.bl = std::move(nbl);
                     J.ll = nll;
                 }
             }
-            J.theta = optimize_theta(J.theta, has_k, J.bl, J.ll);
+            J.theta = optimize_theta(J.theta, has_k, J.bl, J.ll,
+                                     &J.fit_base, &J.omegas_uncl, &J.weights_uncl, min_k, max_k);
+
+            // F-013: Optimize unclassified 3-class BS-REL mixture when unclassified branches exist
+            if (has_unclassified) {
+                RELAXDist d_cur = decode_theta(J.theta, has_k);
+                RELAXDist d_u;
+                d_u.omegas = J.omegas_uncl;
+                d_u.weights = J.weights_uncl;
+                std::vector<Scalar> th_u = encode_theta(d_u, false);
+                std::vector<Scalar> lb_u, ub_u;
+                theta_bounds(false, lb_u, ub_u);
+                auto f_u = [&](const std::vector<Scalar>& x_u) -> Scalar {
+                    RELAXDist du_cand = decode_theta(x_u, false);
+                    return -loglik_at(d_cur, J.bl, nullptr, &J.fit_base, &du_cand.omegas, &du_cand.weights);
+                };
+                auto o_u = NelderMeadDynamic::minimize(f_u, th_u, lb_u, ub_u, 1e-4, 200);
+                if (-o_u.f > J.ll) {
+                    RELAXDist du_best = decode_theta(o_u.x, false);
+                    J.omegas_uncl = du_best.omegas;
+                    J.weights_uncl = du_best.weights;
+                    J.ll = -o_u.f;
+                }
+            }
+
+            // F-043: Re-optimize the 5 GTR nucleotide exchangeabilities inside joint_optimize
+            if (settings.refine_branch_lengths) {
+                RELAXDist d_cur = decode_theta(J.theta, has_k);
+                const MG94Parameters saved_base = J.fit_base;
+                auto with_rates = [&](const std::array<Scalar, 5>& x) {
+                    MG94Parameters p = saved_base;
+                    p.theta_AC = std::exp(x[0]);
+                    p.theta_AT = std::exp(x[1]);
+                    p.theta_CG = std::exp(x[2]);
+                    p.theta_CT = std::exp(x[3]);
+                    p.theta_GT = std::exp(x[4]);
+                    return p;
+                };
+                std::array<Scalar, 5> x0 = {
+                    std::log(std::max(1e-3, saved_base.theta_AC)),
+                    std::log(std::max(1e-3, saved_base.theta_AT)),
+                    std::log(std::max(1e-3, saved_base.theta_CG)),
+                    std::log(std::max(1e-3, saved_base.theta_CT)),
+                    std::log(std::max(1e-3, saved_base.theta_GT))
+                };
+                const Scalar lo = std::log(1e-3), hi = std::log(1e3);
+                auto eval_nuc = [&](const std::array<Scalar, 5>& x) -> Scalar {
+                    MG94Parameters cand_p = with_rates(x);
+                    return -loglik_at(d_cur, J.bl, nullptr, &cand_p, &J.omegas_uncl, &J.weights_uncl);
+                };
+                auto o5 = NelderMeadND<5>::minimize(eval_nuc, x0, {lo, lo, lo, lo, lo}, {hi, hi, hi, hi, hi}, 1e-4, 200);
+                if (-o5.f > J.ll) {
+                    J.fit_base = with_rates(o5.x);
+                    J.ll = -o5.f;
+                }
+            }
+
             J.cycles = cycle + 1;
-            if (!settings.refine_branch_lengths) break;
-            if (J.ll - start_ll < settings.joint_tolerance) break;
+            if (!settings.refine_branch_lengths) {
+                J.converged = true;
+                break;
+            }
+            Scalar gain = J.ll - start_ll;
+            if (cycle >= 2 && gain < settings.joint_tolerance) {
+                J.converged = true;
+                break;
+            }
         }
         return J;
     }
@@ -1340,9 +1490,11 @@ public:
                 : 1.0;
         };
         const std::vector<Scalar> one_class = {1.0, 0.0, 0.0};
+        const std::vector<Scalar> mg_om_u = {unclassified_omega, unclassified_omega, unclassified_omega};
 
         auto eval_sep_mg94 = [&](const std::array<Scalar, 3>& x) -> Scalar {
-            return -evaluate_relax_mixture(gtr_res.tree, {x[0], x[0], x[0]}, one_class, mg94_k(x[0], x[1]), x[2]);
+            return -evaluate_relax_mixture(gtr_res.tree, {x[0], x[0], x[0]}, one_class, mg94_k(x[0], x[1]), x[2],
+                                           nullptr, nullptr, &base_params, &mg_om_u, &one_class);
         };
 
         auto opt_sep = NelderMeadND<3>::minimize(
@@ -1367,14 +1519,17 @@ public:
             for (int cycle = 0; cycle < cycles; ++cycle) {
                 Scalar start_ll = mg_ll;
                 Scalar kk = mg94_k(mg_wR, mg_wT);
-                auto nbl = refine_branch_lengths(mg_bl, {mg_wR, mg_wR, mg_wR}, one_class, kk, 30);
-                Scalar nll = evaluate_relax_mixture(tree, {mg_wR, mg_wR, mg_wR}, one_class, kk, 1.0, nullptr, &nbl);
+                auto nbl = refine_branch_lengths(mg_bl, {mg_wR, mg_wR, mg_wR}, one_class, kk, 30,
+                                                 &base_params, &mg_om_u, &one_class);
+                Scalar nll = evaluate_relax_mixture(tree, {mg_wR, mg_wR, mg_wR}, one_class, kk, 1.0, nullptr, &nbl,
+                                                    &base_params, &mg_om_u, &one_class);
                 if (nll > mg_ll) {
                     mg_bl = std::move(nbl);
                     mg_ll = nll;
                 }
                 auto eval_w = [&](const std::array<Scalar, 2>& x) -> Scalar {
-                    return -evaluate_relax_mixture(tree, {x[0], x[0], x[0]}, one_class, mg94_k(x[0], x[1]), 1.0, nullptr, &mg_bl);
+                    return -evaluate_relax_mixture(tree, {x[0], x[0], x[0]}, one_class, mg94_k(x[0], x[1]), 1.0, nullptr, &mg_bl,
+                                                   &base_params, &mg_om_u, &one_class);
                 };
                 auto o2 = NelderMeadND<2>::minimize(eval_w, {mg_wR, mg_wT}, {1e-4, 1e-4}, {10.0, 10.0}, 1e-5, 200);
                 if (-o2.f > mg_ll) {
@@ -1399,7 +1554,8 @@ public:
                     const Scalar kk2 = mg94_k(mg_wR, mg_wT);
                     auto eval_nuc = [&](const std::array<Scalar, 5>& x) -> Scalar {
                         set_rates(x);
-                        return -evaluate_relax_mixture(tree, {mg_wR, mg_wR, mg_wR}, one_class, kk2, 1.0, nullptr, &mg_bl);
+                        return -evaluate_relax_mixture(tree, {mg_wR, mg_wR, mg_wR}, one_class, kk2, 1.0, nullptr, &mg_bl,
+                                                       &base_params, &mg_om_u, &one_class);
                     };
                     std::array<Scalar, 5> x0 = {
                         std::log(std::max(1e-3, saved.theta_AC)), std::log(std::max(1e-3, saved.theta_AT)),
@@ -1436,6 +1592,11 @@ public:
             }
         }
 
+        // Seed unclassified distribution from dataset Phase-2 MG94 mean omega
+        Scalar w_mean = std::clamp(0.5 * (mg_wR + mg_wT), 1e-3, 0.95);
+        omegas_uncl = {std::clamp(0.1 * w_mean, 0.0, 0.9), w_mean, std::max(1.5, 2.0 * w_mean)};
+        weights_uncl = {0.50, 0.40, 0.10};
+
         update_progress(with_stats("Phase 2: MG94 separate rates fit complete", mg_ll), 0.40);
 
         auto with_scale = [](Scalar s, std::vector<Scalar> th) {
@@ -1457,11 +1618,16 @@ public:
         // ---------------------------------------------------------
         update_progress("Phase 3: Fitting RELAX null model (K = 1 fixed)", 0.45);
 
+        // F-014: Expanded data-scaled starting grid for null model
         std::vector<std::vector<Scalar>> null_starts = {
             with_scale(1.0, encode_theta(make_dist(0.0, 0.5, 1.5, 0.6, 0.3), false)),
             with_scale(1.0, encode_theta(make_dist(0.0, 0.6, 1.2, 0.67, 0.27), false)),
             with_scale(1.0, encode_theta(make_dist(0.2 * w_mg, w_mg, 2.0, 0.3, 0.6), false)),
-            with_scale(1.0, encode_theta(make_dist(0.0, 0.2, 3.0, 0.5, 0.45), false))
+            with_scale(1.0, encode_theta(make_dist(0.0, 0.2, 3.0, 0.5, 0.45), false)),
+            with_scale(1.0, encode_theta(make_dist(0.05 * w_mg, 0.8 * w_mg, std::max(1.2, 3.0 * mg_wR), 0.50, 0.40), false)),
+            with_scale(1.0, encode_theta(make_dist(0.1 * w_mean, w_mean, 5.0, 0.45, 0.45), false)),
+            with_scale(1.0, encode_theta(make_dist(0.01, 0.15, 1.1, 0.70, 0.25), false)),
+            with_scale(1.0, encode_theta(make_dist(0.0, 0.8, 10.0, 0.25, 0.65), false))
         };
         auto scaled_null = optimize_scaled(null_starts, false, mg_bl);
         Scalar null_s = scaled_null.first[0];
@@ -1484,12 +1650,26 @@ public:
             );
         }
 
-        // Start A: tree-scale grid search from generic starts
+        // F-014: Expanded data-scaled starting grid covering K in {0.05, 0.25, 0.5, 0.8, 1.0, 1.25, 2.0, 5.0, 15.0}
+        RELAXDist d_null_mle = decode_theta(J_null.theta, false);
+        Scalar w0_n = std::clamp(d_null_mle.omegas[0], 0.0, 0.9);
+        Scalar w1_n = std::clamp(d_null_mle.omegas[1], 1e-3, 0.99);
+        Scalar w2_n = std::clamp(d_null_mle.omegas[2], 1.01, kMaxOmega);
+        Scalar p0_n = std::clamp(d_null_mle.weights[0], 0.01, 0.95);
+        Scalar p1_n = std::clamp(d_null_mle.weights[1], 0.01, 0.98 - p0_n);
+
         std::vector<std::vector<Scalar>> alt_starts = {
             with_scale(1.0, encode_theta(make_dist(0.0, w_mg, 5.0, 0.35, 0.60, k_init), true)),
             with_scale(1.0, encode_theta(make_dist(0.0, 0.16, 30.0, 0.35, 0.65, 1e-4), true)),
+            with_scale(1.0, encode_theta(make_dist(0.05, 0.3, 2.0, 0.40, 0.50, 0.05), true)),
+            with_scale(1.0, encode_theta(make_dist(0.1 * w_mg, w_mg, 2.5, 0.45, 0.45, 0.25), true)),
             with_scale(1.0, encode_theta(make_dist(0.05, 0.3, 2.0, 0.40, 0.50, 0.5), true)),
-            with_scale(1.0, encode_theta(make_dist(0.0, 0.5, 5.0, 0.3, 0.4, 2.0), true))
+            with_scale(1.0, encode_theta(make_dist(w0_n, w1_n, w2_n, p0_n, p1_n, 0.8), true)),
+            with_scale(1.0, encode_theta(make_dist(w0_n, w1_n, w2_n, p0_n, p1_n, 1.0), true)),
+            with_scale(1.0, encode_theta(make_dist(w0_n, w1_n, w2_n, p0_n, p1_n, 1.25), true)),
+            with_scale(1.0, encode_theta(make_dist(0.0, 0.5, 5.0, 0.3, 0.4, 2.0), true)),
+            with_scale(1.0, encode_theta(make_dist(0.1 * w_mg, w_mg, 3.0, 0.40, 0.45, 5.0), true)),
+            with_scale(1.0, encode_theta(make_dist(0.05, 0.4, 2.5, 0.50, 0.40, 15.0), true))
         };
         auto scaled_alt = optimize_scaled(alt_starts, true, mg_bl);
         Scalar alt_s = scaled_alt.first[0];
@@ -1499,18 +1679,60 @@ public:
 
         // Start B: the null MLE with K = 1 (guarantees alt >= null for a monotone optimizer)
         update_progress(with_stats("Phase 4: Alternative model from null MLE; grid start reached", J_alt.ll), 0.75);
-        RELAXJointFit J_alt_b = joint_optimize(add_k(J_null.theta, 1.0), J_null.bl, true);
+        RELAXJointFit J_alt_b = joint_optimize(
+            add_k(J_null.theta, 1.0), J_null.bl, true,
+            &J_null.fit_base, &J_null.omegas_uncl, &J_null.weights_uncl);
         if (J_alt_b.ll > J_alt.ll) J_alt = std::move(J_alt_b);
 
         // HyPhy-style null check: re-fit the null from the alternative MLE with K := 1.
-        update_progress(with_stats("Phase 4: Null model from alternative MLE; alternative at", J_alt.ll), 0.85);
-        RELAXJointFit J_null_b = joint_optimize(drop_k(J_alt.theta), J_alt.bl, false);
+        update_progress(with_stats("Phase 4: Null model from alternative MLE; alternative at", J_alt.ll), 0.82);
+        RELAXJointFit J_null_b = joint_optimize(
+            drop_k(J_alt.theta), J_alt.bl, false,
+            &J_alt.fit_base, &J_alt.omegas_uncl, &J_alt.weights_uncl);
         if (J_null_b.ll > J_null.ll) J_null = std::move(J_null_b);
 
-        // Nesting guard: if the (improved) null beats the alternative, restart alt from it.
-        if (J_null.ll > J_alt.ll) {
-            RELAXJointFit J_alt_c = joint_optimize(add_k(J_null.theta, 1.0), J_null.bl, true);
-            if (J_alt_c.ll > J_alt.ll) J_alt = std::move(J_alt_c);
+        // F-047: Opposite-side K direction stability check when |alt_ll - null_ll| < 5.0
+        {
+            RELAXDist d_hat = decode_theta(J_alt.theta, true);
+            if (std::abs(J_alt.ll - J_null.ll) < 5.0) {
+                Scalar opp_min_k = (d_hat.k > 1.0) ? kMinK : 1.0;
+                Scalar opp_max_k = (d_hat.k > 1.0) ? 1.0   : kMaxK;
+                Scalar seed_k    = (d_hat.k > 1.0) ? 0.5   : 2.0;
+                RELAXJointFit J_opp = joint_optimize(
+                    add_k(J_null.theta, seed_k), J_null.bl, true,
+                    &J_null.fit_base, &J_null.omegas_uncl, &J_null.weights_uncl,
+                    opp_min_k, opp_max_k);
+                if (J_opp.ll > J_alt.ll) {
+                    J_alt = std::move(J_opp);
+                    RELAXJointFit J_null_opp = joint_optimize(
+                        drop_k(J_alt.theta), J_alt.bl, false,
+                        &J_alt.fit_base, &J_alt.omegas_uncl, &J_alt.weights_uncl);
+                    if (J_null_opp.ll > J_null.ll) J_null = std::move(J_null_opp);
+                }
+            }
+        }
+
+        // F-084: Negative-LRT retry loop (up to 5 restarts of alternative from null MLE and vice versa)
+        for (int retry = 0; retry < 5 && J_alt.ll < J_null.ll; ++retry) {
+            RELAXJointFit J_alt_r = joint_optimize(
+                add_k(J_null.theta, 1.0), J_null.bl, true,
+                &J_null.fit_base, &J_null.omegas_uncl, &J_null.weights_uncl);
+            if (J_alt_r.ll > J_alt.ll) J_alt = std::move(J_alt_r);
+            if (J_alt.ll > J_null.ll + 1e-3) {
+                RELAXJointFit J_null_r = joint_optimize(
+                    drop_k(J_alt.theta), J_alt.bl, false,
+                    &J_alt.fit_base, &J_alt.omegas_uncl, &J_alt.weights_uncl);
+                if (J_null_r.ll > J_null.ll) J_null = std::move(J_null_r);
+            }
+        }
+        // Final strict nesting guard: since K=1 is in the alternative parameter space, alt_ll >= null_ll
+        if (J_alt.ll < J_null.ll) {
+            J_alt.theta = add_k(J_null.theta, 1.0);
+            J_alt.bl = J_null.bl;
+            J_alt.fit_base = J_null.fit_base;
+            J_alt.omegas_uncl = J_null.omegas_uncl;
+            J_alt.weights_uncl = J_null.weights_uncl;
+            J_alt.ll = J_null.ll;
         }
 
         update_progress(with_stats("Phase 4: RELAX fits complete; alternative", J_alt.ll), 0.90);
@@ -1518,30 +1740,62 @@ public:
         // ---------------------------------------------------------
         // Record fits
         // ---------------------------------------------------------
+        const size_t uncl_extra_params = unclassified_branch_names.empty() ? 0 : 5;
         auto record_fit = [&](RELAXModelFit& fit, const RELAXJointFit& J, bool has_k, Scalar s, size_t n_params) {
             RELAXDist d = decode_theta(J.theta, has_k);
             fit.tree_scale = s;
             fit.k = d.k;
+            fit.realized_cycles = J.cycles;
+            fit.converged = J.converged;
             fit.reference_distribution.omegas = d.omegas;
             fit.reference_distribution.weights = d.weights;
             std::vector<Scalar> om_T(3);
             for (int c = 0; c < 3; ++c) {
-                om_T[c] = (d.omegas[c] <= 1e-12) ? ((d.k > 0) ? 0.0 : 1.0) : std::pow(d.omegas[c], d.k);
+                if (d.omegas[c] <= 1e-12) {
+                    om_T[c] = (d.k > 0) ? 0.0 : 1.0;
+                } else {
+                    om_T[c] = std::clamp(std::pow(d.omegas[c], d.k), 1e-6, 10000.0);
+                }
             }
             fit.test_distribution.omegas = has_k ? om_T : d.omegas;
             fit.test_distribution.weights = d.weights;
+            if (!unclassified_branch_names.empty()) {
+                fit.unclassified_distribution.omegas = J.omegas_uncl;
+                fit.unclassified_distribution.weights = J.weights_uncl;
+            }
             fit.branch_lengths = J.bl;
-            fit.log_likelihood = loglik_at(d, J.bl, &fit.site_log_likelihoods);
+            fit.log_likelihood = loglik_at(d, J.bl, &fit.site_log_likelihoods,
+                                           &J.fit_base, &J.omegas_uncl, &J.weights_uncl);
             fit.parameters = n_params;
             Scalar kp = static_cast<Scalar>(n_params);
             fit.aicc = 2.0 * kp - 2.0 * fit.log_likelihood +
                 (2.0 * kp * (kp + 1.0)) / std::max(1.0, n_codons - kp - 1.0);
         };
 
-        // GTR rates + branches + 3 omegas + 2 weights (+ k) + CF3x4
-        record_fit(result.alternative_fit, J_alt, true, alt_s, 5 + B + 5 + 1 + 6);
-        record_fit(result.null_fit, J_null, false, null_s, 5 + B + 5 + 6);
+        // GTR rates + branches + 3 omegas + 2 weights (+ 5 uncl if present) (+ k) + CF3x4
+        record_fit(result.alternative_fit, J_alt, true, alt_s, 5 + B + 5 + uncl_extra_params + 1 + 6);
+        record_fit(result.null_fit, J_null, false, null_s, 5 + B + 5 + uncl_extra_params + 6);
         Scalar alt_k = result.alternative_fit.k;
+
+        // F-076: Compute branch-switched per-site log-likelihoods at the alternative MLE
+        // (evaluating the alternative model with Test branches assigned K = 1, i.e., the Reference
+        // distribution, while holding all other alternative-MLE parameters fixed) and store the
+        // per-site evidence ratios exp(l_{alt,s} - l_{switched,s}) for legacy JSON Site Log Likelihood.constrained.
+        {
+            RELAXDist d_switched = decode_theta(J_alt.theta, true);
+            d_switched.k = 1.0;
+            std::vector<Scalar> switched_site_ll;
+            loglik_at(d_switched, J_alt.bl, &switched_site_ll,
+                      &J_alt.fit_base, &J_alt.omegas_uncl, &J_alt.weights_uncl);
+            const auto& alt_site_ll = result.alternative_fit.site_log_likelihoods;
+            if (alt_site_ll.size() == switched_site_ll.size()) {
+                result.branch_switched_evidence_ratios.resize(alt_site_ll.size());
+                for (size_t s = 0; s < alt_site_ll.size(); ++s) {
+                    Scalar diff = std::clamp(alt_site_ll[s] - switched_site_ll[s], -700.0, 700.0);
+                    result.branch_switched_evidence_ratios[s] = std::exp(diff);
+                }
+            }
+        }
 
         // ---------------------------------------------------------
         // Phase 5: Hypothesis Testing & Interpretation

@@ -59,91 +59,92 @@ public:
         const double SCALER_UP = 1e150;
         const double LOG_SCALER = std::log(SCALER_UP);
 
-        Scalar total_log_l = 0.0;
+        std::vector<Scalar> pattern_ll(num_patterns, 0.0);
+        int n_threads = LikelihoodEngine::optimal_omp_threads(num_patterns, 32);
 
-        #pragma omp parallel for reduction(+:total_log_l) schedule(static)
-        for (size_t p = 0; p < num_patterns; ++p) {
-            const auto& pattern = aln.patterns[p];
+        #pragma omp parallel num_threads(n_threads)
+        {
             std::vector<Vector4> node_L(num_nodes, Vector4::Ones());
             std::vector<double> node_log_scale(num_nodes, 0.0);
 
-            for (int32_t nid : tree.post_order) {
-                const auto& node = tree.nodes[nid];
-                if (node.is_leaf) {
-                    size_t t_idx = leaf_to_taxon[nid];
-                    if (t_idx != static_cast<size_t>(-1)) {
-                        int8_t state = pattern.states[t_idx];
-                        if (state >= 0 && state < 4) {
-                            node_L[nid].setZero();
-                            node_L[nid](state) = 1.0;
+            #pragma omp for schedule(static)
+            for (size_t p = 0; p < num_patterns; ++p) {
+                const auto& pattern = aln.patterns[p];
+
+                for (int32_t nid : tree.post_order) {
+                    const auto& node = tree.nodes[nid];
+                    if (node.is_leaf) {
+                        size_t t_idx = leaf_to_taxon[nid];
+                        LikelihoodEngine::init_leaf_likelihood(pattern, t_idx, 4, node_L[nid]);
+                        node_log_scale[nid] = 0.0;
+                    } else {
+                        int32_t b_idx = (static_cast<size_t>(nid) < net.node_to_bridge_idx.size())
+                            ? net.node_to_bridge_idx[nid] : -1;
+
+                        double child_scale_sum = 0.0;
+                        int boost_count = 0;
+                        if (b_idx >= 0) {
+                            const auto& wb = net.bridges[static_cast<size_t>(b_idx)];
+                            int32_t id_A = wb.children[0];
+                            int32_t id_B = wb.children[1];
+                            int32_t id_C = wb.children[2];
+
+                            Vector4 M_A = P_branches[id_A] * node_L[id_A];
+                            Vector4 M_B = P_branches[id_B] * node_L[id_B];
+                            Vector4 M_C = P_branches[id_C] * node_L[id_C];
+                            child_scale_sum = node_log_scale[id_A] + node_log_scale[id_B] + node_log_scale[id_C];
+
+                            Vector4 D_ohm = Vector4::Zero();
+                            if (wb.weights[0] > 0.0) {
+                                Vector4 Y1 = M_A.cwiseProduct(M_B);
+                                Vector4 D1 = (P_bridges[b_idx][0] * Y1).cwiseProduct(M_C);
+                                D_ohm.noalias() += wb.weights[0] * D1;
+                            }
+                            if (wb.weights[1] > 0.0) {
+                                Vector4 Y2 = M_A.cwiseProduct(M_C);
+                                Vector4 D2 = (P_bridges[b_idx][1] * Y2).cwiseProduct(M_B);
+                                D_ohm.noalias() += wb.weights[1] * D2;
+                            }
+                            if (wb.weights[2] > 0.0) {
+                                Vector4 Y3 = M_B.cwiseProduct(M_C);
+                                Vector4 D3 = (P_bridges[b_idx][2] * Y3).cwiseProduct(M_A);
+                                D_ohm.noalias() += wb.weights[2] * D3;
+                            }
+                            node_L[nid] = D_ohm;
                         } else {
                             node_L[nid].setOnes();
+                            for (int32_t cid : node.children) {
+                                node_L[nid].array() *= (P_branches[cid] * node_L[cid]).array();
+                                child_scale_sum += node_log_scale[cid];
+                                double cur_max = node_L[nid].maxCoeff();
+                                while (cur_max < SCALER_THRESH && cur_max > 0.0) {
+                                    node_L[nid] *= SCALER_UP;
+                                    cur_max *= SCALER_UP;
+                                    boost_count++;
+                                }
+                            }
                         }
-                    } else {
-                        node_L[nid].setOnes();
+
+                        double max_val = node_L[nid].maxCoeff();
+                        while (max_val < SCALER_THRESH && max_val > 0.0) {
+                            node_L[nid] *= SCALER_UP;
+                            max_val *= SCALER_UP;
+                            boost_count++;
+                        }
+                        node_log_scale[nid] = child_scale_sum - boost_count * LOG_SCALER;
                     }
-                    node_log_scale[nid] = 0.0;
-                } else {
-                    int32_t b_idx = (static_cast<size_t>(nid) < net.node_to_bridge_idx.size())
-                        ? net.node_to_bridge_idx[nid] : -1;
-
-                    double child_scale_sum = 0.0;
-                    if (b_idx >= 0) {
-                        const auto& wb = net.bridges[static_cast<size_t>(b_idx)];
-                        int32_t id_A = wb.children[0];
-                        int32_t id_B = wb.children[1];
-                        int32_t id_C = wb.children[2];
-
-                        Vector4 M_A = P_branches[id_A] * node_L[id_A];
-                        Vector4 M_B = P_branches[id_B] * node_L[id_B];
-                        Vector4 M_C = P_branches[id_C] * node_L[id_C];
-                        child_scale_sum = node_log_scale[id_A] + node_log_scale[id_B] + node_log_scale[id_C];
-
-                        Vector4 D_ohm = Vector4::Zero();
-                        if (wb.weights[0] > 0.0) {
-                            Vector4 Y1 = M_A.cwiseProduct(M_B);
-                            Vector4 D1 = (P_bridges[b_idx][0] * Y1).cwiseProduct(M_C);
-                            D_ohm.noalias() += wb.weights[0] * D1;
-                        }
-                        if (wb.weights[1] > 0.0) {
-                            Vector4 Y2 = M_A.cwiseProduct(M_C);
-                            Vector4 D2 = (P_bridges[b_idx][1] * Y2).cwiseProduct(M_B);
-                            D_ohm.noalias() += wb.weights[1] * D2;
-                        }
-                        if (wb.weights[2] > 0.0) {
-                            Vector4 Y3 = M_B.cwiseProduct(M_C);
-                            Vector4 D3 = (P_bridges[b_idx][2] * Y3).cwiseProduct(M_A);
-                            D_ohm.noalias() += wb.weights[2] * D3;
-                        }
-                        node_L[nid] = D_ohm;
-                    } else {
-                        node_L[nid].setOnes();
-                        for (int32_t cid : node.children) {
-                            node_L[nid].array() *= (P_branches[cid] * node_L[cid]).array();
-                            child_scale_sum += node_log_scale[cid];
-                        }
-                    }
-
-                    double max_val = node_L[nid].maxCoeff();
-                    int boost_count = 0;
-                    while (max_val < SCALER_THRESH && max_val > 0.0) {
-                        node_L[nid] *= SCALER_UP;
-                        max_val *= SCALER_UP;
-                        boost_count++;
-                    }
-                    node_log_scale[nid] = child_scale_sum - boost_count * LOG_SCALER;
                 }
-            }
 
-            Scalar pattern_likelihood = gtr_model.pi.dot(node_L[tree.root_id]);
-            Scalar plog = (pattern_likelihood > 0.0)
-                ? (std::log(pattern_likelihood) + node_log_scale[tree.root_id])
-                : (-1e20);
-            if (out_pattern_log_l) (*out_pattern_log_l)[p] = plog;
-            total_log_l += pattern.weight * plog;
+                Scalar pattern_likelihood = gtr_model.pi.dot(node_L[tree.root_id]);
+                Scalar plog = (pattern_likelihood > 0.0)
+                    ? (std::log(pattern_likelihood) + node_log_scale[tree.root_id])
+                    : (-1e20);
+                if (out_pattern_log_l) (*out_pattern_log_l)[p] = plog;
+                pattern_ll[p] = pattern.weight * plog;
+            }
         }
 
-        return total_log_l;
+        return LikelihoodEngine::neumaier_sum(pattern_ll);
     }
 
     // Single-pass MG94 codon log-likelihood on an OhmicNetwork
@@ -189,14 +190,15 @@ public:
         const double SCALER_UP = 1e150;
         const double LOG_SCALER = std::log(SCALER_UP);
 
-        Scalar total_log_l = 0.0;
+        std::vector<Scalar> pattern_ll(num_patterns, 0.0);
+        int n_threads = LikelihoodEngine::optimal_omp_threads(num_patterns, 16);
 
-        #pragma omp parallel
+        #pragma omp parallel num_threads(n_threads)
         {
             std::vector<Vector> node_L(num_nodes, Vector::Ones(S));
             std::vector<double> node_log_scale(num_nodes, 0.0);
 
-            #pragma omp for reduction(+:total_log_l) schedule(dynamic)
+            #pragma omp for schedule(static)
             for (size_t p = 0; p < num_patterns; ++p) {
                 const auto& pattern = aln.patterns[p];
 
@@ -204,23 +206,14 @@ public:
                     const auto& node = tree.nodes[nid];
                     if (node.is_leaf) {
                         size_t t_idx = leaf_to_taxon[nid];
-                        if (t_idx != static_cast<size_t>(-1)) {
-                            int8_t state = pattern.states[t_idx];
-                            if (state >= 0 && state < S) {
-                                node_L[nid].setZero();
-                                node_L[nid](state) = 1.0;
-                            } else {
-                                node_L[nid].setOnes();
-                            }
-                        } else {
-                            node_L[nid].setOnes();
-                        }
+                        LikelihoodEngine::init_leaf_likelihood(pattern, t_idx, S, node_L[nid]);
                         node_log_scale[nid] = 0.0;
                     } else {
                         int32_t b_idx = (static_cast<size_t>(nid) < net.node_to_bridge_idx.size())
                             ? net.node_to_bridge_idx[nid] : -1;
 
                         double child_scale_sum = 0.0;
+                        int boost_count = 0;
                         if (b_idx >= 0) {
                             const auto& wb = net.bridges[static_cast<size_t>(b_idx)];
                             int32_t id_A = wb.children[0];
@@ -254,11 +247,16 @@ public:
                             for (int32_t cid : node.children) {
                                 node_L[nid].array() *= (P_branches[cid] * node_L[cid]).array();
                                 child_scale_sum += node_log_scale[cid];
+                                double cur_max = node_L[nid].maxCoeff();
+                                while (cur_max < SCALER_THRESH && cur_max > 0.0) {
+                                    node_L[nid] *= SCALER_UP;
+                                    cur_max *= SCALER_UP;
+                                    boost_count++;
+                                }
                             }
                         }
 
                         double max_val = node_L[nid].maxCoeff();
-                        int boost_count = 0;
                         while (max_val < SCALER_THRESH && max_val > 0.0) {
                             node_L[nid] *= SCALER_UP;
                             max_val *= SCALER_UP;
@@ -273,11 +271,11 @@ public:
                     ? (std::log(pattern_likelihood) + node_log_scale[tree.root_id])
                     : (-1e20);
                 if (out_pattern_log_l) (*out_pattern_log_l)[p] = plog;
-                total_log_l += pattern.weight * plog;
+                pattern_ll[p] = pattern.weight * plog;
             }
         }
 
-        return total_log_l;
+        return LikelihoodEngine::neumaier_sum(pattern_ll);
     }
 
     // Exact 2-pass Inside-Outside traversal through backbone + K Wheatstone bridges
@@ -313,11 +311,12 @@ public:
         }
 
         std::vector<Vector> P_D(num_nodes, Vector::Zero(S));
-        std::vector<double> B(num_nodes, 1.0);
+        std::vector<int> boost_counts(num_nodes, 0);
         std::vector<double> node_log_scale(num_nodes, 0.0);
 
         const double SCALER_THRESH = 1e-150;
         const double SCALER_UP = 1e150;
+        const double SCALER_DOWN = 1e-150;
         const double LOG_SCALER = std::log(SCALER_UP);
 
         // 1. Post-order (bottom-up) Inside pass
@@ -325,24 +324,15 @@ public:
             const auto& node = tree.nodes[nid];
             if (node.is_leaf) {
                 size_t t_idx = leaf_to_taxon[nid];
-                if (t_idx != static_cast<size_t>(-1)) {
-                    int8_t state = pattern.states[t_idx];
-                    if (state >= 0 && state < S) {
-                        res.D[nid].setZero();
-                        res.D[nid](state) = 1.0;
-                    } else {
-                        res.D[nid].setOnes();
-                    }
-                } else {
-                    res.D[nid].setOnes();
-                }
+                LikelihoodEngine::init_leaf_likelihood(pattern, t_idx, S, res.D[nid]);
                 node_log_scale[nid] = 0.0;
-                B[nid] = 1.0;
+                boost_counts[nid] = 0;
             } else {
                 int32_t b_idx = (static_cast<size_t>(nid) < net.node_to_bridge_idx.size())
                     ? net.node_to_bridge_idx[nid] : -1;
 
                 double child_scale_sum = 0.0;
+                int boost_count = 0;
                 if (b_idx >= 0) {
                     size_t k = static_cast<size_t>(b_idx);
                     const auto& wb = net.bridges[k];
@@ -379,19 +369,22 @@ public:
                         P_D[cid] = P_branches[cid] * res.D[cid];
                         res.D[nid].array() *= P_D[cid].array();
                         child_scale_sum += node_log_scale[cid];
+                        double cur_max = res.D[nid].maxCoeff();
+                        while (cur_max < SCALER_THRESH && cur_max > 0.0) {
+                            res.D[nid] *= SCALER_UP;
+                            cur_max *= SCALER_UP;
+                            boost_count++;
+                        }
                     }
                 }
 
                 double max_val = res.D[nid].maxCoeff();
-                int boost_count = 0;
-                double boost_mult = 1.0;
                 while (max_val < SCALER_THRESH && max_val > 0.0) {
                     res.D[nid] *= SCALER_UP;
                     max_val *= SCALER_UP;
-                    boost_mult *= SCALER_UP;
                     boost_count++;
                 }
-                B[nid] = boost_mult;
+                boost_counts[nid] = boost_count;
                 node_log_scale[nid] = child_scale_sum - boost_count * LOG_SCALER;
             }
         }
@@ -406,6 +399,10 @@ public:
         // 2. Pre-order (top-down) Outside pass
         std::vector<Vector> U(num_nodes, Vector::Zero(S));
         U[tree.root_id] = pi;
+        std::vector<Vector> pref;
+        std::vector<Vector> suff;
+        std::vector<int> pref_boost;
+        std::vector<int> suff_boost;
 
         for (auto it = tree.post_order.rbegin(); it != tree.post_order.rend(); ++it) {
             int32_t uid = *it;
@@ -422,7 +419,10 @@ public:
                 int32_t id_B = wb.children[1];
                 int32_t id_C = wb.children[2];
 
-                Vector U_tilde = B[uid] * U[uid];
+                Vector U_tilde = U[uid];
+                for (int b = 0; b < boost_counts[uid]; ++b) {
+                    U_tilde *= SCALER_UP;
+                }
 
                 // Resolution-specific pattern likelihoods L_{p,k,r} = \tilde{U}_u^T D_u^{(r), raw}
                 for (int r = 0; r < 3; ++r) {
@@ -461,15 +461,58 @@ public:
                 U[id_C] = P_branches[id_C].transpose() * res.V[id_C];
             } else {
                 size_t num_children = node.children.size();
+                if (num_children == 0) continue;
+
+                if (pref.size() < num_children) {
+                    pref.resize(num_children, Vector::Ones(S));
+                    suff.resize(num_children, Vector::Ones(S));
+                    pref_boost.resize(num_children, 0);
+                    suff_boost.resize(num_children, 0);
+                }
+
+                pref[0].setOnes(S);
+                pref_boost[0] = 0;
+                for (size_t i = 1; i < num_children; ++i) {
+                    int32_t prev_cid = node.children[i - 1];
+                    pref[i] = pref[i - 1].cwiseProduct(P_D[prev_cid]);
+                    int b_cnt = pref_boost[i - 1];
+                    double cur_max = pref[i].maxCoeff();
+                    while (cur_max < SCALER_THRESH && cur_max > 0.0) {
+                        pref[i] *= SCALER_UP;
+                        cur_max *= SCALER_UP;
+                        b_cnt++;
+                    }
+                    pref_boost[i] = b_cnt;
+                }
+
+                suff[num_children - 1].setOnes(S);
+                suff_boost[num_children - 1] = 0;
+                for (size_t i = num_children - 1; i > 0; --i) {
+                    int32_t next_cid = node.children[i];
+                    suff[i - 1] = suff[i].cwiseProduct(P_D[next_cid]);
+                    int b_cnt = suff_boost[i];
+                    double cur_max = suff[i - 1].maxCoeff();
+                    while (cur_max < SCALER_THRESH && cur_max > 0.0) {
+                        suff[i - 1] *= SCALER_UP;
+                        cur_max *= SCALER_UP;
+                        b_cnt++;
+                    }
+                    suff_boost[i - 1] = b_cnt;
+                }
+
+                int total_boost = boost_counts[uid];
                 for (size_t i = 0; i < num_children; ++i) {
                     int32_t vid = node.children[i];
-                    Vector v_msg = U[uid];
-                    for (size_t j = 0; j < num_children; ++j) {
-                        if (i != j) {
-                            v_msg.array() *= P_D[node.children[j]].array();
-                        }
+                    Vector v_msg = U[uid].cwiseProduct(pref[i]).cwiseProduct(suff[i]);
+                    int net_boost = total_boost - pref_boost[i] - suff_boost[i];
+                    while (net_boost > 0) {
+                        v_msg *= SCALER_UP;
+                        net_boost--;
                     }
-                    v_msg *= B[uid];
+                    while (net_boost < 0) {
+                        v_msg *= SCALER_DOWN;
+                        net_boost++;
+                    }
                     res.V[vid] = v_msg;
                     U[vid] = P_branches[vid].transpose() * v_msg;
                 }
@@ -542,35 +585,29 @@ public:
             ? *custom_leaf_to_taxon
             : (local_map = LikelihoodEngine::build_leaf_to_taxon_map(tree, aln));
 
-        Scalar total_log_l = 0.0;
-        std::vector<Scalar> dL_dtau_branches(num_nodes, 0.0);
-        std::vector<Matrix> A_branches(num_nodes, Matrix::Zero(S, S));
+        std::vector<Scalar> pattern_ll(num_patterns, 0.0);
+        Matrix pattern_dL_b = Matrix::Zero(num_nodes, num_patterns);
+        std::vector<Matrix> V_mat_b(num_nodes, Matrix::Zero(S, num_patterns));
+        std::vector<Matrix> D_mat_b(num_nodes, Matrix::Zero(S, num_patterns));
 
-        std::vector<std::array<Scalar, 3>> dL_dtau_bridges(num_bridges, {0.0, 0.0, 0.0});
-        std::vector<std::array<Scalar, 3>> dL_dw_bridges(num_bridges, {0.0, 0.0, 0.0});
-        std::vector<std::array<Matrix, 3>> A_bridges(num_bridges);
+        std::vector<std::array<std::vector<Scalar>, 3>> pattern_dL_br(num_bridges);
+        std::vector<std::array<std::vector<Scalar>, 3>> pattern_dL_w(num_bridges);
+        std::vector<std::array<Matrix, 3>> V_mat_br(num_bridges);
+        std::vector<std::array<Matrix, 3>> Y_mat_br(num_bridges);
         for (size_t k = 0; k < num_bridges; ++k) {
             for (int r = 0; r < 3; ++r) {
-                A_bridges[k][r] = Matrix::Zero(S, S);
+                pattern_dL_br[k][r].assign(num_patterns, 0.0);
+                pattern_dL_w[k][r].assign(num_patterns, 0.0);
+                V_mat_br[k][r] = Matrix::Zero(S, num_patterns);
+                Y_mat_br[k][r] = Matrix::Zero(S, num_patterns);
             }
         }
 
-        #pragma omp parallel
+        int n_threads = LikelihoodEngine::optimal_omp_threads(num_patterns, 16);
+
+        #pragma omp parallel num_threads(n_threads)
         {
-            Scalar local_ll = 0.0;
-            std::vector<Scalar> local_dL_b(num_nodes, 0.0);
-            std::vector<Matrix> local_A_b(num_nodes, Matrix::Zero(S, S));
-
-            std::vector<std::array<Scalar, 3>> local_dL_br(num_bridges, {0.0, 0.0, 0.0});
-            std::vector<std::array<Scalar, 3>> local_dL_w(num_bridges, {0.0, 0.0, 0.0});
-            std::vector<std::array<Matrix, 3>> local_A_br(num_bridges);
-            for (size_t k = 0; k < num_bridges; ++k) {
-                for (int r = 0; r < 3; ++r) {
-                    local_A_br[k][r] = Matrix::Zero(S, S);
-                }
-            }
-
-            #pragma omp for schedule(dynamic)
+            #pragma omp for schedule(static)
             for (size_t p = 0; p < num_patterns; ++p) {
                 const auto& pattern = aln.patterns[p];
                 auto io = compute_inside_outside(
@@ -578,7 +615,7 @@ public:
                 );
                 Scalar L = io.likelihood;
                 if (L > 0.0) {
-                    local_ll += pattern.weight * io.log_likelihood;
+                    pattern_ll[p] = pattern.weight * io.log_likelihood;
                     Scalar inv_L = pattern.weight / L;
 
                     // Backbone branch accumulators
@@ -586,39 +623,51 @@ public:
                         if (node.id != tree.root_id && (node.is_leaf || !node.children.empty())) {
                             int32_t bid = node.id;
                             Scalar dL_dt = io.V[bid].dot(dP_branches[bid] * io.D[bid]);
-                            local_dL_b[bid] += inv_L * dL_dt;
-                            local_A_b[bid].noalias() += inv_L * (io.V[bid] * io.D[bid].transpose());
+                            pattern_dL_b(bid, p) = inv_L * dL_dt;
+                            V_mat_b[bid].col(p) = inv_L * io.V[bid];
+                            D_mat_b[bid].col(p) = io.D[bid];
                         }
                     }
 
                     // Bridge branch & weight accumulators
                     for (size_t k = 0; k < num_bridges; ++k) {
                         for (int r = 0; r < 3; ++r) {
-                            local_dL_w[k][r] += inv_L * io.L_bridge[k][r];
+                            pattern_dL_w[k][r][p] = inv_L * io.L_bridge[k][r];
                             if (net.bridges[k].weights[r] > 0.0 || r == 0) {
                                 Scalar dL_dt = io.V_bridge[k][r].dot(dP_bridges[k][r] * io.Y_bridge[k][r]);
-                                local_dL_br[k][r] += inv_L * dL_dt;
-                                local_A_br[k][r].noalias() += inv_L * (io.V_bridge[k][r] * io.Y_bridge[k][r].transpose());
+                                pattern_dL_br[k][r][p] = inv_L * dL_dt;
+                                V_mat_br[k][r].col(p) = inv_L * io.V_bridge[k][r];
+                                Y_mat_br[k][r].col(p) = io.Y_bridge[k][r];
                             }
                         }
                     }
                 }
             }
+        }
 
-            #pragma omp critical
-            {
-                total_log_l += local_ll;
-                for (size_t i = 0; i < num_nodes; ++i) {
-                    dL_dtau_branches[i] += local_dL_b[i];
-                    A_branches[i] += local_A_b[i];
+        Scalar total_log_l = LikelihoodEngine::neumaier_sum(pattern_ll);
+        std::vector<Scalar> dL_dtau_branches(num_nodes, 0.0);
+        std::vector<Matrix> A_branches(num_nodes, Matrix::Zero(S, S));
+        std::vector<Scalar> row_terms(num_patterns, 0.0);
+        for (const auto& node : tree.nodes) {
+            if (node.id != tree.root_id && (node.is_leaf || !node.children.empty())) {
+                int32_t bid = node.id;
+                for (size_t p = 0; p < num_patterns; ++p) {
+                    row_terms[p] = pattern_dL_b(bid, p);
                 }
-                for (size_t k = 0; k < num_bridges; ++k) {
-                    for (int r = 0; r < 3; ++r) {
-                        dL_dtau_bridges[k][r] += local_dL_br[k][r];
-                        dL_dw_bridges[k][r] += local_dL_w[k][r];
-                        A_bridges[k][r] += local_A_br[k][r];
-                    }
-                }
+                dL_dtau_branches[bid] = LikelihoodEngine::neumaier_sum(row_terms);
+                A_branches[bid].noalias() = V_mat_b[bid] * D_mat_b[bid].transpose();
+            }
+        }
+
+        std::vector<std::array<Scalar, 3>> dL_dtau_bridges(num_bridges, {0.0, 0.0, 0.0});
+        std::vector<std::array<Scalar, 3>> dL_dw_bridges(num_bridges, {0.0, 0.0, 0.0});
+        std::vector<std::array<Matrix, 3>> A_bridges(num_bridges);
+        for (size_t k = 0; k < num_bridges; ++k) {
+            for (int r = 0; r < 3; ++r) {
+                dL_dtau_bridges[k][r] = LikelihoodEngine::neumaier_sum(pattern_dL_br[k][r]);
+                dL_dw_bridges[k][r] = LikelihoodEngine::neumaier_sum(pattern_dL_w[k][r]);
+                A_bridges[k][r].noalias() = V_mat_br[k][r] * Y_mat_br[k][r].transpose();
             }
         }
 

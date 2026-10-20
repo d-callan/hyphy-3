@@ -72,7 +72,7 @@ nlohmann::json RELAXResult::to_legacy_json(const Tree& tree, const Alignment& al
             }}
         };
 
-        auto format_distro = [](const RELAXRateDistribution& ref_d, const RELAXRateDistribution& test_d) {
+        auto format_distro = [](const RELAXRateDistribution& ref_d, const RELAXRateDistribution& test_d, const RELAXRateDistribution& uncl_d) {
             nlohmann::json res;
             nlohmann::json r_obj, t_obj;
             for (size_t k = 0; k < ref_d.omegas.size(); ++k) {
@@ -87,6 +87,16 @@ nlohmann::json RELAXResult::to_legacy_json(const Tree& tree, const Alignment& al
             }
             res["Reference"] = r_obj;
             res["Test"] = t_obj;
+            if (!uncl_d.omegas.empty() && uncl_d.omegas.size() == uncl_d.weights.size()) {
+                nlohmann::json u_obj;
+                for (size_t k = 0; k < uncl_d.omegas.size(); ++k) {
+                    u_obj[std::to_string(k)] = {
+                        {"omega", uncl_d.omegas[k]},
+                        {"proportion", uncl_d.weights[k]}
+                    };
+                }
+                res["Unclassified"] = u_obj;
+            }
             return res;
         };
 
@@ -96,7 +106,9 @@ nlohmann::json RELAXResult::to_legacy_json(const Tree& tree, const Alignment& al
             {"Log Likelihood", alternative_fit.log_likelihood},
             {"display order", 2},
             {"estimated parameters", alternative_fit.parameters},
-            {"Rate Distributions", format_distro(alternative_fit.reference_distribution, alternative_fit.test_distribution)}
+            {"realized_cycles", alternative_fit.realized_cycles},
+            {"converged", alternative_fit.converged},
+            {"Rate Distributions", format_distro(alternative_fit.reference_distribution, alternative_fit.test_distribution, alternative_fit.unclassified_distribution)}
         };
 
         // Null fit
@@ -105,7 +117,9 @@ nlohmann::json RELAXResult::to_legacy_json(const Tree& tree, const Alignment& al
             {"Log Likelihood", null_fit.log_likelihood},
             {"display order", 3},
             {"estimated parameters", null_fit.parameters},
-            {"Rate Distributions", format_distro(null_fit.reference_distribution, null_fit.test_distribution)}
+            {"realized_cycles", null_fit.realized_cycles},
+            {"converged", null_fit.converged},
+            {"Rate Distributions", format_distro(null_fit.reference_distribution, null_fit.test_distribution, null_fit.unclassified_distribution)}
         };
 
         j["fits"] = fits;
@@ -152,13 +166,18 @@ nlohmann::json RELAXResult::to_legacy_json(const Tree& tree, const Alignment& al
         j["branch attributes"] = {{"0", branch_attr}};
 
         // 7. Site Log Likelihoods
-        if (!alternative_fit.site_log_likelihoods.empty() && !null_fit.site_log_likelihoods.empty()) {
-            j["Site Log Likelihood"] = {
-                {"0", {
-                    {"unconstrained", {alternative_fit.site_log_likelihoods}},
-                    {"constrained", {null_fit.site_log_likelihoods}}
-                }}
-            };
+        if (!alternative_fit.site_log_likelihoods.empty()) {
+            const auto& constrained_vals = !branch_switched_evidence_ratios.empty()
+                ? branch_switched_evidence_ratios
+                : null_fit.site_log_likelihoods;
+            if (!constrained_vals.empty()) {
+                j["Site Log Likelihood"] = {
+                    {"0", {
+                        {"unconstrained", {alternative_fit.site_log_likelihoods}},
+                        {"constrained", {constrained_vals}}
+                    }}
+                };
+            }
         }
 
         j["runtime"] = "3.0.0";
@@ -214,7 +233,8 @@ nlohmann::json RELAXResult::to_modern_json(const Tree& tree, const Alignment& al
 
         // Model fits
         auto format_distro_modern = [](const RELAXRateDistribution& ref_d,
-                                       const RELAXRateDistribution& test_d) {
+                                       const RELAXRateDistribution& test_d,
+                                       const RELAXRateDistribution& uncl_d) {
             if (ref_d.omegas.size() != ref_d.weights.size() ||
                 test_d.omegas.size() != test_d.weights.size() ||
                 ref_d.omegas.size() != test_d.omegas.size()) {
@@ -242,6 +262,17 @@ nlohmann::json RELAXResult::to_modern_json(const Tree& tree, const Alignment& al
             }
             d["reference"] = ref_arr;
             d["test"] = test_arr;
+            if (!uncl_d.omegas.empty() && uncl_d.omegas.size() == uncl_d.weights.size()) {
+                nlohmann::json uncl_arr = nlohmann::json::array();
+                for (size_t k = 0; k < uncl_d.omegas.size(); ++k) {
+                    uncl_arr.push_back({
+                        {"class", static_cast<int>(k + 1)},
+                        {"omega", finite_or_null(uncl_d.omegas[k])},
+                        {"proportion", finite_or_null(uncl_d.weights[k])}
+                    });
+                }
+                d["unclassified"] = uncl_arr;
+            }
             return d;
         };
 
@@ -265,8 +296,11 @@ nlohmann::json RELAXResult::to_modern_json(const Tree& tree, const Alignment& al
             alternative_fit.log_likelihood, alternative_fit.aicc,
             static_cast<int>(alternative_fit.parameters));
         alt["k_parameter"] = finite_or_null(k);
+        alt["realized_cycles"] = alternative_fit.realized_cycles;
+        alt["converged"] = alternative_fit.converged;
         alt["rate_distributions"] = format_distro_modern(
-            alternative_fit.reference_distribution, alternative_fit.test_distribution);
+            alternative_fit.reference_distribution, alternative_fit.test_distribution,
+            alternative_fit.unclassified_distribution);
         j["model_fits"]["alternative"] = alt;
 
         nlohmann::json nul = fit_entry(
@@ -274,8 +308,11 @@ nlohmann::json RELAXResult::to_modern_json(const Tree& tree, const Alignment& al
             null_fit.log_likelihood, null_fit.aicc,
             static_cast<int>(null_fit.parameters));
         nul["k_parameter"] = 1.0;
+        nul["realized_cycles"] = null_fit.realized_cycles;
+        nul["converged"] = null_fit.converged;
         nul["rate_distributions"] = format_distro_modern(
-            null_fit.reference_distribution, null_fit.test_distribution);
+            null_fit.reference_distribution, null_fit.test_distribution,
+            null_fit.unclassified_distribution);
         j["model_fits"]["null"] = nul;
 
         // Statistical tests

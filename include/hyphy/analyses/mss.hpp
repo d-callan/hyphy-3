@@ -633,7 +633,15 @@ public:
             MG94Matrix mg_mat_f81;
             mg_mat_f81.update(mg_p, ctx.aln.pos_nuc_frequencies, ctx.aln.codon_frequencies_f3x4, *code);
             Scalar conv_f81 = (mg_mat_f81.scale_factor > 0.0) ? (3.0 / mg_mat_f81.scale_factor) : 3.0;
-            sweep_codon_branches_cavity(ctx.tree, ctx.aln, mg_mat_f81, ctx.leaf_to_taxon, conv_f81);
+            Scalar prev_sweep_ll = LikelihoodEngine::compute_mg94_log_likelihood(ctx.tree, ctx.aln, mg_mat_f81, &ctx.leaf_to_taxon, conv_f81);
+            for (int sweep = 0; sweep < 5; ++sweep) {
+                sweep_codon_branches_cavity(ctx.tree, ctx.aln, mg_mat_f81, ctx.leaf_to_taxon, conv_f81, 1e-4, 25);
+                Scalar cur_ll = LikelihoodEngine::compute_mg94_log_likelihood(ctx.tree, ctx.aln, mg_mat_f81, &ctx.leaf_to_taxon, conv_f81);
+                if (std::abs(cur_ll - prev_sweep_ll) < 1e-3) {
+                    break;
+                }
+                prev_sweep_ll = cur_ll;
+            }
         }
 
         MG94Matrix mg_mat;
@@ -664,8 +672,8 @@ public:
         const MG94Matrix& mg,
         const std::vector<size_t>& leaf_to_taxon,
         Scalar conv,
-        Scalar tol = 1e-3,
-        int max_iter = 12
+        Scalar tol = 1e-4,
+        int max_iter = 25
     ) {
         size_t num_nodes = curr_tree.num_nodes();
         size_t num_patterns = aln.patterns.size();
@@ -763,6 +771,18 @@ public:
                         U[cid][p] = cav;
                     }
                     dfs(cid);
+                }
+                for (size_t p = 0; p < num_patterns; ++p) {
+                    Vector d_vec = Vector::Ones(S);
+                    for (int32_t cid : node.children) {
+                        d_vec.array() *= P_D[cid][p].array();
+                        Scalar mx = d_vec.maxCoeff();
+                        if (mx > 0.0 && mx < 1e-100) d_vec /= mx;
+                    }
+                    D[uid][p] = d_vec;
+                    if (uid != curr_tree.root_id) {
+                        P_D[uid][p] = P_branch[uid] * d_vec;
+                    }
                 }
             }
         };
@@ -877,7 +897,7 @@ public:
         std::vector<Scalar>& gene_scalers,
         std::vector<Scalar>& gene_omegas,
         bool fix_omega,
-        int max_cycles = 3
+        int max_cycles = 8
     ) const {
         size_t K = part.num_classes();
         size_t G = genes.size();
@@ -923,11 +943,11 @@ public:
                             if (node.id != g.tree.root_id) P_br[node.id] = m.transition_matrix(g.branch_tau[node.id] * sc);
                         }
                         return -LikelihoodEngine::compute_tree_log_likelihood_from_P(g.tree, g.aln, P_br, m.pi, S, &g.leaf_to_taxon);
-                    }, 0.2, gene_scalers[g_idx], 5.0, 1e-4, 20);
+                    }, 1e-3, gene_scalers[g_idx], 1000.0, 1e-4, 40);
                     gene_scalers[g_idx] = best_s;
                 } else {
                     auto opt2 = NelderMead2D::minimize([&](Scalar w, Scalar sc) {
-                        if (w < 1e-5 || w > 50.0 || sc < 0.1 || sc > 10.0) return 1e20;
+                        if (w < 1e-5 || w > 50.0 || sc < 1e-3 || sc > 1000.0) return 1e20;
                         MG94Parameters p = g.mg94_params;
                         p.alpha = 1.0;
                         p.beta = w;
@@ -940,9 +960,9 @@ public:
                             if (node.id != g.tree.root_id) P_br[node.id] = m.transition_matrix(g.branch_tau[node.id] * sc);
                         }
                         return -LikelihoodEngine::compute_tree_log_likelihood_from_P(g.tree, g.aln, P_br, m.pi, S, &g.leaf_to_taxon);
-                    }, gene_omegas[g_idx], gene_scalers[g_idx], 1e-5, 20.0, 1e-4, 35);
-                    gene_omegas[g_idx] = std::max(1e-5, opt2.a);
-                    gene_scalers[g_idx] = std::max(0.1, opt2.b);
+                    }, gene_omegas[g_idx], gene_scalers[g_idx], 1e-5, 1000.0, 1e-4, 40);
+                    gene_omegas[g_idx] = std::clamp(opt2.a, 1e-5, 50.0);
+                    gene_scalers[g_idx] = std::clamp(opt2.b, 1e-3, 1000.0);
                 }
             }
             return evaluate_composite_log_l(part, class_rates, &gene_scalers, &gene_omegas);
@@ -958,7 +978,7 @@ public:
         Scalar prev_ll = evaluate_composite_log_l(part, class_rates, &gene_scalers, &gene_omegas);
 
         for (int cycle = 0; cycle < max_cycles; ++cycle) {
-            // Step A: Optimize each non-pivot class rate via 1D Brent in log-space
+            // Step A: Optimize each non-pivot class rate via 1D Brent
             for (size_t k = 0; k < K; ++k) {
                 if (static_cast<int>(k) == ref_k) continue;
                 if (class_flux[k] <= 1e-12) continue;
@@ -973,8 +993,8 @@ public:
                     return -evaluate_composite_log_l(part, cand, &gene_scalers, &gene_omegas);
                 };
                 Scalar lo = std::max(1e-3, init_r * 0.15);
-                Scalar hi = std::min(20.0, std::max(3.0, init_r * 4.0));
-                auto [best_r, _] = Brent1D::minimize(obj_k, lo, init_r, hi, 1e-3, 16);
+                Scalar hi = std::min(100.0, std::max(10.0, init_r * 6.0));
+                auto [best_r, _] = Brent1D::minimize(obj_k, lo, init_r, hi, 1e-4, 40);
                 class_rates[k] = best_r;
                 if (norm != MSSNormalization::NeutralRef) {
                     normalize_class_rates(class_rates, norm, part.neutral_class_id, class_flux);
@@ -1001,11 +1021,11 @@ public:
                             if (node.id != g.tree.root_id) P_br[node.id] = m.transition_matrix(g.branch_tau[node.id] * sc);
                         }
                         return -LikelihoodEngine::compute_tree_log_likelihood_from_P(g.tree, g.aln, P_br, m.pi, S, &g.leaf_to_taxon);
-                    }, 0.25, gene_scalers[g_idx], 4.0, 1e-3, 14);
+                    }, 1e-3, gene_scalers[g_idx], 1000.0, 1e-4, 40);
                     gene_scalers[g_idx] = best_s;
                 } else {
                     auto opt2 = NelderMead2D::minimize([&](Scalar w, Scalar sc) {
-                        if (w < 1e-5 || w > 50.0 || sc < 0.1 || sc > 10.0) return 1e20;
+                        if (w < 1e-5 || w > 50.0 || sc < 1e-3 || sc > 1000.0) return 1e20;
                         MG94Parameters p = g.mg94_params;
                         p.alpha = 1.0;
                         p.beta = w;
@@ -1018,22 +1038,23 @@ public:
                             if (node.id != g.tree.root_id) P_br[node.id] = m.transition_matrix(g.branch_tau[node.id] * sc);
                         }
                         return -LikelihoodEngine::compute_tree_log_likelihood_from_P(g.tree, g.aln, P_br, m.pi, S, &g.leaf_to_taxon);
-                    }, gene_omegas[g_idx], gene_scalers[g_idx], 1e-5, 20.0, 1e-3, 25);
-                    gene_omegas[g_idx] = std::max(1e-5, opt2.a);
-                    gene_scalers[g_idx] = std::max(0.1, opt2.b);
+                    }, gene_omegas[g_idx], gene_scalers[g_idx], 1e-5, 1000.0, 1e-4, 40);
+                    gene_omegas[g_idx] = std::clamp(opt2.a, 1e-5, 50.0);
+                    gene_scalers[g_idx] = std::clamp(opt2.b, 1e-3, 1000.0);
                 }
             }
 
             normalize_class_rates(class_rates, norm, part.neutral_class_id, class_flux);
             Scalar cur_ll = evaluate_composite_log_l(part, class_rates, &gene_scalers, &gene_omegas);
-            if (cur_ll - prev_ll < 1e-3 && cycle >= 1) {
+            Scalar gain = cur_ll - prev_ll;
+            if (cycle >= 2 && gain < 1e-4) {
                 prev_ll = cur_ll;
                 break;
             }
             prev_ll = cur_ll;
         }
 
-        // Single-gene branch-length polish if G == 1
+        // Single-gene 1D Brent scaler polish if G == 1 (F-061)
         if (G == 1 && !fix_omega) {
             int S = code->num_sense_codons;
             std::vector<Scalar> syn_mat = part.expand_to_matrix(S, class_rates);
@@ -1044,8 +1065,18 @@ public:
             p.syn_pair_rates = &syn_mat;
             MG94Matrix m;
             m.update(p, g.aln.pos_nuc_frequencies, g.aln.codon_frequencies_f3x4, *code);
-            Scalar cur_ll = evaluate_composite_log_l(part, class_rates, &gene_scalers, &gene_omegas);
-            if (cur_ll > prev_ll) prev_ll = cur_ll;
+            auto [best_s, best_nll] = Brent1D::minimize([&](Scalar sc) {
+                size_t nn = g.tree.num_nodes();
+                std::vector<Matrix> P_br(nn);
+                for (const auto& node : g.tree.nodes) {
+                    if (node.id != g.tree.root_id) P_br[node.id] = m.transition_matrix(g.branch_tau[node.id] * sc);
+                }
+                return -LikelihoodEngine::compute_tree_log_likelihood_from_P(g.tree, g.aln, P_br, m.pi, S, &g.leaf_to_taxon);
+            }, 1e-3, gene_scalers[0], 1000.0, 1e-4, 40);
+            if (-best_nll > prev_ll) {
+                gene_scalers[0] = best_s;
+                prev_ll = -best_nll;
+            }
         }
 
         return prev_ll;
@@ -1408,11 +1439,13 @@ public:
             in_settings.shared_between_rate
         );
 
-        // Determine effective normalization
+        // Determine effective normalization (F-030)
         MSSNormalization norm = in_settings.normalization;
         if (!in_settings.normalization_explicit) {
             if (res.partition.neutral_class_id >= 0) {
                 norm = MSSNormalization::NeutralRef;
+            } else if (in_settings.fix_omega) {
+                norm = MSSNormalization::Unweighted;
             } else {
                 norm = MSSNormalization::Flux;
             }
@@ -1445,7 +1478,7 @@ public:
             gene_scalers,
             gene_omegas,
             in_settings.fix_omega,
-            3
+            8
         );
 
         size_t extra_params = (!res.partition.is_empirical_fixed && K > 1) ? (K - 1) : 0;
@@ -1493,7 +1526,7 @@ public:
                 est.p_value_uncorrected = 1.0;
                 est.p_value_holm = 1.0;
             } else {
-                // Evaluate profile log-likelihood at alpha_k = 1.0 (with gene scalers re-optimized)
+                // Evaluate profile log-likelihood at target_r (with per-gene scalers & omegas re-optimized, F-027)
                 auto eval_profile_at = [&](Scalar target_r) -> Scalar {
                     std::vector<Scalar> cand = class_rates;
                     if (norm == MSSNormalization::NeutralRef) {
@@ -1520,7 +1553,52 @@ public:
                             }
                         }
                     }
-                    return evaluate_composite_log_l(res.partition, cand, &gene_scalers, &gene_omegas);
+
+                    std::vector<Scalar> local_scalers = gene_scalers;
+                    std::vector<Scalar> local_omegas = gene_omegas;
+                    int S_local = code->num_sense_codons;
+                    std::vector<Scalar> syn_mat_local = res.partition.expand_to_matrix(S_local, cand);
+                    size_t G_local = genes.size();
+                    for (size_t g_idx = 0; g_idx < G_local; ++g_idx) {
+                        const auto& g = genes[g_idx];
+                        if (in_settings.fix_omega) {
+                            MG94Parameters p = g.mg94_params;
+                            p.alpha = 1.0;
+                            p.beta = local_omegas[g_idx];
+                            p.syn_pair_rates = &syn_mat_local;
+                            MG94Matrix m;
+                            m.update(p, g.aln.pos_nuc_frequencies, g.aln.codon_frequencies_f3x4, *code);
+                            auto [best_s, _] = Brent1D::minimize([&](Scalar sc) {
+                                size_t nn = g.tree.num_nodes();
+                                std::vector<Matrix> P_br(nn);
+                                for (const auto& node : g.tree.nodes) {
+                                    if (node.id != g.tree.root_id) P_br[node.id] = m.transition_matrix(g.branch_tau[node.id] * sc);
+                                }
+                                return -LikelihoodEngine::compute_tree_log_likelihood_from_P(g.tree, g.aln, P_br, m.pi, S_local, &g.leaf_to_taxon);
+                            }, 1e-3, local_scalers[g_idx], 1000.0, 1e-4, 25);
+                            local_scalers[g_idx] = best_s;
+                        } else {
+                            auto opt2 = NelderMead2D::minimize([&](Scalar w, Scalar sc) {
+                                if (w < 1e-5 || w > 50.0 || sc < 1e-3 || sc > 1000.0) return 1e20;
+                                MG94Parameters p = g.mg94_params;
+                                p.alpha = 1.0;
+                                p.beta = w;
+                                p.syn_pair_rates = &syn_mat_local;
+                                MG94Matrix m;
+                                m.update(p, g.aln.pos_nuc_frequencies, g.aln.codon_frequencies_f3x4, *code);
+                                size_t nn = g.tree.num_nodes();
+                                std::vector<Matrix> P_br(nn);
+                                for (const auto& node : g.tree.nodes) {
+                                    if (node.id != g.tree.root_id) P_br[node.id] = m.transition_matrix(g.branch_tau[node.id] * sc);
+                                }
+                                return -LikelihoodEngine::compute_tree_log_likelihood_from_P(g.tree, g.aln, P_br, m.pi, S_local, &g.leaf_to_taxon);
+                            }, local_omegas[g_idx], local_scalers[g_idx], 1e-5, 1000.0, 1e-4, 25);
+                            local_omegas[g_idx] = std::clamp(opt2.a, 1e-5, 50.0);
+                            local_scalers[g_idx] = std::clamp(opt2.b, 1e-3, 1000.0);
+                        }
+                    }
+
+                    return evaluate_composite_log_l(res.partition, cand, &local_scalers, &local_omegas);
                 };
 
                 // Local quadratic curvature for SE and 95% profile CI

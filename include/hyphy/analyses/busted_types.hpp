@@ -2,6 +2,7 @@
 
 #include "hyphy/core/types.hpp"
 #include "hyphy/core/stats.hpp"
+#include <map>
 #include <string>
 #include <vector>
 
@@ -146,7 +147,12 @@ struct BUSTEDResult {
     BUSTEDFit relax_alternative;
 
     std::vector<BUSTEDMSSClassRate> mss_rates; // Populated when BUSTED-MSS (--mss) is enabled
-    std::vector<Scalar> evidence_ratios; // Bayes factors per site for omega_K > 1
+    std::vector<Scalar> evidence_ratios; // Optimized null ERs: exp(ell_alt - ell_opt_null) per site
+    std::vector<Scalar> constrained_evidence_ratios; // Clamp-only ERs: exp(ell_alt - ell_clamped) holding alt nuisance params fixed
+    std::map<std::string, std::vector<Scalar>> branch_posterior_probabilities; // Per-branch, per-site posterior P(omega_K | b, s)
+    std::map<std::string, std::vector<Scalar>> branch_empirical_bayes_factors; // Per-branch, per-site EBF for omega_K
+    std::map<std::string, std::vector<Scalar>> branch_er_2h; // Per-branch, per-site 2-hit evidence ratio when --multiple-hits is active
+    std::map<std::string, std::vector<Scalar>> branch_er_3h; // Per-branch, per-site 3-hit evidence ratio when --multiple-hits Double+Triple is active
     std::vector<Scalar> site_error_bfs;  // Max error sink Bayes factor across branches per site
     std::vector<BUSTEDErrorEvent> flagged_error_events; // Branch-site pairs with BF_sink >= threshold
     double runtime_seconds = 0.0;

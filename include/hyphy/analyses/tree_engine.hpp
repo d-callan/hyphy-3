@@ -108,8 +108,21 @@ public:
         if (N < 2) {
             throw std::runtime_error("Spectral tree scaffolding requires at least 2 taxa.");
         }
-
         Matrix D = NeighborJoining::compute_tn93_distances(aln);
+        return build_spectral_scaffold_from_distances(D, aln.taxon_names, allow_polytomies, star_threshold, gap_ratio);
+    }
+
+    static Tree build_spectral_scaffold_from_distances(
+        const Matrix& D,
+        const std::vector<std::string>& taxon_names,
+        bool allow_polytomies = true,
+        Scalar star_threshold = 0.05,
+        Scalar gap_ratio = 0.15
+    ) {
+        size_t N = taxon_names.size();
+        if (N < 2) {
+            throw std::runtime_error("Spectral tree scaffolding requires at least 2 taxa.");
+        }
 
         // Compute median positive distance for RBF kernel bandwidth sigma
         std::vector<Scalar> pos_dists;
@@ -136,11 +149,11 @@ public:
             int32_t id = static_cast<int32_t>(tree.nodes.size());
             TreeNode node;
             node.id = id;
-            node.name = aln.sequences[taxon_idx].name;
+            node.name = taxon_names[taxon_idx];
             node.is_leaf = true;
             node.branch_length = 0.01;
             tree.nodes.push_back(std::move(node));
-            tree.leaf_name_to_id[aln.sequences[taxon_idx].name] = id;
+            tree.leaf_name_to_id[taxon_names[taxon_idx]] = id;
             return id;
         };
 
@@ -155,9 +168,9 @@ public:
             return id;
         };
 
-        // Recursive Spectral Cheeger Partition
-        std::function<int32_t(const std::vector<size_t>&)> recurse_partition;
-        recurse_partition = [&](const std::vector<size_t>& indices) -> int32_t {
+        // Recursive Spectral Cheeger Partition with Electrostatic Boundary Grounding
+        std::function<int32_t(const std::vector<size_t>&, const std::vector<size_t>&)> recurse_partition;
+        recurse_partition = [&](const std::vector<size_t>& indices, const std::vector<size_t>& anchor_indices) -> int32_t {
             size_t m = indices.size();
             if (m == 1) {
                 return create_leaf(indices[0]);
@@ -246,7 +259,7 @@ public:
                 return poly_node;
             }
 
-            // Bipartition along the Fiedler vector v2 using maximum eigengap (Cheeger sweep cut)
+            // Bipartition along the Fiedler vector v2 using Electrostatic Port Grounding + Cheeger sweep
             Vector v2 = es.eigenvectors().col(1);
             std::vector<size_t> grp1, grp2;
 
@@ -256,16 +269,80 @@ public:
                 return v2(static_cast<Eigen::Index>(a)) < v2(static_cast<Eigen::Index>(b));
             });
 
-            // Find the maximum eigengap in sorted v2
-            Scalar max_gap = -1.0;
-            size_t best_cut = m / 2; // fallback
+            // Electrostatic Boundary Grounding:
+            // If this subset is connected to an external anchor partition, orient v2 so that
+            // sort_order[0..k) is the boundary-proximal entry port (smallest distance to anchor_indices).
+            std::vector<Scalar> d_anchor(m, 0.0);
+            if (!anchor_indices.empty()) {
+                for (size_t i = 0; i < m; ++i) {
+                    size_t ti = indices[i];
+                    Scalar min_da = 1e9;
+                    for (size_t a : anchor_indices) {
+                        Scalar d = D(static_cast<Eigen::Index>(ti), static_cast<Eigen::Index>(a));
+                        if (d < min_da) min_da = d;
+                    }
+                    d_anchor[i] = min_da;
+                }
+                // Check which pole of v2 is closer to the external anchor
+                size_t end_window = std::max<size_t>(1, std::min<size_t>(5, m / 3));
+                Scalar left_pole_d = 1e9, right_pole_d = 1e9;
+                for (size_t k = 0; k < end_window; ++k) {
+                    left_pole_d = std::min(left_pole_d, d_anchor[sort_order[k]]);
+                    right_pole_d = std::min(right_pole_d, d_anchor[sort_order[m - 1 - k]]);
+                }
+                if (right_pole_d < left_pole_d) {
+                    std::reverse(sort_order.begin(), sort_order.end());
+                    v2 = -v2;
+                }
+            }
 
+            // Find the optimal cut along sorted v2:
+            // When grounded to an external anchor, a serial conduit (where boundary distance increases
+            // along v2) should peel off the boundary-proximal entry cluster rather than cutting at the
+            // interior centroid (which would invert the proximal half into a reversed side-chain).
+            size_t best_cut = m / 2;
+            Scalar max_gap = -1.0;
             for (size_t k = 0; k < m - 1; ++k) {
-                Scalar gap = v2(static_cast<Eigen::Index>(sort_order[k + 1])) - 
-                             v2(static_cast<Eigen::Index>(sort_order[k]));
+                Scalar gap = std::abs(v2(static_cast<Eigen::Index>(sort_order[k + 1])) -
+                                      v2(static_cast<Eigen::Index>(sort_order[k])));
                 if (gap > max_gap) {
                     max_gap = gap;
                     best_cut = k + 1;
+                }
+            }
+
+            if (!anchor_indices.empty() && m >= 5) {
+                Scalar min_d_all = 1e9, max_d_all = 0.0;
+                size_t argmin_pos = 0;
+                for (size_t k = 0; k < m; ++k) {
+                    Scalar da = d_anchor[sort_order[k]];
+                    if (da < min_d_all) {
+                        min_d_all = da;
+                        argmin_pos = k;
+                    }
+                    if (da > max_d_all) max_d_all = da;
+                }
+
+                // Check if the minimum-distance entry port sits near the proximal end of v2 (first 35%)
+                // while the default best_cut would swallow more than 40% of the clade (inverting the trunk)
+                if (argmin_pos <= m / 3 && (max_d_all - min_d_all) > 2e-3 && best_cut > std::max<size_t>(2, m / 4)) {
+                    // Find the best eigengap in the proximal entry zone [1 .. max(2, m/3)]
+                    // weighted by proximity to the boundary port
+                    size_t max_prox_cut = std::max<size_t>(2, std::min<size_t>(m - 1, std::max<size_t>(argmin_pos + 2, m / 4)));
+                    Scalar best_prox_score = -1.0;
+                    size_t prox_cut = best_cut;
+                    for (size_t k = std::max<size_t>(1, argmin_pos); k <= max_prox_cut && k < m; ++k) {
+                        Scalar gap = std::abs(v2(static_cast<Eigen::Index>(sort_order[k])) -
+                                              v2(static_cast<Eigen::Index>(sort_order[k - 1])));
+                        // Favor cuts right after the entry port where anchor distance steps up
+                        Scalar dist_jump = std::max<Scalar>(0.0, d_anchor[sort_order[k]] - min_d_all);
+                        Scalar score = (gap + 1e-4) * (1.0 + dist_jump / std::max<Scalar>(1e-4, sigma));
+                        if (score > best_prox_score) {
+                            best_prox_score = score;
+                            prox_cut = k;
+                        }
+                    }
+                    best_cut = prox_cut;
                 }
             }
 
@@ -286,9 +363,15 @@ public:
                 }
             }
 
+            // Choose boundary anchors for each child recursion:
+            // For grp1 (proximal), its boundary anchor is the external anchor (if present) or grp2.
+            // For grp2 (distal), its immediate boundary anchor is grp1!
+            const std::vector<size_t>& anchor_for_grp1 = anchor_indices.empty() ? grp2 : anchor_indices;
+            const std::vector<size_t>& anchor_for_grp2 = grp1;
+
             int32_t parent = create_internal();
-            int32_t child1 = recurse_partition(grp1);
-            int32_t child2 = recurse_partition(grp2);
+            int32_t child1 = recurse_partition(grp1, anchor_for_grp1);
+            int32_t child2 = recurse_partition(grp2, anchor_for_grp2);
 
             tree.nodes[parent].children = {child1, child2};
             tree.nodes[child1].parent_id = parent;
@@ -310,8 +393,9 @@ public:
 
         std::vector<size_t> all_taxa(N);
         std::iota(all_taxa.begin(), all_taxa.end(), 0);
+        std::vector<size_t> empty_anchor;
 
-        int32_t root = recurse_partition(all_taxa);
+        int32_t root = recurse_partition(all_taxa, empty_anchor);
         tree.root_id = root;
         tree.compute_post_order();
         return tree;
@@ -405,10 +489,6 @@ public:
                     Scalar local_ll = 0.0;
                     std::vector<Scalar> local_dL(n_nodes, 0.0);
 
-                    const double SCALER_THRESH = 1e-150;
-                    const double SCALER_UP = 1e150;
-                    const double LOG_SCALER = 345.38776394910684;
-
                     #pragma omp for schedule(dynamic)
                     for (size_t p = 0; p < n_pat; ++p) {
                         const auto& pattern = aln_ref.patterns[p];
@@ -436,19 +516,11 @@ public:
                                 for (int32_t cid : node.children) {
                                     P_D[cid] = P_b[cid] * node_L[cid];
                                 }
-                                tree_ref.eval_internal_node(nid, P_b, node_L, node_log_scale, node_L[nid], child_scale_sum);
-
-                                double max_val = node_L[nid].maxCoeff();
-                                int boost_count = 0;
                                 double boost_mult = 1.0;
-                                while (max_val < SCALER_THRESH && max_val > 0.0) {
-                                    node_L[nid] *= SCALER_UP;
-                                    max_val *= SCALER_UP;
-                                    boost_mult *= SCALER_UP;
-                                    boost_count++;
-                                }
+                                const std::vector<std::array<Matrix4, 3>>* no_bridges = nullptr;
+                                tree_ref.eval_internal_node(nid, P_b, node_L, node_log_scale, node_L[nid], child_scale_sum, no_bridges, &boost_mult);
                                 B[nid] = boost_mult;
-                                node_log_scale[nid] = child_scale_sum - boost_count * LOG_SCALER;
+                                node_log_scale[nid] = child_scale_sum;
                             }
                         }
 
@@ -516,7 +588,7 @@ public:
         }
 
         LBFGSpp::LBFGSBParam<Scalar> opt_param;
-        opt_param.m = std::min<int>(6, std::max<int>(2, static_cast<int>(n_b)));
+        opt_param.m = std::max<int>(3, std::min<int>(6, static_cast<int>(n_b)));
         opt_param.epsilon = epsilon;
         opt_param.max_iterations = static_cast<int>(max_iterations);
 
@@ -652,13 +724,9 @@ public:
         std::vector<Vector4> P_D(num_nodes);
         std::vector<double> B(num_nodes, 1.0);
 
-        const double SCALER_THRESH = 1e-150;
-        const double SCALER_UP = 1e150;
-        const double LOG_SCALER = 345.38776394910684;
-
         for (int32_t poly_id : polytomies) {
-            const auto& pnode = tree.nodes[poly_id];
-            size_t k = pnode.children.size();
+            const std::vector<int32_t> p_children = tree.nodes[poly_id].children;
+            size_t k = p_children.size();
             if (k < 3) continue;
 
             // Evaluate directional derivatives for all pairs of children (ci, cj)
@@ -691,19 +759,11 @@ public:
                         for (int32_t cid : node.children) {
                             P_D[cid] = P_b[cid] * D_all[cid];
                         }
-                        tree.eval_internal_node(nid, P_b, D_all, node_log_scale, D_all[nid], child_scale_sum);
-
-                        double max_val = D_all[nid].maxCoeff();
-                        int boost_count = 0;
                         double boost_mult = 1.0;
-                        while (max_val < SCALER_THRESH && max_val > 0.0) {
-                            D_all[nid] *= SCALER_UP;
-                            max_val *= SCALER_UP;
-                            boost_mult *= SCALER_UP;
-                            boost_count++;
-                        }
+                        const std::vector<std::array<Matrix4, 3>>* no_bridges = nullptr;
+                        tree.eval_internal_node(nid, P_b, D_all, node_log_scale, D_all[nid], child_scale_sum, no_bridges, &boost_mult);
                         B[nid] = boost_mult;
-                        node_log_scale[nid] = child_scale_sum - boost_count * LOG_SCALER;
+                        node_log_scale[nid] = child_scale_sum;
                     }
                 }
 
@@ -739,14 +799,14 @@ public:
                 // Screen all pairs of children
                 for (size_t i = 0; i < k; ++i) {
                     for (size_t j = i + 1; j < k; ++j) {
-                        int32_t ci = pnode.children[i];
-                        int32_t cj = pnode.children[j];
+                        int32_t ci = p_children[i];
+                        int32_t cj = p_children[j];
 
                         Vector4 D_pair = P_D[ci].cwiseProduct(P_D[cj]);
                         Vector4 V_pair = V_poly;
                         for (size_t m = 0; m < k; ++m) {
                             if (m != i && m != j) {
-                                V_pair.array() *= P_D[pnode.children[m]].array();
+                                V_pair.array() *= P_D[p_children[m]].array();
                             }
                         }
                         Scalar dL = V_pair.dot(gtr.Q * D_pair);
@@ -763,14 +823,14 @@ public:
 
             // If the best directional gradient exceeds threshold, resolve the pair!
             if (best_grad > gradient_threshold) {
-                int32_t ci = pnode.children[best_i];
-                int32_t cj = pnode.children[best_j];
+                int32_t ci = p_children[best_i];
+                int32_t cj = p_children[best_j];
 
                 // Create new internal node grouping (ci, cj)
                 int32_t new_id = static_cast<int32_t>(tree.nodes.size());
                 TreeNode new_node;
                 new_node.id = new_id;
-                new_node.name = "Resolved_" + std::to_string(resolved_count + 1);
+                new_node.name = "Resolved_" + std::to_string(new_id);
                 new_node.parent_id = poly_id;
                 new_node.children = {ci, cj};
                 new_node.branch_length = 0.01;
@@ -785,18 +845,26 @@ public:
                 p_ch.erase(std::remove(p_ch.begin(), p_ch.end(), cj), p_ch.end());
                 p_ch.push_back(new_id);
 
+                // Keep working buffers and post-order synchronized for subsequent polytomies in this pass
+                num_nodes = tree.num_nodes();
+                P_b.push_back(gtr.transition_matrix(0.01));
+                D_all.resize(num_nodes, Vector4::Zero());
+                V_all.resize(num_nodes, Vector4::Zero());
+                node_log_scale.resize(num_nodes, 0.0);
+                P_D.resize(num_nodes, Vector4::Zero());
+                B.resize(num_nodes, 1.0);
+                leaf_to_taxon.resize(num_nodes, static_cast<size_t>(-1));
+                tree.compute_post_order();
+
                 resolved_count++;
             }
         }
 
-        if (resolved_count > 0) {
-            tree.compute_post_order();
-        }
         return resolved_count;
     }
 
     // =========================================================================
-    // 4b. Topological Rearrangement via Ohmic Resistance-Bounded SPR
+    // 4b. Topological Rearrangement via Ohmic Resistance-Bounded SPR & Port Grounding
     // =========================================================================
     static bool is_in_subtree(const Tree& tree, int32_t query, int32_t root) {
         if (query == root) return true;
@@ -809,6 +877,257 @@ public:
             depth++;
         }
         return false;
+    }
+
+    struct PortRegroundResult {
+        Tree tree;
+        std::vector<int32_t> affected_branches;
+    };
+
+    // Native Ohmic Operator: Re-grounds a subtree C_u (currently attached to p_u = parent(u))
+    // by sliding its external attachment port from u to an internal node x strictly inside C_u,
+    // reversing the parent-child orientation along the internal path u <-> ... <-> x.
+    static std::optional<PortRegroundResult> reground_subtree_at_internal_port(
+        const Tree& orig,
+        int32_t u,
+        int32_t x
+    ) {
+        if (u == orig.root_id || u == INVALID_INDEX || x == INVALID_INDEX || u == x) return std::nullopt;
+        if (orig.nodes[x].is_leaf) return std::nullopt;
+        if (!is_in_subtree(orig, x, u)) return std::nullopt;
+
+        int32_t p_u = orig.nodes[u].parent_id;
+        if (p_u == INVALID_INDEX) return std::nullopt;
+
+        // Collect path from u down to x: path[0] = u, path[1] = ..., path[k] = x
+        std::vector<int32_t> path;
+        int32_t curr = x;
+        while (curr != INVALID_INDEX) {
+            path.push_back(curr);
+            if (curr == u) break;
+            curr = orig.nodes[curr].parent_id;
+        }
+        if (path.empty() || path.back() != u || path.size() < 2) return std::nullopt;
+        std::reverse(path.begin(), path.end()); // Now path[0] == u, path.back() == x
+
+        Tree tree = orig;
+        Scalar old_tu = std::max<Scalar>(1e-4, orig.nodes[u].branch_length);
+
+        // Save original edge lengths along the path: edge_len[i] is branch length of path[i] (edge path[i-1] -> path[i])
+        std::vector<Scalar> edge_len(path.size(), 0.0);
+        for (size_t i = 1; i < path.size(); ++i) {
+            edge_len[i] = std::max<Scalar>(1e-4, orig.nodes[path[i]].branch_length);
+        }
+
+        // Reverse edges along the path: for i = 0 .. k-1, path[i] becomes a child of path[i+1]
+        for (size_t i = 0; i + 1 < path.size(); ++i) {
+            int32_t parent_old = path[i];
+            int32_t child_old = path[i + 1];
+
+            // Remove child_old from parent_old.children
+            auto& ch_list = tree.nodes[parent_old].children;
+            ch_list.erase(std::remove(ch_list.begin(), ch_list.end(), child_old), ch_list.end());
+
+            // Add parent_old to child_old.children
+            tree.nodes[child_old].children.push_back(parent_old);
+            tree.nodes[parent_old].parent_id = child_old;
+            tree.nodes[parent_old].branch_length = edge_len[i + 1];
+        }
+
+        // Attach x directly to p_u in place of u
+        auto& pu_ch = tree.nodes[p_u].children;
+        for (size_t i = 0; i < pu_ch.size(); ++i) {
+            if (pu_ch[i] == u) {
+                pu_ch[i] = x;
+                break;
+            }
+        }
+        tree.nodes[x].parent_id = p_u;
+        tree.nodes[x].branch_length = std::max<Scalar>(1e-4, 0.5 * old_tu);
+
+        std::vector<int32_t> raw_affected;
+        raw_affected.push_back(x);
+        for (int32_t c : tree.nodes[x].children) raw_affected.push_back(c);
+
+        if (tree.nodes[u].children.size() == 1) {
+            int32_t s = tree.nodes[u].children[0];
+            int32_t p_new = tree.nodes[u].parent_id; // which is path[1]
+            auto& pnew_ch = tree.nodes[p_new].children;
+            for (size_t i = 0; i < pnew_ch.size(); ++i) {
+                if (pnew_ch[i] == u) {
+                    pnew_ch[i] = s;
+                    break;
+                }
+            }
+            tree.nodes[s].parent_id = p_new;
+            tree.nodes[s].branch_length += tree.nodes[u].branch_length;
+            tree.nodes[u].children.clear();
+            tree.nodes[u].parent_id = INVALID_INDEX;
+            tree.nodes[u].branch_length = 0.0;
+            raw_affected.push_back(s);
+        }
+
+        for (size_t i = 0; i < path.size(); ++i) {
+            raw_affected.push_back(path[i]);
+        }
+
+        std::vector<int32_t> affected;
+        for (int32_t nid : raw_affected) {
+            if (nid >= 0 && static_cast<size_t>(nid) < tree.nodes.size() &&
+                nid != tree.root_id && tree.nodes[nid].parent_id != INVALID_INDEX) {
+                affected.push_back(nid);
+            }
+        }
+        std::sort(affected.begin(), affected.end());
+        affected.erase(std::unique(affected.begin(), affected.end()), affected.end());
+
+        tree.compute_post_order();
+        if (tree.post_order.empty()) return std::nullopt;
+        for (int32_t nid : tree.post_order) {
+            if (nid < 0 || static_cast<size_t>(nid) >= tree.nodes.size()) return std::nullopt;
+        }
+        return PortRegroundResult{std::move(tree), std::move(affected)};
+    }
+
+    // Native Ohmic Operator: Sweeps internal clades C_u and slides their entry port to the
+    // internal node x in C_u that minimizes effective resistance / maximizes GTR log-likelihood.
+    static size_t run_ohmic_port_regrounding(
+        Tree& tree,
+        const Alignment& aln,
+        const GTRMatrix& gtr,
+        const Matrix& Omega,
+        size_t max_ports_per_clade = 6
+    ) {
+        size_t accepted_regroundings = 0;
+        size_t N = aln.num_taxa;
+        if (N < 5) return 0;
+
+        Scalar current_best_ll = LikelihoodEngine::compute_gtr_log_likelihood(tree, aln, gtr);
+
+        auto compute_node_leaves = [&]() {
+            std::vector<std::vector<size_t>> leaves(tree.nodes.size());
+            for (int32_t nid : tree.post_order) {
+                if (nid == INVALID_INDEX || static_cast<size_t>(nid) >= tree.nodes.size()) continue;
+                if (tree.nodes[nid].is_leaf) {
+                    size_t tid = LikelihoodEngine::find_taxon_index(aln, tree.nodes[nid].name);
+                    if (tid != static_cast<size_t>(-1) && tid < N) {
+                        leaves[nid].push_back(tid);
+                    }
+                } else {
+                    for (int32_t c : tree.nodes[nid].children) {
+                        if (c != INVALID_INDEX && static_cast<size_t>(c) < leaves.size()) {
+                            leaves[nid].insert(leaves[nid].end(), leaves[c].begin(), leaves[c].end());
+                        }
+                    }
+                }
+            }
+            return leaves;
+        };
+
+        std::vector<std::vector<size_t>> node_leaves = compute_node_leaves();
+
+        std::vector<int32_t> internal_clades;
+        for (const auto& node : tree.nodes) {
+            if (!node.is_leaf && node.id != tree.root_id && node.parent_id != INVALID_INDEX) {
+                if (static_cast<size_t>(node.id) < node_leaves.size() && node_leaves[node.id].size() >= 4) {
+                    internal_clades.push_back(node.id);
+                }
+            }
+        }
+
+        // Prioritize clades with higher Ohmic tension (longer subtending branch or larger clade)
+        std::sort(internal_clades.begin(), internal_clades.end(), [&](int32_t a, int32_t b) {
+            return tree.nodes[a].branch_length > tree.nodes[b].branch_length;
+        });
+
+        for (int32_t u : internal_clades) {
+            if (u < 0 || static_cast<size_t>(u) >= tree.nodes.size() || static_cast<size_t>(u) >= node_leaves.size()) continue;
+            if (tree.nodes[u].is_leaf || tree.nodes[u].parent_id == INVALID_INDEX || u == tree.root_id) continue;
+            // Verify u is still reachable from root_id
+            if (!is_in_subtree(tree, u, tree.root_id)) continue;
+            if (node_leaves[u].size() < 4) continue;
+
+            const std::vector<size_t> leaves_u = node_leaves[u];
+
+            // Identify external reference leaves (prefer sibling leaves of u, else all outside leaves)
+            std::vector<uint8_t> in_u(N, 0);
+            for (size_t lu : leaves_u) {
+                if (lu < N) in_u[lu] = 1;
+            }
+
+            std::vector<size_t> ext_leaves;
+            int32_t p_u = tree.nodes[u].parent_id;
+            if (p_u != INVALID_INDEX && p_u >= 0 && static_cast<size_t>(p_u) < node_leaves.size()) {
+                for (size_t lp : node_leaves[p_u]) {
+                    if (lp < N && !in_u[lp]) ext_leaves.push_back(lp);
+                }
+            }
+            if (ext_leaves.empty()) {
+                for (size_t i = 0; i < N; ++i) {
+                    if (!in_u[i]) ext_leaves.push_back(i);
+                }
+            }
+            if (ext_leaves.empty()) continue;
+
+            // Collect all internal nodes strictly inside C_u and rank by minimum resistance to ext_leaves
+            struct PortCandidate {
+                int32_t x;
+                Scalar score;
+            };
+            std::vector<PortCandidate> ports;
+            auto collect_internal = [&](int32_t nid, auto& self) -> void {
+                for (int32_t c : tree.nodes[nid].children) {
+                    if (c == INVALID_INDEX || static_cast<size_t>(c) >= tree.nodes.size()) continue;
+                    if (!tree.nodes[c].is_leaf && static_cast<size_t>(c) < node_leaves.size() && !node_leaves[c].empty()) {
+                        Scalar min_r = 1e9;
+                        Scalar sum_r = 0.0;
+                        size_t cnt = 0;
+                        size_t step_c = std::max<size_t>(1, node_leaves[c].size() / 4);
+                        size_t step_e = std::max<size_t>(1, ext_leaves.size() / 6);
+                        for (size_t ic = 0; ic < node_leaves[c].size(); ic += step_c) {
+                            size_t lc = node_leaves[c][ic];
+                            for (size_t ie = 0; ie < ext_leaves.size(); ie += step_e) {
+                                size_t le = ext_leaves[ie];
+                                Scalar r = Omega(static_cast<Eigen::Index>(lc), static_cast<Eigen::Index>(le));
+                                if (r < min_r) min_r = r;
+                                sum_r += r;
+                                cnt++;
+                            }
+                        }
+                        Scalar mean_r = (cnt > 0) ? (sum_r / static_cast<Scalar>(cnt)) : min_r;
+                        ports.push_back({c, 0.8 * min_r + 0.2 * mean_r});
+                        self(c, self);
+                    }
+                }
+            };
+            collect_internal(u, collect_internal);
+            if (ports.empty()) continue;
+
+            std::sort(ports.begin(), ports.end(), [](const auto& a, const auto& b) {
+                return a.score < b.score;
+            });
+
+            size_t limit = std::min(ports.size(), max_ports_per_clade);
+            for (size_t i = 0; i < limit; ++i) {
+                int32_t x = ports[i].x;
+                auto maybe_reg = reground_subtree_at_internal_port(tree, u, x);
+                if (!maybe_reg.has_value()) continue;
+
+                Tree cand_tree = std::move(maybe_reg->tree);
+                auto& aff = maybe_reg->affected_branches;
+                Scalar cand_ll = optimize_branches_gtr(cand_tree, aln, gtr, 4, 1e-2, &aff);
+
+                if (cand_ll > current_best_ll + 0.05) {
+                    current_best_ll = cand_ll;
+                    tree = std::move(cand_tree);
+                    node_leaves = compute_node_leaves();
+                    accepted_regroundings++;
+                    break;
+                }
+            }
+        }
+
+        return accepted_regroundings;
     }
 
     struct SPRMoveResult {
@@ -878,7 +1197,18 @@ public:
             tree.nodes.push_back(std::move(new_w));
         }
 
-        tree.nodes[w].name = "SPR_Node_" + std::to_string(w);
+        std::string cand_name = "SPR_Node_" + std::to_string(w);
+        int suffix = 1;
+        auto name_exists = [&](const std::string& nm) {
+            for (const auto& nd : tree.nodes) {
+                if (nd.id != w && nd.name == nm) return true;
+            }
+            return false;
+        };
+        while (name_exists(cand_name)) {
+            cand_name = "SPR_Node_" + std::to_string(w) + "_" + std::to_string(++suffix);
+        }
+        tree.nodes[w].name = cand_name;
         tree.nodes[w].is_leaf = false;
         tree.nodes[w].parent_id = pv;
         tree.nodes[w].children = {v, u};
@@ -984,6 +1314,14 @@ public:
         for (size_t round = 0; round < max_rounds; ++round) {
             bool improved_in_round = false;
 
+            // Phase A: Native Ohmic Port-Regrounding (relaxes inverted clades by sliding entry ports)
+            size_t regrounded = run_ohmic_port_regrounding(tree, aln, gtr, Omega, 6);
+            if (regrounded > 0) {
+                accepted_moves += regrounded;
+                improved_in_round = true;
+                current_best_ll = optimize_branches_gtr(tree, aln, gtr, 10, 1e-3);
+            }
+
             auto compute_node_leaves = [&]() {
                 std::vector<std::vector<size_t>> leaves(tree.nodes.size());
                 for (int32_t nid : tree.post_order) {
@@ -1022,7 +1360,7 @@ public:
                 if (u < 0 || static_cast<size_t>(u) >= tree.nodes.size() || static_cast<size_t>(u) >= node_leaves.size()) continue;
                 if (tree.nodes[u].parent_id == INVALID_INDEX || node_leaves[u].empty()) continue;
 
-                const auto& leaves_u = node_leaves[u];
+                const std::vector<size_t> leaves_u = node_leaves[u];
 
                 struct TargetCandidate {
                     int32_t v;
@@ -1289,20 +1627,58 @@ public:
         std::vector<std::string> island_newicks_res(num_islands);
         std::vector<size_t> island_spr_res(num_islands, 0);
 
-        // Prepare island sub-alignments and initial trees
+        Matrix D = NeighborJoining::compute_tn93_distances(aln);
+
+        // Prepare Kron-Reduced / Boundary-Anchored island sub-alignments and initial trees
+        // Each island k includes 1 external boundary anchor taxon a* (closest non-island leaf)
+        // pinned at the root of the island tree so local SPR & port-regrounding preserve root polarity!
         std::vector<Alignment> sub_alns(num_islands);
         std::vector<Tree> island_trees(num_islands);
+        std::vector<std::string> anchor_names(num_islands);
 
         for (size_t k = 0; k < num_islands; ++k) {
             int32_t r = island_roots[k];
             auto taxa = get_subtree_leaf_names(tree, r);
             out_island_sizes[k] = taxa.size();
-            sub_alns[k] = create_taxon_sub_alignment(aln, taxa);
+
+            std::unordered_set<std::string> in_island(taxa.begin(), taxa.end());
+            std::string best_anchor;
+            Scalar best_d = 1e9;
+
+            for (size_t i = 0; i < aln.num_taxa; ++i) {
+                const std::string& cand_name = aln.sequences[i].name;
+                if (in_island.count(cand_name)) continue;
+                for (const auto& tname : taxa) {
+                    auto it = aln.taxon_to_index.find(tname);
+                    if (it != aln.taxon_to_index.end()) {
+                        Scalar d = D(static_cast<Eigen::Index>(i), static_cast<Eigen::Index>(it->second));
+                        if (d < best_d) {
+                            best_d = d;
+                            best_anchor = cand_name;
+                        }
+                    }
+                }
+            }
+
+            anchor_names[k] = best_anchor;
+            std::vector<std::string> taxa_with_anchor = taxa;
             std::string sub_nwk = subtree_to_newick(tree, r, true);
+            if (!best_anchor.empty()) {
+                taxa_with_anchor.push_back(best_anchor);
+                while (!sub_nwk.empty() && sub_nwk.back() == ';') sub_nwk.pop_back();
+                Scalar anchor_bl = std::max<Scalar>(1e-3, best_d * 0.5);
+                std::ostringstream wrapped;
+                wrapped << "(" << sub_nwk << ":" << std::setprecision(8)
+                        << std::max<Scalar>(1e-4, tree.nodes[r].branch_length)
+                        << "," << best_anchor << ":" << anchor_bl << ");";
+                sub_nwk = wrapped.str();
+            }
+
+            sub_alns[k] = create_taxon_sub_alignment(aln, taxa_with_anchor);
             island_trees[k] = Tree::from_newick(sub_nwk);
         }
 
-        // Parallel optimization of disjoint Ohmic islands
+        // Parallel optimization of disjoint Boundary-Anchored Ohmic islands
         #pragma omp parallel for schedule(dynamic)
         for (size_t k = 0; k < num_islands; ++k) {
             auto& i_tree = island_trees[k];
@@ -1312,7 +1688,7 @@ public:
             // 1. Local branch length optimization under GTR
             optimize_branches_gtr(i_tree, i_aln, local_gtr, 20, 1e-3);
 
-            // 2. Local Ohmic resistance-bounded SPR
+            // 2. Local Ohmic resistance-bounded SPR + Port Regrounding
             size_t moves = run_resistance_bounded_spr(
                 i_tree, i_aln, local_gtr, 2, std::min<size_t>(6, i_aln.num_taxa)
             );
@@ -1329,8 +1705,31 @@ public:
             // 4. Final local polish
             optimize_branches_gtr(i_tree, i_aln, local_gtr, 15, 1e-3);
 
-            // Export local Newick representation
-            island_newicks_res[k] = i_tree.to_newick(true);
+            // 5. Extract rooted ingroup Newick by stripping the boundary anchor taxon
+            const std::string& anc = anchor_names[k];
+            if (!anc.empty()) {
+                int32_t anc_id = INVALID_INDEX;
+                for (const auto& nd : i_tree.nodes) {
+                    if (nd.is_leaf && nd.name == anc) {
+                        anc_id = nd.id;
+                        break;
+                    }
+                }
+                // Only extract if anchor remained a direct child of root and root has 1 ingroup child
+                if (anc_id != INVALID_INDEX &&
+                    i_tree.nodes[anc_id].parent_id == i_tree.root_id &&
+                    i_tree.nodes[i_tree.root_id].children.size() == 2) {
+                    int32_t ingroup_root = (i_tree.nodes[i_tree.root_id].children[0] == anc_id)
+                        ? i_tree.nodes[i_tree.root_id].children[1]
+                        : i_tree.nodes[i_tree.root_id].children[0];
+                    island_newicks_res[k] = subtree_to_newick(i_tree, ingroup_root, true);
+                } else {
+                    // Fallback: re-extract original ingroup if anchor migrated inside
+                    island_newicks_res[k] = subtree_to_newick(tree, island_roots[k], true);
+                }
+            } else {
+                island_newicks_res[k] = i_tree.to_newick(true);
+            }
         }
 
         size_t total_spr_moves = 0;

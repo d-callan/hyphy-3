@@ -25,6 +25,7 @@ struct GTRFitResult {
     GTRParameters params;
     Tree tree;
     int iterations = 0;
+    bool converged = false;
 };
 
 // Fits nucleotide GTR model (substitution rates + branch lengths) on an alignment
@@ -91,13 +92,17 @@ public:
         curr_tree.scale_bridge_lengths(opt_s);
 
         // Stage 2 & 3: Alternating coordinate-wise optimization of GTR rates and individual branch lengths
-        int total_evals = 0;
-        for (int cycle = 0; cycle < 2; ++cycle) {
+        constexpr int max_cycles = 15;
+        Scalar prev_cycle_ll = -opt_s_nll;
+        int cycles_run = 0;
+        bool converged = false;
+
+        for (int cycle = 0; cycle < max_cycles; ++cycle) {
+            cycles_run = cycle + 1;
             // Optimize 5 GTR rate parameters coordinate-wise. Thetas must be
             // re-fit every cycle: the branch-length sweep below changes the tree,
             // so single-pass theta optimization leaves rates stale at the joint
-            // optimum (observed as ~13% theta drift and ~14 log units short of
-            // the converged likelihood on benchmark datasets).
+            // optimum.
             auto opt_rate = [&](Scalar& r_ref) {
                 auto rate_obj = [&](Scalar val) -> Scalar {
                     Scalar old_val = r_ref;
@@ -106,9 +111,8 @@ public:
                     r_ref = old_val;
                     return -lnl;
                 };
-                auto [best_r, _] = Brent1D::minimize(rate_obj, 1e-4, r_ref, 20.0, 1e-3, 20);
+                auto [best_r, _] = Brent1D::minimize(rate_obj, 1e-4, r_ref, 100.0, 1e-4, 20);
                 r_ref = best_r;
-                total_evals += 20;
             };
 
             opt_rate(params.theta_AC);
@@ -121,8 +125,7 @@ public:
             if (curr_tree.bridges.empty()) {
                 GTRMatrix gtr_cur;
                 gtr_cur.update(params, nuc_aln.nuc_frequencies);
-                sweep_gtr_branches_cavity(curr_tree, nuc_aln, gtr_cur, leaf_to_taxon, 1e-3, 12);
-                total_evals += static_cast<int>(num_branches);
+                sweep_gtr_branches_cavity(curr_tree, nuc_aln, gtr_cur, leaf_to_taxon, 1e-4, 15);
             } else {
                 for (size_t b = 0; b < num_branches; ++b) {
                     int32_t nid = branch_node_ids[b];
@@ -134,11 +137,18 @@ public:
                         curr_tree.nodes[nid].branch_length = old_bl;
                         return -lnl;
                     };
-                    auto [best_bl, _] = Brent1D::minimize(bl_obj, 1e-6, std::max(init_bl, 1e-4), 5.0, 1e-3, 20);
+                    auto [best_bl, _] = Brent1D::minimize(bl_obj, 1e-6, std::max(init_bl, 1e-4), 50.0, 1e-4, 20);
                     curr_tree.nodes[nid].branch_length = best_bl;
-                    total_evals += 20;
                 }
             }
+
+            Scalar current_ll = eval_tree_lnl(curr_tree, params);
+            if (cycle >= 1 && std::abs(current_ll - prev_cycle_ll) < 1e-3) {
+                prev_cycle_ll = current_ll;
+                converged = true;
+                break;
+            }
+            prev_cycle_ll = current_ll;
         }
         for (auto& br : curr_tree.bridges) {
             if (br.bridge_node_id >= 0 && static_cast<size_t>(br.bridge_node_id) < curr_tree.nodes.size() &&
@@ -153,7 +163,8 @@ public:
         res.log_likelihood = final_lnl;
         res.params = params;
         res.tree = curr_tree;
-        res.iterations = 3;
+        res.iterations = cycles_run;
+        res.converged = converged;
 
         size_t K = 5 + num_branches;
         size_t N = nuc_aln.num_nucleotides;
@@ -189,13 +200,9 @@ public:
             if (node.is_leaf) {
                 size_t t_idx = leaf_to_taxon[nid];
                 for (size_t p = 0; p < num_patterns; ++p) {
-                    int8_t state = (t_idx != static_cast<size_t>(-1)) ? nuc_aln.patterns[p].states[t_idx] : -1;
-                    if (state >= 0 && state < 4) {
-                        D[nid][p].setZero();
-                        D[nid][p](state) = 1.0;
-                    } else {
-                        D[nid][p].setOnes();
-                    }
+                    LikelihoodEngine::init_leaf_likelihood(
+                        nuc_aln.patterns[p], t_idx, 4, D[nid][p]
+                    );
                     if (nid != curr_tree.root_id) {
                         P_D[nid][p] = P_branch[nid] * D[nid][p];
                     }
@@ -240,7 +247,7 @@ public:
                     }
                     return -lnl;
                 };
-                auto [best_bl, _] = Brent1D::minimize(bl_obj, 1e-6, std::max<Scalar>(init_bl, 1e-4), 5.0, tol, max_iter);
+                auto [best_bl, _] = Brent1D::minimize(bl_obj, 1e-6, std::max<Scalar>(init_bl, 1e-4), 50.0, tol, max_iter);
                 curr_tree.nodes[uid].branch_length = best_bl;
                 P_branch[uid] = gtr.transition_matrix(best_bl);
                 for (size_t p = 0; p < num_patterns; ++p) {
@@ -318,13 +325,9 @@ public:
             if (node.is_leaf) {
                 size_t t_idx = leaf_to_taxon[nid];
                 for (size_t p = 0; p < num_patterns; ++p) {
-                    int8_t state = (t_idx != static_cast<size_t>(-1)) ? nuc_aln.patterns[p].states[t_idx] : -1;
-                    if (state >= 0 && state < 4) {
-                        D[nid][p].setZero();
-                        D[nid][p](state) = 1.0;
-                    } else {
-                        D[nid][p].setOnes();
-                    }
+                    LikelihoodEngine::init_leaf_likelihood(
+                        nuc_aln.patterns[p], t_idx, 4, D[nid][p]
+                    );
                     if (nid != curr_tree.root_id) {
                         P_D[nid][p] = P_branch[nid] * D[nid][p];
                     }
@@ -680,7 +683,7 @@ public:
         // Stage 2: Coordinate sweeps
         for (int p = 0; p < passes; ++p) {
             if (curr_tree.bridges.empty()) {
-                GTRFitter::sweep_gtr_branches_cavity(curr_tree, aln, gtr, leaf_to_taxon, 1e-3, 15);
+                GTRFitter::sweep_gtr_branches_cavity(curr_tree, aln, gtr, leaf_to_taxon, 1e-4, 15);
             } else {
                 for (size_t b = 0; b < num_branches; ++b) {
                     int32_t nid = branch_node_ids[b];
@@ -692,7 +695,7 @@ public:
                         curr_tree.nodes[nid].branch_length = old_bl;
                         return -lnl;
                     };
-                    auto [best_bl, _] = Brent1D::minimize(bl_obj, 1e-6, std::max(init_bl, static_cast<Scalar>(1e-4)), 5.0, 1e-3, 15);
+                    auto [best_bl, _] = Brent1D::minimize(bl_obj, 1e-6, std::max(init_bl, static_cast<Scalar>(1e-4)), 50.0, 1e-4, 15);
                     curr_tree.nodes[nid].branch_length = best_bl;
                 }
             }
@@ -806,8 +809,10 @@ public:
 
         Scalar fx = 0.0;
         int niter = 0;
+        bool conv = false;
         try {
             niter = solver.minimize(obj, x, fx, lb, ub);
+            conv = true;
         } catch (const std::exception& e) {
             std::cerr << "L-BFGS-B warning: " << e.what() << "\n";
         }
@@ -817,7 +822,7 @@ public:
         res.x_opt = x;
         res.param_names = {"omega"};
         res.iterations = niter;
-        res.converged = true;
+        res.converged = conv;
         res.tree = tree;
         return res;
     }
@@ -852,8 +857,12 @@ public:
         res.x_opt(0) = opt_pt.a; // omega
         res.x_opt(1) = opt_pt.b; // scale s
         res.param_names = {"omega", "tree_scale"};
-        res.iterations = 50;
-        res.converged = true;
+        res.iterations = opt_pt.iterations;
+        res.converged = opt_pt.converged;
+
+        res.params = base_params;
+        res.params.alpha = 1.0;
+        res.params.beta = opt_pt.a;
 
         res.tree = tree;
         for (auto& node : res.tree.nodes) {
@@ -862,27 +871,34 @@ public:
             }
         }
         res.tree.scale_bridge_lengths(opt_pt.b);
-        res.params = base_params;
-        res.params.alpha = 1.0;
-        res.params.beta = opt_pt.a;
         return res;
     }
 
-    // Jointly fits all branch lengths, global omega, and GTR exchangeability rates
+    // Jointly fits all branch lengths, global omega(s), and GTR exchangeability rates
     // under unconstrained MG94 in a unified single-stage quasi-Newton solve via
     // spectral Fréchet matrix exponential derivatives.
     FitResult fit_full_model(
         Scalar init_omega = 1.0,
         MG94Parameters base_params = MG94Parameters{},
         std::function<void(const std::string&, double)> progress_cb = nullptr,
-        int max_iters = 60,
-        Scalar tolerance = 1e-5
+        int max_iters = 250,
+        Scalar tolerance = 1e-5,
+        const std::vector<bool>* is_test_branch = nullptr,
+        Scalar* out_background_omega = nullptr
     ) {
         if (progress_cb) progress_cb("Phase 2: Initializing branch lengths and omega", 0.30);
 
         // 1. Initial quick fit of omega & global branch scale (warm-up)
         auto init_res = fit_omega_and_scale(init_omega, base_params);
-        Tree cur_tree = init_res.tree;
+        Tree cur_tree = tree;
+        Scalar init_scale = init_res.x_opt(1);
+        for (auto& node : cur_tree.nodes) {
+            if (node.id != cur_tree.root_id) {
+                node.branch_length *= init_scale;
+            }
+        }
+        cur_tree.scale_bridge_lengths(init_scale);
+
         MG94Parameters p = base_params;
         p.alpha = 1.0;
         p.beta = init_res.x_opt(0);
@@ -897,24 +913,53 @@ public:
             }
         }
         size_t B = branch_node_ids.size();
-        size_t dim = B + 6;
         size_t num_nodes = cur_tree.num_nodes();
+
+        if (max_iters <= 40) {
+            max_iters = std::max<int>(max_iters, std::min<int>(500, 5 * static_cast<int>(B) + 60));
+        }
+
+        // Check if a partitioned 2-omega model (test vs background) is requested and non-trivial
+        bool has_bg_omega = false;
+        if (is_test_branch != nullptr && is_test_branch->size() >= num_nodes) {
+            bool any_test = false, any_bg = false;
+            for (int32_t nid : branch_node_ids) {
+                if ((*is_test_branch)[nid]) any_test = true;
+                else any_bg = true;
+            }
+            has_bg_omega = (any_test && any_bg);
+        }
+
+        size_t idx_omega_test = B;
+        size_t idx_omega_bg   = has_bg_omega ? (B + 1) : B;
+        size_t idx_theta_base = has_bg_omega ? (B + 2) : (B + 1);
+        size_t dim            = idx_theta_base + 5;
 
         Vector x(dim), lb(dim), ub(dim);
         for (size_t i = 0; i < B; ++i) {
-            x(i) = std::log(std::clamp(cur_tree.nodes[branch_node_ids[i]].branch_length, 1e-7, 10.0));
+            x(i) = std::log(std::clamp(cur_tree.nodes[branch_node_ids[i]].branch_length, 1e-7, 100.0));
             lb(i) = -18.420680744;
-            ub(i) = 3.0;
+            ub(i) = 6.91;
         }
 
-        x(B) = std::log(std::clamp(p.beta, 1e-3, 10.0));
-        lb(B) = -8.0; ub(B) = 4.0;
+        x(idx_omega_test) = std::log(std::clamp(p.beta, 1e-4, 100.0));
+        lb(idx_omega_test) = -10.0;
+        ub(idx_omega_test) = 6.91;
 
-        x(B + 1) = std::log(std::clamp(p.theta_AC, 1e-3, 20.0)); lb(B + 1) = -8.0; ub(B + 1) = 4.0;
-        x(B + 2) = std::log(std::clamp(p.theta_AT, 1e-3, 20.0)); lb(B + 2) = -8.0; ub(B + 2) = 4.0;
-        x(B + 3) = std::log(std::clamp(p.theta_CG, 1e-3, 20.0)); lb(B + 3) = -8.0; ub(B + 3) = 4.0;
-        x(B + 4) = std::log(std::clamp(p.theta_CT, 1e-3, 20.0)); lb(B + 4) = -8.0; ub(B + 4) = 4.0;
-        x(B + 5) = std::log(std::clamp(p.theta_GT, 1e-3, 20.0)); lb(B + 5) = -8.0; ub(B + 5) = 4.0;
+        if (has_bg_omega) {
+            x(idx_omega_bg) = std::log(std::clamp(p.beta, 1e-4, 100.0));
+            lb(idx_omega_bg) = -10.0;
+            ub(idx_omega_bg) = 6.91;
+        }
+
+        const std::array<Scalar, 5> init_thetas = {
+            p.theta_AC, p.theta_AT, p.theta_CG, p.theta_CT, p.theta_GT
+        };
+        for (size_t k = 0; k < 5; ++k) {
+            x(idx_theta_base + k) = std::log(std::clamp(init_thetas[k], 1e-4, 100.0));
+            lb(idx_theta_base + k) = -10.0;
+            ub(idx_theta_base + k) = 6.91;
+        }
 
         struct JointMG94Objective {
             const Tree& tree;
@@ -922,6 +967,17 @@ public:
             const std::vector<int32_t>& nodes;
             size_t num_nodes;
             const std::vector<size_t>& leaf_map;
+            const std::vector<bool>* is_test_branch;
+            bool has_bg_omega;
+            size_t idx_omega_test;
+            size_t idx_omega_bg;
+            size_t idx_theta_base;
+            const Vector& lb;
+            const Vector& ub;
+
+            Scalar best_fx = std::numeric_limits<Scalar>::infinity();
+            Vector best_x = Vector();
+            Scalar last_proj_grad_inf = std::numeric_limits<Scalar>::infinity();
 
             Scalar operator()(const Vector& y, Vector& grad) {
                 size_t B = nodes.size();
@@ -932,15 +988,17 @@ public:
 
                 MG94Parameters params;
                 params.alpha = 1.0;
-                params.beta = std::exp(y(B));
-                params.theta_AC = std::exp(y(B + 1));
-                params.theta_AT = std::exp(y(B + 2));
-                params.theta_CG = std::exp(y(B + 3));
-                params.theta_CT = std::exp(y(B + 4));
-                params.theta_GT = std::exp(y(B + 5));
+                params.beta = std::exp(y(idx_omega_test));
+                Scalar omega_bg = has_bg_omega ? std::exp(y(idx_omega_bg)) : params.beta;
+                params.theta_AC = std::exp(y(idx_theta_base + 0));
+                params.theta_AT = std::exp(y(idx_theta_base + 1));
+                params.theta_CG = std::exp(y(idx_theta_base + 2));
+                params.theta_CT = std::exp(y(idx_theta_base + 3));
+                params.theta_GT = std::exp(y(idx_theta_base + 4));
 
                 auto res = LikelihoodEngine::compute_joint_frechet_gradients(
-                    tree, aln, params, bls, &leaf_map
+                    tree, aln, params, bls, &leaf_map,
+                    has_bg_omega ? is_test_branch : nullptr, omega_bg
                 );
 
                 grad.resize(y.size());
@@ -948,14 +1006,30 @@ public:
                     int32_t nid = nodes[i];
                     grad(i) = -bls[nid] * res.grad_branches[nid];
                 }
-                grad(B)     = -params.beta * res.grad_omega;
-                grad(B + 1) = -params.theta_AC * res.grad_theta_AC;
-                grad(B + 2) = -params.theta_AT * res.grad_theta_AT;
-                grad(B + 3) = -params.theta_CG * res.grad_theta_CG;
-                grad(B + 4) = -params.theta_CT * res.grad_theta_CT;
-                grad(B + 5) = -params.theta_GT * res.grad_theta_GT;
+                grad(idx_omega_test) = -params.beta * res.grad_omega;
+                if (has_bg_omega) {
+                    grad(idx_omega_bg) = -omega_bg * res.grad_omega_bg;
+                }
+                grad(idx_theta_base + 0) = -params.theta_AC * res.grad_theta_AC;
+                grad(idx_theta_base + 1) = -params.theta_AT * res.grad_theta_AT;
+                grad(idx_theta_base + 2) = -params.theta_CG * res.grad_theta_CG;
+                grad(idx_theta_base + 3) = -params.theta_CT * res.grad_theta_CT;
+                grad(idx_theta_base + 4) = -params.theta_GT * res.grad_theta_GT;
 
-                return -res.log_likelihood;
+                Scalar fx_val = -res.log_likelihood;
+                if (std::isfinite(fx_val) && fx_val < best_fx) {
+                    best_fx = fx_val;
+                    best_x = y;
+                }
+
+                Scalar pg_inf = 0.0;
+                for (Eigen::Index i = 0; i < y.size(); ++i) {
+                    Scalar proj = std::clamp(y(i) - grad(i), lb(i), ub(i)) - y(i);
+                    pg_inf = std::max(pg_inf, std::abs(proj));
+                }
+                last_proj_grad_inf = pg_inf;
+
+                return fx_val;
             }
         };
 
@@ -963,7 +1037,13 @@ public:
             progress_cb("Phase 2: Unified joint Fréchet quasi-Newton optimization", 0.45);
         }
 
-        JointMG94Objective obj{cur_tree, aln, branch_node_ids, num_nodes, leaf_to_taxon};
+        JointMG94Objective obj{
+            cur_tree, aln, branch_node_ids, num_nodes, leaf_to_taxon,
+            is_test_branch, has_bg_omega, idx_omega_test, idx_omega_bg, idx_theta_base,
+            lb, ub
+        };
+        obj.best_x = x;
+
         LBFGSpp::LBFGSBParam<Scalar> opt_param;
         opt_param.m = 8;
         opt_param.epsilon = tolerance;
@@ -971,32 +1051,57 @@ public:
         LBFGSpp::LBFGSBSolver<Scalar> solver(opt_param);
         Scalar fx = 0.0;
         int iters = 0;
+        bool solver_ok = false;
         try {
             iters = solver.minimize(obj, x, fx, lb, ub);
-        } catch (...) {}
+            solver_ok = true;
+        } catch (...) {
+            solver_ok = false;
+        }
+
+        if (std::isfinite(obj.best_fx) && (!std::isfinite(fx) || obj.best_fx < fx)) {
+            x = obj.best_x;
+            fx = obj.best_fx;
+        }
 
         for (size_t i = 0; i < B; ++i) {
             cur_tree.nodes[branch_node_ids[i]].branch_length = std::exp(x(i));
         }
-        p.beta = std::exp(x(B));
-        p.theta_AC = std::exp(x(B + 1));
-        p.theta_AT = std::exp(x(B + 2));
-        p.theta_CG = std::exp(x(B + 3));
-        p.theta_CT = std::exp(x(B + 4));
-        p.theta_GT = std::exp(x(B + 5));
+        p.beta = std::exp(x(idx_omega_test));
+        Scalar opt_omega_bg = has_bg_omega ? std::exp(x(idx_omega_bg)) : p.beta;
+        if (out_background_omega != nullptr) {
+            *out_background_omega = opt_omega_bg;
+        }
+        p.theta_AC = std::exp(x(idx_theta_base + 0));
+        p.theta_AT = std::exp(x(idx_theta_base + 1));
+        p.theta_CG = std::exp(x(idx_theta_base + 2));
+        p.theta_CT = std::exp(x(idx_theta_base + 3));
+        p.theta_GT = std::exp(x(idx_theta_base + 4));
 
         FitResult res;
         res.log_likelihood = -fx;
-        res.x_opt.resize(6);
-        res.x_opt(0) = p.beta;
-        res.x_opt(1) = p.theta_AC;
-        res.x_opt(2) = p.theta_AT;
-        res.x_opt(3) = p.theta_CG;
-        res.x_opt(4) = p.theta_CT;
-        res.x_opt(5) = p.theta_GT;
-        res.param_names = {"omega", "theta_AC", "theta_AT", "theta_CG", "theta_CT", "theta_GT"};
+        if (has_bg_omega) {
+            res.x_opt.resize(7);
+            res.x_opt(0) = p.beta;
+            res.x_opt(1) = p.theta_AC;
+            res.x_opt(2) = p.theta_AT;
+            res.x_opt(3) = p.theta_CG;
+            res.x_opt(4) = p.theta_CT;
+            res.x_opt(5) = p.theta_GT;
+            res.x_opt(6) = opt_omega_bg;
+            res.param_names = {"omega", "theta_AC", "theta_AT", "theta_CG", "theta_CT", "theta_GT", "omega_background"};
+        } else {
+            res.x_opt.resize(6);
+            res.x_opt(0) = p.beta;
+            res.x_opt(1) = p.theta_AC;
+            res.x_opt(2) = p.theta_AT;
+            res.x_opt(3) = p.theta_CG;
+            res.x_opt(4) = p.theta_CT;
+            res.x_opt(5) = p.theta_GT;
+            res.param_names = {"omega", "theta_AC", "theta_AT", "theta_CG", "theta_CT", "theta_GT"};
+        }
         res.iterations = iters;
-        res.converged = true;
+        res.converged = (solver_ok && iters < max_iters) || (obj.last_proj_grad_inf <= std::max<Scalar>(tolerance, 1e-3));
         res.tree = cur_tree;
         res.params = p;
         return res;

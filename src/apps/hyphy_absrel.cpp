@@ -35,7 +35,7 @@ static void print_absrel_usage(const char* prog) {
               << "  " << Console::brand("--code") << " <name>        Genetic code (default: Universal)\n"
               << "  " << Console::brand("--branches") << " <set>     Branches to test: All, Internal, Leaves (default: All)\n"
               << "  " << Console::brand("--pvalue") << " <threshold> Holm-Bonferroni p-value threshold (default: 0.05)\n"
-              << "  " << Console::brand("--max-rates") << " <N>      Maximum rate classes per branch (default: 3)\n"
+              << "  " << Console::brand("--max-rates, --rates") << " <N> Maximum rate classes per branch (default: 3)\n"
               << "  " << Console::brand("--threads") << " <N>        Number of OpenMP worker threads\n"
               << "  " << Console::brand("--output") << " <file>      Path to output JSON file (default: <alignment>.ABSREL.json)\n"
               << "  " << Console::brand("--html") << " <file>        Also write a self-contained interactive HTML report\n"
@@ -62,7 +62,7 @@ int run_absrel(int argc, char* argv[]) {
             settings.test_branches = argv[++i];
         } else if ((arg == "--pvalue" || arg == "-p") && i + 1 < argc) {
             settings.p_threshold = std::stod(argv[++i]);
-        } else if (arg == "--max-rates" && i + 1 < argc) {
+        } else if ((arg == "--max-rates" || arg == "--rates") && i + 1 < argc) {
             settings.max_rate_classes = std::stoi(argv[++i]);
         } else if (arg == "--help" || arg == "-h") {
             print_absrel_usage(argv[0]);

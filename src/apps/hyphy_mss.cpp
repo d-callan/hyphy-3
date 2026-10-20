@@ -141,8 +141,12 @@ int run_mss(int argc, char* argv[]) {
         return 1;
     }
 
-    if (!settings.normalization_explicit && !settings.neutral_ref.empty()) {
-        settings.normalization = MSSNormalization::NeutralRef;
+    if (!settings.normalization_explicit) {
+        if (!settings.neutral_ref.empty()) {
+            settings.normalization = MSSNormalization::NeutralRef;
+        } else if (settings.fix_omega) {
+            settings.normalization = MSSNormalization::Unweighted;
+        }
     }
 
     finalize_common_cli_options(cli, ".MSS.json");

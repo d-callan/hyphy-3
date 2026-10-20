@@ -103,7 +103,7 @@ int run_contrast_fel(int argc, char* argv[]) {
     std::string cli_cmd = join_cli_command(argc, argv);
 
     LoadedCodonDataset ds;
-    if (!load_codon_dataset(cli, ds, false, /*allow_fallback_code=*/true)) {
+    if (!load_codon_dataset(cli, ds, false, /*allow_fallback_code=*/false)) {
         return 1;
     }
     auto& gcode = ds.gcode;

@@ -225,6 +225,9 @@ inline nlohmann::json phylogeny_block(const Tree& tree,
     std::map<std::string, Scalar> totals;
 
     for (const auto& node : tree.nodes) {
+        if (node.id != tree.root_id && node.parent_id == INVALID_INDEX) {
+            continue;
+        }
         const std::string key =
             node.name.empty() ? ("Node" + std::to_string(node.id)) : node.name;
         if (nodes.contains(key)) {

@@ -61,7 +61,7 @@ static void print_usage(const char* prog, bool ph_mode = false) {
               << "  " << Console::brand("--auto-k") << "             Automatically select optimal K via AICc step-up\n"
               << "  " << Console::brand("--multiple-hits") << " <M>  Multi-nucleotide substitutions: None (default), Double, Double+Triple\n"
               << "  " << Console::brand("--error-sink") << "          Enable non-evolutionary saturation error sink class (BUSTED-E)\n"
-              << "  " << Console::brand("--error-sink-weight") << " <W> Maximum allowed error sink mixture weight (default: 0.05)\n"
+              << "  " << Console::brand("--error-sink-weight") << " <W> Maximum allowed error sink mixture weight (default: 0.01)\n"
               << "  " << Console::brand("--error-sink-bf") << " <BF>  Empirical Bayes Factor threshold to flag artifact branch-sites (default: 100)\n"
               << "  " << Console::brand("--output-filtered-alignment") << " <file> Write FASTA with BUSTED-E artifact branch-sites masked as ---\n"
               << "  " << Console::brand("--no-branch-opt") << "      Disable individual branch length refinement (use proportional scaling)\n"
@@ -176,12 +176,14 @@ int run_busted(int argc, char* argv[]) {
 
     // Validate branch selection upfront before fitting GTR/MG94
     size_t n_test_br = 0, n_bg_br = 0, n_unclass_br = 0;
+    std::vector<bool> preview_test_branches;
     try {
         BUSTEDAnalyzer preview(tree, aln);
         preview.select_branch_partitions(settings.test_branches, settings.comparison_branches, settings.phenotype_mode || settings.relax_mode);
         n_test_br = preview.num_test_branches;
         n_bg_br = preview.num_background_branches;
         n_unclass_br = preview.num_unclassified_branches;
+        preview_test_branches = preview.is_test_branch;
         if ((settings.phenotype_mode || settings.relax_mode) && n_bg_br == 0) {
             throw std::runtime_error(
                 "BUSTED-PH / RELAX requires a proper subset of foreground/test branches and a non-empty background/reference set. "
@@ -217,7 +219,9 @@ int run_busted(int argc, char* argv[]) {
 
     // Initialize and run BUSTED / BUSTED-PH
     Panel::print_step(1, 2, "Fitting Baseline GTR & Global MG94 Models", "Exchangeability rates & branch lengths");
-    BUSTEDAnalyzer analyzer = BUSTEDAnalyzer::create_and_fit(tree, aln);
+    BUSTEDAnalyzer analyzer = BUSTEDAnalyzer::create_and_fit(
+        tree, aln, (n_bg_br > 0) ? &preview_test_branches : nullptr
+    );
     analyzer.select_branch_partitions(settings.test_branches, settings.comparison_branches, settings.phenotype_mode || settings.relax_mode);
 
     std::cout << "  " << Console::muted("Nucleotide GTR Log-L : ") << Console::bold(std::to_string(analyzer.gtr_log_l)) << "\n"
