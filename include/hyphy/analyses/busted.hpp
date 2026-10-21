@@ -550,7 +550,7 @@ public:
             Scalar alpha_m = syn_rates[m];
             for (const auto& node : tree.nodes) {
                 if (node.id != tree.root_id) {
-                    Scalar bl = custom_branch_lengths ? (*custom_branch_lengths)[node.id] : (s * branch_tau[node.id]);
+                    Scalar bl = s * (custom_branch_lengths ? (*custom_branch_lengths)[node.id] : branch_tau[node.id]);
                     if (is_test_branch[node.id]) {
                         P_mix[m][node.id] = Matrix::Zero(S, S);
                         Scalar use_bio = (eps_sink > 0.0) ? bio_scale : 1.0;
@@ -679,7 +679,7 @@ public:
                 Scalar alpha_m = syn_rates[m];
                 for (const auto& node : tree.nodes) {
                     if (node.id != tree.root_id) {
-                        Scalar bl = custom_branch_lengths ? (*custom_branch_lengths)[node.id] : (s * branch_tau[node.id]);
+                        Scalar bl = s * (custom_branch_lengths ? (*custom_branch_lengths)[node.id] : branch_tau[node.id]);
                         P_comp[m][k][node.id] = mg.transition_matrix(alpha_m * bl);
                     }
                 }
@@ -880,7 +880,7 @@ public:
             Scalar alpha_m = syn_rates[m];
             for (const auto& node : tree.nodes) {
                 if (node.id != tree.root_id) {
-                    Scalar bl = custom_branch_lengths ? (*custom_branch_lengths)[node.id] : (s * branch_tau[node.id]);
+                    Scalar bl = s * (custom_branch_lengths ? (*custom_branch_lengths)[node.id] : branch_tau[node.id]);
                     if (is_test_branch[node.id]) {
                         P_mix[m][node.id] = Matrix::Zero(S, S);
                         Scalar use_bio = (eps_sink > 0.0) ? bio_scale : 1.0;
@@ -2961,7 +2961,7 @@ public:
             for (const auto& node : tree.nodes) {
                 if (node.id != tree.root_id) {
                     int nid = node.id;
-                    Scalar bl = custom_branch_lengths ? (*custom_branch_lengths)[nid] : (s * branch_tau[nid]);
+                    Scalar bl = s * (custom_branch_lengths ? (*custom_branch_lengths)[nid] : branch_tau[nid]);
                     int part = (static_cast<size_t>(nid) < branch_partition.size()) ? branch_partition[nid] : (is_test_branch[nid] ? 0 : 1);
                     if (part == 0) {
                         P_mix[m][nid] = Matrix::Zero(S, S);
@@ -3143,7 +3143,7 @@ public:
                 Scalar alpha_m = syn_rates[m];
                 for (const auto& node : tree.nodes) {
                     if (node.id != tree.root_id && branch_partition[node.id] == 0) {
-                        Scalar bl = custom_branch_lengths ? (*custom_branch_lengths)[node.id] : (s * branch_tau[node.id]);
+                        Scalar bl = s * (custom_branch_lengths ? (*custom_branch_lengths)[node.id] : branch_tau[node.id]);
                         P_comp_t[m][k][node.id] = mg.transition_matrix(alpha_m * bl);
                     }
                 }
@@ -3162,7 +3162,7 @@ public:
                 Scalar alpha_m = syn_rates[m];
                 for (const auto& node : tree.nodes) {
                     if (node.id != tree.root_id && branch_partition[node.id] == 1) {
-                        Scalar bl = custom_branch_lengths ? (*custom_branch_lengths)[node.id] : (s * branch_tau[node.id]);
+                        Scalar bl = s * (custom_branch_lengths ? (*custom_branch_lengths)[node.id] : branch_tau[node.id]);
                         P_comp_b[m][k][node.id] = mg.transition_matrix(alpha_m * bl);
                     }
                 }
@@ -3183,7 +3183,7 @@ public:
                     Scalar alpha_m = syn_rates[m];
                     for (const auto& node : tree.nodes) {
                         if (node.id != tree.root_id && branch_partition[node.id] == 2) {
-                            Scalar bl = custom_branch_lengths ? (*custom_branch_lengths)[node.id] : (s * branch_tau[node.id]);
+                            Scalar bl = s * (custom_branch_lengths ? (*custom_branch_lengths)[node.id] : branch_tau[node.id]);
                             P_comp_u[m][k][node.id] = mg.transition_matrix(alpha_m * bl);
                         }
                     }
@@ -3226,7 +3226,7 @@ public:
                             P_mix[m][nid] += (*weights_unclass)[k] * P_comp_u[m][k][nid];
                         }
                     } else {
-                        Scalar bl = custom_branch_lengths ? (*custom_branch_lengths)[nid] : (s * branch_tau[nid]);
+                        Scalar bl = s * (custom_branch_lengths ? (*custom_branch_lengths)[nid] : branch_tau[nid]);
                         P_mix[m][nid] = mg_unclass.transition_matrix(alpha_m * bl);
                     }
                 }
@@ -3467,7 +3467,7 @@ public:
             for (const auto& node : tree.nodes) {
                 if (node.id != tree.root_id) {
                     int nid = node.id;
-                    Scalar bl = custom_branch_lengths ? (*custom_branch_lengths)[nid] : (s * branch_tau[nid]);
+                    Scalar bl = s * (custom_branch_lengths ? (*custom_branch_lengths)[nid] : branch_tau[nid]);
                     int part = branch_partition[nid];
                     if (part == 0) {
                         P_mix[m][nid] = Matrix::Zero(S, S);
