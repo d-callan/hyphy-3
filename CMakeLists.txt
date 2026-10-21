@@ -246,6 +246,34 @@ add_executable(hyphy_joint_align_test tests/test_joint_align.cpp)
 target_link_libraries(hyphy_joint_align_test PRIVATE hyphy3_core)
 add_test(NAME JointAlignTest COMMAND hyphy_joint_align_test)
 
+add_executable(hyphy_expcm_test tests/test_expcm.cpp)
+target_link_libraries(hyphy_expcm_test PRIVATE hyphy3_core)
+add_test(NAME ExpcmTest COMMAND hyphy_expcm_test)
+
+add_executable(hyphy_expcm_optimizer_test tests/test_expcm_optimizer.cpp src/analyses/expcm_optimizer.cpp)
+target_link_libraries(hyphy_expcm_optimizer_test PRIVATE hyphy3_core)
+add_test(NAME ExpcmOptimizerTest COMMAND hyphy_expcm_optimizer_test)
+
+add_executable(hyphy_gradient_validation_test tests/test_gradient_validation.cpp src/analyses/expcm_optimizer.cpp)
+target_link_libraries(hyphy_gradient_validation_test PRIVATE hyphy3_core)
+add_test(NAME GradientValidationTest COMMAND hyphy_gradient_validation_test)
+
+add_executable(hyphy_optimizer_quick_test tests/test_optimizer_quick.cpp src/analyses/expcm_optimizer.cpp)
+target_link_libraries(hyphy_optimizer_quick_test PRIVATE hyphy3_core)
+add_test(NAME OptimizerQuickTest COMMAND hyphy_optimizer_quick_test)
+
+add_executable(hyphy_phase4_persite_test tests/test_phase4_persite.cpp)
+target_link_libraries(hyphy_phase4_persite_test PRIVATE hyphy3_core)
+add_test(NAME Phase4PersiteTest COMMAND hyphy_phase4_persite_test)
+
+add_executable(hyphy_phase4_optimizer_test tests/test_phase4_optimizer.cpp src/analyses/persite_optimizer.cpp)
+target_link_libraries(hyphy_phase4_optimizer_test PRIVATE hyphy3_core)
+add_test(NAME Phase4OptimizerTest COMMAND hyphy_phase4_optimizer_test)
+
+add_executable(hyphy_phase4_validation_test tests/test_phase4_validation.cpp src/analyses/persite_optimizer.cpp)
+target_link_libraries(hyphy_phase4_validation_test PRIVATE hyphy3_core)
+add_test(NAME Phase4ValidationTest COMMAND hyphy_phase4_validation_test)
+
 add_test(NAME HTMLReportEndToEndTest
     COMMAND ${CMAKE_COMMAND}
         -DHYPHY3=$<TARGET_FILE:hyphy3>
@@ -255,7 +283,7 @@ add_test(NAME HTMLReportEndToEndTest
 )
 
 
-# Unified HyPhy 3 CLI Driver (hyphy3 fel ..., hyphy3 meme ..., hyphy3 busted ..., hyphy3 absrel ..., hyphy3 relax ..., hyphy3 fubar ..., hyphy3 prime ..., hyphy3 gard ..., hyphy3 slac ..., hyphy3 dfel ..., hyphy3 mss ..., hyphy3 ohmic ..., hyphy3 joint-align ...)
+# Unified HyPhy 3 CLI Driver (hyphy3 fel ..., hyphy3 meme ..., hyphy3 busted ..., hyphy3 absrel ..., hyphy3 relax ..., hyphy3 fubar ..., hyphy3 prime ..., hyphy3 gard ..., hyphy3 slac ..., hyphy3 dfel ..., hyphy3 mss ..., hyphy3 ohmic ..., hyphy3 joint-align ..., hyphy3 expcm ...)
 add_executable(hyphy3
     src/apps/hyphy3.cpp
     src/apps/hyphy_fel.cpp
@@ -274,7 +302,10 @@ add_executable(hyphy3
     src/apps/hyphy_tree.cpp
     src/apps/hyphy_joint_align.cpp
     src/apps/hyphy_characterize.cpp
+    src/apps/hyphy_expcm.cpp
     src/apps/hyphy_report.cpp
+    src/analyses/expcm_optimizer.cpp
+    src/analyses/persite_optimizer.cpp
 )
 target_compile_definitions(hyphy3 PRIVATE HYPHY3_COMBINED_DRIVER)
 target_link_libraries(hyphy3 PRIVATE hyphy3_report)
@@ -328,6 +359,14 @@ target_link_libraries(hyphy3-joint-align PRIVATE hyphy3_core)
 add_executable(hyphy3-characterize src/apps/hyphy_characterize.cpp)
 target_link_libraries(hyphy3-characterize PRIVATE hyphy3_core)
 
+add_executable(hyphy3-expcm
+    src/apps/hyphy_expcm.cpp
+    src/apps/hyphy_expcm_main.cpp
+    src/analyses/expcm_optimizer.cpp
+    src/analyses/persite_optimizer.cpp
+)
+target_link_libraries(hyphy3-expcm PRIVATE hyphy3_core)
+
 # Backward-compatible aliases
 add_executable(hyphy-fel ALIAS hyphy3-fel)
 add_executable(hyphy-contrast-fel ALIAS hyphy3-contrast-fel)
@@ -345,6 +384,7 @@ add_executable(hyphy-ohmic ALIAS hyphy3-ohmic)
 add_executable(hyphy-tree ALIAS hyphy3-tree)
 add_executable(hyphy-joint-align ALIAS hyphy3-joint-align)
 add_executable(hyphy-characterize ALIAS hyphy3-characterize)
+add_executable(hyphy-expcm ALIAS hyphy3-expcm)
 
 # Python & nanobind bindings
 find_package(Python 3.8 COMPONENTS Interpreter Development.Module)
