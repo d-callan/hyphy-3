@@ -181,10 +181,10 @@ This allows joint L-BFGS optimization across all branch lengths simultaneously i
 | **Full BUSTED-S (SRV) Analysis** | ADH (23 taxa, 254 codons) | 18.42 s | **6.15 s** | **3.00×** |
 | **Full BUSTED-MH (Double+Triple)** | ADH (23 taxa, 254 codons) | 26.50 s | **6.47 s** | **4.10×** |
 | **Full MEME Analysis** | CD2 (10 taxa, 187 codons) | 4.82 s | **1.21 s** | **3.98×** |
-| **Full aBSREL Analysis** | β-globin (17 taxa, 144 codons) | 48.0 s (ln L = -3631.58) | **25.7 s** (ln L = -3633.51) | **1.87×** (|Δ ln L| ≤ 1.9) |
-| **Full RELAX Analysis** | Fig4E (33 taxa, 286 codons) | 13.3 s (ln L = -4982.98) | **14.5 s** (ln L = -4957.65)¹ | **0.9×** (K = 0.000 in both; LRT 123.4 vs 119.6) |
+| **Full aBSREL Analysis** | β-globin (17 taxa, 144 codons) | 48.0 s (ln L = -3631.58) | **25.7 s** (ln L = -3631.57) | **1.87×** (|Δ ln L| ≤ 0.01) |
+| **Full RELAX Analysis** | Fig4E (33 taxa, 286 codons) | 13.3 s (ln L = -4982.98) | **14.5 s** (ln L = -4982.91)¹ | **0.9×** (K = 0.000 in both; LRT 122.84 vs 122.90) |
 
-¹ Fig4E contains 49 partially-resolved codons (e.g. `AC-`); both HyPhy 2.5 and hyphy-3 resolve partial/IUPAC codons by summing over all compatible sense codons (prior benchmark numbers were recorded before IUPAC/partial-codon mask resolution was unified across all site and branch-site likelihood engines). Both timings: HyPhy 2.5.101 and hyphy-3, default threads, same machine.
+¹ Fig4E contains 49 partially-resolved codons (e.g. `AC-`); both HyPhy 2.5 and hyphy-3 resolve partial/IUPAC codons at leaves by summing over all compatible sense codons (`Translate2Frequencies(smear=true)` / `init_leaf_likelihood`). Both timings: HyPhy 2.5.101 and hyphy-3, default threads, same machine.
 
 ---
 
@@ -198,15 +198,15 @@ This allows joint L-BFGS optimization across all branch lengths simultaneously i
 | **Contrast-FEL** | Do selective pressures differ across designated branch sets? | Site-level multi-group | Empirical Bayes Ridge Likelihood, LRT | Group-specific β | — | 100% Verified |
 | **FUBAR** | Which sites are under selection via fast Bayesian approximation? | Site-level (dN ≷ dS) | Bivariate (α, β) rate grid, VB0 / Gibbs | Bivariate 20x20 grid | — | 100% Verified |
 | **PRIME** | Which biophysical amino acid properties are under selection? | Site-level & Property | Variance-stabilized biophysical model, L₂ Ridge | Site α, β, λ | — | 100% Verified |
-| **MEME** | Which codon sites are under episodic selection? | Site-level & Lineage | 2-rate mixture, 0.333 χ²₀ + 0.300 χ²₁ + 0.367 χ²₂ LRT | Site mixture | — | 100% Verified |
+| **MEME** | Which codon sites are under episodic selection? | Site-level & Lineage | 2-rate mixture, 0.333 χ²₀ + 0.300 χ²₁ + 0.367 χ²₂ LRT | 2-class site mixture (no >2-rate/MH/resample) | — | 100% Verified (2-rate) |
 | **BUSTED** | Has the gene evolved under episodic selection? | Gene-wide (all branches) | 3-category ω mixture, ½ χ²₀ + ½ χ²₂ | Site mixture | Optional | 100% Verified |
 | **BUSTED-S** | Gene-wide selection robust to synonymous variation? | Gene-wide with SRV | Discrete site-to-site α and ω mixture | Site α & ω | Optional | 100% Verified |
 | **BUSTED-MH** | Gene-wide selection accounting for multi-nucleotide hits? | Gene-wide with MH | Reversible 1-hit, 2-hit (δ), 3-hit (ψ) generator | Site α & ω | Double, Double+Triple | 100% Verified |
 | **BUSTED-E** | Gene-wide selection robust to alignment/sequencing errors? | Gene-wide with Error Sink | Huber ε-contaminated saturation replacement kernel | Site α & ω + P_sink | Optional | 100% Verified |
 | **BUSTED-PH** | Is episodic positive selection specifically associated with a phenotype/trait? | Phenotype-associated (3-way branch partition) | 4-model workflow, Union-Intersection Test ($\max(p_{FG}, p_{\text{diff}}) \le \alpha$) + $\text{AIC}_c$ BG neutrality | Separate FG, BG & Unclassified $\omega$ | Optional | 100% Verified |
 | **BUSTED-Auto** | Principled automatic selection of Sink, MH, SRV, and K? | Gene-wide Full-Auto | 4-Gate Surprisal & Score Model Selector | Auto-selected | Auto-selected | 100% Verified |
-| **aBSREL** | Which specific lineages/branches evolved under selection? | Lineage-specific | Adaptive complexity selection (AICc Step-Up) | Branch-site ω | — | |Δ ln L| < 2.0 |
-| **RELAX** | Has selection relaxed (K < 1) or intensified (K > 1) on test branches? | Branch-set contrast | 3-rate mixture with exponent K, χ²₁ LRT | Branch-site mixture (BS-REL) | — | |Δ ln L| ≤ 2.6 (CD2, adh)¹ |
+| **aBSREL** | Which specific lineages/branches evolved under selection? | Lineage-specific | Adaptive complexity selection (AICc Step-Up) | Branch-site ω (no SRV/MH) | — | |Δ ln L| ≤ 0.01 (β-globin) |
+| **RELAX** | Has selection relaxed (K < 1) or intensified (K > 1) on test branches? | Binary branch-set contrast | 3-rate mixture with exponent K, χ²₁ LRT | 3-class BS-REL (no SRV/MH/Group mode) | — | |Δ ln L| ≤ 0.07 (Fig4E)¹ |
 | **GTR / MG94** | What are baseline nucleotide biases & global dN/dS? | Alignment-wide | Reversible CTMC with F3x4 equilibrium | Global ω | Supported | 100% Verified |
 | **GARD** | Where are recombination breakpoints located? | Recombination & Topology | Segmented GTR + Neighbor-Joining, AICc selection | Independent segment rates | — | 100% Verified |
 | **SLAC** | Are individual sites undergoing selection using counting methods? | Site-level (dN ≷ dS) | Joint ML Ancestral Reconstruction, exact Binomial test | None | — | 100% Verified |
@@ -228,12 +228,12 @@ This allows joint L-BFGS optimization across all branch lengths simultaneously i
 - **Outputs**: MLEs of (α_s, β_s), likelihood ratio test statistics, raw p-values, total site tree length, and Datamonkey JSON export.
 
 #### 2. **MEME (Mixed Effects Model of Evolution)**
-- **Scope**: Site-by-site detection of **episodic** diversifying selection affecting a subset of lineages while remaining conserved on others.
+- **Scope**: Site-by-site detection of **episodic** diversifying selection affecting a subset of lineages while remaining conserved on others (standard 2-rate single-hit model; `--rates > 2`, `--multiple-hits`, `--resample`, and `--impute-states` are not used in `hyphy3 meme`).
 - **Workflow**:
   1. Formulates a 2-rate mixture model per site across branches:
      - Fraction p⁻ of branches evolve with rate β⁻ under constraint β⁻ ≤ α.
      - Fraction p⁺ = 1 - p⁻ of branches evolve with unrestricted rate β⁺ (can exceed α).
-  2. Maximizes profile mixture likelihood over (α, β⁻, β⁺, p⁺).
+  2. Maximizes profile mixture likelihood over (α, β⁻, β⁺, p⁺) (plus a separate background non-synonymous rate β_bg when a subset of branches is tested).
   3. Compares alternative fit against constrained null (β⁺ ≤ α, effectively β⁺ = α) using HyPhy's calibrated mixture distribution 0.333 χ²₀ + 0.300 χ²₁ + 0.367 χ²₂.
   4. Calculates branch-level **Empirical Bayes Factors (EBF)** to determine which individual phylogenetic branches are experiencing positive selection at each site.
 - **Outputs**: Site-level LRTs, p-values, branch attribution lists, EBF matrices, and Datamonkey JSON export.
@@ -270,7 +270,7 @@ Q_ij = (α or β) × ψ × ∏_{p ∈ D} r_{i_p → j_p} π_{j_p}^(p)    (|D|K =
     5. **Constrained Background ($M_{\text{null,BG}}$)**: Constrains $\omega_{BG,K} = 1$ while $\Theta_{FG}$ remains unconstrained ($p_{BG}$ via $\frac{1}{2}\chi^2_0 + \frac{1}{2}\chi^2_2$).
   - **Two-Stage Decision Procedure**:
     1. **Union-Intersection Test (UIT)**: Requires joint evidence of foreground selection and regime difference, $p_{\text{UIT}} = \max(p_{FG}, p_{\text{diff}}) \le \alpha$ (where $p_{\text{diff}}$ is the $\chi^2_{2K-1}$ LRT comparing $M_{\text{shared}}$ vs. $M_{\text{unc}}$).
-    2. **Lack of Evidence for Background Selection ($\text{AIC}_c$ / $p_{BG}$ Screen)**: Requires that the background-neutral model is supported ($\Delta\text{AIC}_c^{(BG)} = \text{AIC}_c(M_{\text{null,BG}}) - \text{AIC}_c(M_{\text{unc}}) \le 2.0$ or $p_{BG} > 0.068$, asymptotically equivalent to $\text{LRT}_{BG} \le 4.0$), plus a composite ranking score $-\log_{10}(\max(10^{-8}, p_{FG})) - \log_{10}(\max(10^{-8}, p_{\text{diff}})) + \log_{10}(\max(10^{-8}, p_{BG}))$.
+    2. **Lack of Evidence for Background Selection ($\text{AIC}_c$ / $p_{BG}$ Screen)**: Requires that the background-neutral model is supported by the disjunction $\Delta\text{AIC}_c^{(BG)} = \text{AIC}_c(M_{\text{null,BG}}) - \text{AIC}_c(M_{\text{unc}}) \le 2.0$ or $p_{BG} > 0.068$, plus a composite ranking score $-\log_{10}(\max(10^{-8}, p_{FG})) - \log_{10}(\max(10^{-8}, p_{\text{diff}})) + \log_{10}(\max(10^{-8}, p_{BG}))$.
 - **BUSTED-Auto (`--auto`, 4-Gate Surprisal & Score Model Selector)**:
   - Eliminates combinatorial 36-model grid searches by diagnosing and selecting the optimal model configuration from a single fast baseline fit:
     - **Gate 1 (Error Sink):** Evaluates branch-site surprisal gain ΔI_sink (in bits) and spatial adjacency, activating `--error-sink` only if the EM probe yields Δ ln L > 2.2 (with max surprisal ≥ 13.0 bits or adjacent clusters with ≥ 8.0 bits).
@@ -281,7 +281,7 @@ Q_ij = (α or β) × ψ × ∏_{p ∈ D} r_{i_p → j_p} π_{j_p}^(p)    (|D|K =
   - Automatically identifies the optimal number of selection categories K ∈ {1, 2, ..., K_max} via step-up AICc optimization, avoiding over-parameterization on simpler datasets.
 
 #### 4. **aBSREL (Adaptive Branch-Site Random Effects Likelihood)**
-- **Scope**: Tests whether a proportion of sites have evolved under positive diversifying selection along **each lineage/branch** of a phylogenetic tree, without requiring a priori branch labeling.
+- **Scope**: Tests whether a proportion of sites have evolved under positive diversifying selection along **each lineage/branch** of a phylogenetic tree, without requiring a priori branch labeling (models per-branch ω mixtures directly without site-level SRV or multiple-hit parameters).
 - **Workflow**:
   1. **Phase 1 (GTR Baseline)**: Precomputes nucleotide substitution biases and initial branch lengths.
   2. **Phase 2 (MG94 Baseline)**: Fits standard codon model with branch-specific ω_b ratios.
@@ -295,7 +295,7 @@ Null ~ ½ χ²₀ + ½(0.4 χ²₁ + 0.6 χ²₂)
 - **Ultra-Fast Local Projection**: Leverages Inside-Outside subtree (D_{v,p}) and ancestral complement (V_{v,p}) vectors to evaluate candidate branch mixtures via immediate dot products (L_p = V_{v,p}ᵀ P_b D_{v,p}) in microseconds with **zero whole-tree pruning passes**.
 
 #### 5. **RELAX (Detecting Relaxed or Intensified Selection Across Lineages)**
-- **Scope**: Tests whether natural selection has been relaxed (K < 1) or intensified (K > 1) on a designated set of **Test** branches relative to **Reference** branches.
+- **Scope**: Tests whether natural selection has been relaxed (K < 1) or intensified (K > 1) on a designated set of **Test** branches relative to **Reference** branches under a binary (`Classic`) 3-category BS-REL model (for arbitrary $K$ classes, SRV, multiple hits, or error-sink support with RELAX coupling, use `hyphy3 busted --relax` or `hyphy3 busted-ph`).
 - **Workflow**:
   1. **Phase 1 (Nucleotide GTR)**: Fits nucleotide exchangeabilities and branch lengths, alternating rates ↔ branch lengths to convergence.
   2. **Phase 2 (MG94 with Separate Rates)**: Fits distinct global ω_R and ω_T across branch sets, alternating per-branch length refinement (L-BFGS, exact gradients), (ω_R, ω_T), and the nucleotide exchangeabilities (as in HyPhy 2.5's full MG94 refit).
@@ -306,7 +306,7 @@ Null ~ ½ χ²₀ + ½(0.4 χ²₁ + 0.6 χ²₂)
      - K < 1 with p ≤ 0.05: Significant **relaxation of selection** (rates contract toward neutrality ω = 1).
      - K > 1 with p ≤ 0.05: Significant **intensification of selection** (rates diverge from neutrality).
 - **Model (HyPhy 2.5 BS-REL semantics)**: every branch-site combination draws its ω class independently, i.e. each branch uses P_b = Σ_c p_c exp(Q_c t_b), and all classes share one synonymous rate so that the branch length is the mixture-expected number of substitutions. The pre-2026 hyphy-3 model (site-level mixture, each class normalized separately) remains available for comparison via `--relax-mixture site --relax-normalization per-class`.
-- **Branch Set Specification**: Automatically detects `{T}`/`{TEST}`/`{FG}` (and `{R}`/`{REFERENCE}`/`{BG}`) annotations in Newick trees. `--test`/`--reference` resolve, in order, to: a tag present in the tree, a comma-separated list of exact branch names, or a regular expression (only when given as `regex:<pattern>` / `--test-regex`, or as a warned fallback when nothing else matches).
+- **Branch Set Specification**: Automatically detects `{T}`/`{TEST}`/`{FG}` (and `{R}`/`{REFERENCE}`/`{BG}`) annotations in Newick trees, or any single labeled branch tag set against untagged branches. `--test`/`--reference` resolve, in order, to: a tag present in the tree, a comma-separated list of exact branch names, or a regular expression (only when given as `regex:<pattern>` / `--test-regex`, or as a warned fallback when nothing else matches).
 
 #### 6. **Contrast-FEL (Comparing Selection Pressures Between Branch Sets)**
 - **Scope**: Tests whether selective pressures (non-synonymous rates β) differ between two or more designated sets of branches (e.g. Host 1 vs Host 2, Internal vs Leaves, or Phenotype A vs B) across individual codon sites.

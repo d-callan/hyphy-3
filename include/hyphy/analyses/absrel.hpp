@@ -361,15 +361,13 @@ public:
         PD_scratch.noalias() = P_b * D_mat;
         size_t num_patterns = aln.patterns.size();
         Scalar ll = log_scale_offset;
+        Scalar c_ll = 0.0;
         for (size_t p = 0; p < num_patterns; ++p) {
             Scalar Lp = V_mat.col(p).dot(PD_scratch.col(p));
-            if (Lp > 0.0) {
-                ll += pattern_weights_vec(p) * std::log(Lp);
-            } else {
-                ll += pattern_weights_vec(p) * (-1e20);
-            }
+            Scalar term = (Lp > 0.0) ? (pattern_weights_vec(p) * std::log(Lp)) : (pattern_weights_vec(p) * (-1e20));
+            LikelihoodEngine::neumaier_acc(ll, c_ll, term);
         }
-        return ll;
+        return ll + c_ll;
     }
 
     // Zero-allocation helper to compute V_mat [S x P], D_mat [S x P], and log_scale_offset for a single branch
@@ -738,14 +736,14 @@ public:
                 };
                 Scalar best_sc = obj_3d(best_pt);
 
-                // Precompute eigendecompositions for the 5 w1 grid values, and PD = P(a)*D_mat for each (a_mult, w)
+                // Precompute eigendecompositions for the 6 w1 grid values, and PD = P(a)*D_mat for each (a_mult, w)
                 constexpr std::array<Scalar, 6> a_grid = {0.25, 0.5, 1.0, 2.0, 4.0, 8.0};
                 constexpr std::array<Scalar, 5> p1_grid = {0.98, 0.90, 0.75, 0.50, 0.20};
-                constexpr std::array<Scalar, 5> w1_grid = {0.0, 0.05, 0.20, 0.50, 0.80};
+                constexpr std::array<Scalar, 6> w1_grid = {0.0, 0.05, 0.20, 0.40, 0.60, 0.80};
 
-                std::array<MG94Matrix, 5> mat_w1_grid;
-                std::array<Scalar, 5> x2_grid;
-                for (size_t iw1 = 0; iw1 < 5; ++iw1) {
+                std::array<MG94Matrix, 6> mat_w1_grid;
+                std::array<Scalar, 6> x2_grid;
+                for (size_t iw1 = 0; iw1 < 6; ++iw1) {
                     Scalar w1_c = std::clamp(w1_grid[iw1], 1.0 / (1.0 + std::exp(14.0)), 1.0 / (1.0 + std::exp(-6.0)));
                     Scalar x2 = std::log(w1_c / (1.0 - w1_c));
                     x2_grid[iw1] = x2;
@@ -756,8 +754,8 @@ public:
                 // Precompute L_p(a, w) = V_mat.col(p).dot(P(a, w) * D_mat.col(p)) for each grid point!
                 // Since Lp(p1) = p1 * L_p(a, w1) + (1 - p1) * L_p(a, 1.0), evaluating all 5 p1 values requires ZERO matrix multiplications!
                 Vector L_w2(num_patterns);
-                std::array<Vector, 5> L_w1;
-                for (size_t iw1 = 0; iw1 < 5; ++iw1) L_w1[iw1].resize(num_patterns);
+                std::array<Vector, 6> L_w1;
+                for (size_t iw1 = 0; iw1 < 6; ++iw1) L_w1[iw1].resize(num_patterns);
 
                 for (Scalar a_mult : a_grid) {
                     Scalar cand_log_a = std::log(cur_alpha * a_mult);
@@ -768,7 +766,7 @@ public:
                         L_w2(p) = V_mat.col(p).dot(PD_scratch.col(p));
                     }
 
-                    for (size_t iw1 = 0; iw1 < 5; ++iw1) {
+                    for (size_t iw1 = 0; iw1 < 6; ++iw1) {
                         PD_scratch.noalias() = mat_w1_grid[iw1].transition_matrix(a) * D_mat;
                         for (size_t p = 0; p < num_patterns; ++p) {
                             L_w1[iw1](p) = V_mat.col(p).dot(PD_scratch.col(p));
@@ -779,17 +777,15 @@ public:
                         Scalar cand_x1 = std::log(p1_val / (1.0 - p1_val));
                         Scalar p1 = 1.0 / (1.0 + std::exp(-cand_x1));
                         Scalar p2 = 1.0 - p1;
-                        for (size_t iw1 = 0; iw1 < 5; ++iw1) {
+                        for (size_t iw1 = 0; iw1 < 6; ++iw1) {
                             Scalar ll = log_scale_offset;
+                            Scalar c_ll = 0.0;
                             for (size_t p = 0; p < num_patterns; ++p) {
                                 Scalar Lp = p1 * L_w1[iw1](p) + p2 * L_w2(p);
-                                if (Lp > 0.0) {
-                                    ll += pattern_weights_vec(p) * std::log(Lp);
-                                } else {
-                                    ll += pattern_weights_vec(p) * (-1e20);
-                                }
+                                Scalar term = (Lp > 0.0) ? (pattern_weights_vec(p) * std::log(Lp)) : (pattern_weights_vec(p) * (-1e20));
+                                LikelihoodEngine::neumaier_acc(ll, c_ll, term);
                             }
-                            Scalar sc = -ll;
+                            Scalar sc = -(ll + c_ll);
                             if (sc < best_sc) {
                                 best_sc = sc;
                                 best_pt = {cand_log_a, cand_x1, x2_grid[iw1]};
@@ -844,17 +840,17 @@ public:
                 };
                 Scalar best_sc = obj_4d(best_pt);
 
-                // F-053: Factorized 4D grid search expanded to cover HyPhy's full 5x5x5x10 grid space:
+                // F-053: Factorized 5 x 5 x 6 x 10 = 1500-point 4D grid search spanning HyPhy's aBSREL.bf:1068-1071 ranges:
                 // 5 a_grid values, 5 p1 values ({0.98, 0.95, 0.90, 0.75, 0.50}),
-                // 5 w1 values ({0.0, 0.05, 0.20, 0.50, 0.80}), and 10 w2 values ({0.25, 0.5, 0.75, 1.0, 1.5, 4.0, 15.0, 80.0, 500.0, 2500.0}).
+                // 6 w1 values ({0.0, 0.05, 0.20, 0.40, 0.60, 0.80}), and 10 w2 values ({0.25, 0.5, 0.75, 1.0, 1.5, 4.0, 15.0, 80.0, 500.0, 2500.0}).
                 constexpr std::array<Scalar, 5> a_grid = {0.25, 0.5, 1.0, 2.0, 6.0};
                 constexpr std::array<Scalar, 5> p1_grid = {0.98, 0.95, 0.90, 0.75, 0.50};
-                constexpr std::array<Scalar, 5> w1_grid = {0.0, 0.05, 0.20, 0.50, 0.80};
+                constexpr std::array<Scalar, 6> w1_grid = {0.0, 0.05, 0.20, 0.40, 0.60, 0.80};
                 constexpr std::array<Scalar, 10> w2_grid = {0.25, 0.5, 0.75, 1.0, 1.5, 4.0, 15.0, 80.0, 500.0, 2500.0};
 
-                std::array<MG94Matrix, 5> mat_w1_grid;
-                std::array<Scalar, 5> x2_grid;
-                for (size_t iw1 = 0; iw1 < 5; ++iw1) {
+                std::array<MG94Matrix, 6> mat_w1_grid;
+                std::array<Scalar, 6> x2_grid;
+                for (size_t iw1 = 0; iw1 < 6; ++iw1) {
                     Scalar w1_c = std::clamp(w1_grid[iw1], 1.0 / (1.0 + std::exp(14.0)), 1.0 / (1.0 + std::exp(-6.0)));
                     Scalar x2 = std::log(w1_c / (1.0 - w1_c));
                     x2_grid[iw1] = x2;
@@ -871,16 +867,16 @@ public:
                     mat_w2_grid[iw2] = build_q_matrix(w2_exact);
                 }
 
-                std::array<Vector, 5> L_w1;
+                std::array<Vector, 6> L_w1;
                 std::array<Vector, 10> L_w2;
-                for (size_t iw1 = 0; iw1 < 5; ++iw1) L_w1[iw1].resize(num_patterns);
+                for (size_t iw1 = 0; iw1 < 6; ++iw1) L_w1[iw1].resize(num_patterns);
                 for (size_t iw2 = 0; iw2 < 10; ++iw2) L_w2[iw2].resize(num_patterns);
 
                 for (Scalar a_mult : a_grid) {
                     Scalar cand_log_a = std::log(cur_alpha * a_mult);
                     Scalar a = std::exp(cand_log_a);
 
-                    for (size_t iw1 = 0; iw1 < 5; ++iw1) {
+                    for (size_t iw1 = 0; iw1 < 6; ++iw1) {
                         PD_scratch.noalias() = mat_w1_grid[iw1].transition_matrix(a) * D_mat;
                         for (size_t p = 0; p < num_patterns; ++p) {
                             L_w1[iw1](p) = V_mat.col(p).dot(PD_scratch.col(p));
@@ -897,18 +893,16 @@ public:
                         Scalar cand_x1 = std::log(p1_val / (1.0 - p1_val));
                         Scalar p1 = 1.0 / (1.0 + std::exp(-cand_x1));
                         Scalar p2 = 1.0 - p1;
-                        for (size_t iw1 = 0; iw1 < 5; ++iw1) {
+                        for (size_t iw1 = 0; iw1 < 6; ++iw1) {
                             for (size_t iw2 = 0; iw2 < 10; ++iw2) {
                                 Scalar ll = log_scale_offset;
+                                Scalar c_ll = 0.0;
                                 for (size_t p = 0; p < num_patterns; ++p) {
                                     Scalar Lp = p1 * L_w1[iw1](p) + p2 * L_w2[iw2](p);
-                                    if (Lp > 0.0) {
-                                        ll += pattern_weights_vec(p) * std::log(Lp);
-                                    } else {
-                                        ll += pattern_weights_vec(p) * (-1e20);
-                                    }
+                                    Scalar term = (Lp > 0.0) ? (pattern_weights_vec(p) * std::log(Lp)) : (pattern_weights_vec(p) * (-1e20));
+                                    LikelihoodEngine::neumaier_acc(ll, c_ll, term);
                                 }
-                                Scalar sc = -ll;
+                                Scalar sc = -(ll + c_ll);
                                 if (sc < best_sc) {
                                     best_sc = sc;
                                     best_pt = {cand_log_a, cand_x1, x2_grid[iw1], x3_grid[iw2]};
@@ -1225,20 +1219,18 @@ public:
                         }
                     }
 
-                    Scalar total_ll = 0.0;
-                    for (size_t p = 0; p < n_pat; ++p) {
-                        total_ll += pattern_ll[p];
-                    }
+                    Scalar total_ll = LikelihoodEngine::neumaier_sum(pattern_ll);
 
                     grad.resize(n);
                     for (size_t i = 0; i < n; ++i) {
                         int32_t bid = nodes[i];
                         Scalar dL_sum = 0.0;
+                        Scalar c_dL = 0.0;
                         for (size_t p = 0; p < n_pat; ++p) {
-                            dL_sum += pattern_dL(bid, p);
+                            LikelihoodEngine::neumaier_acc(dL_sum, c_dL, pattern_dL(bid, p));
                         }
                         Scalar alpha = alpha_ref[bid];
-                        grad(i) = -alpha * dL_sum;
+                        grad(i) = -alpha * (dL_sum + c_dL);
                     }
 
                     Scalar cur_fx = -total_ll;
@@ -1508,7 +1500,7 @@ public:
         Matrix V_null_mat(S, num_patterns);
         Matrix D_null_mat(S, num_patterns);
 
-        const int max_p5_restarts = 5;
+        const int max_p5_restarts = std::max<int>(10, static_cast<int>(to_test.size()) + 2);
         for (int p5_restart = 0; p5_restart < max_p5_restarts; ++p5_restart) {
             bool full_model_improved = false;
             size_t t_idx = 0;
@@ -1653,13 +1645,10 @@ public:
 
                 // F-080: If null_ll > full_ll + 1e-4 and a restart round remains, warm-start the full model
                 // from the null configuration and restart Phase 5 so all branches are tested against a single
-                // consistent full model.
+                // consistent full model. Since the null configuration is itself a valid point in the unconstrained
+                // Full Model space, if the unconstrained polish does not beat null_ll, adopt the null configuration
+                // directly so null_ll > full_ll is always reconciled.
                 if (std::isfinite(null_ll) && null_ll > full_ll + 1e-4 && (p5_restart + 1 < max_p5_restarts)) {
-                    const auto saved_alpha = branch_alpha;
-                    const auto saved_omegas = branch_omegas;
-                    const auto saved_weights = branch_weights;
-                    const auto saved_gtr = gtr_params;
-
                     branch_alpha = null_alpha;
                     branch_omegas = null_omegas;
                     branch_weights = null_weights;
@@ -1676,6 +1665,15 @@ public:
                     }
                     P_branches = compute_all_branch_transition_matrices();
                     Scalar new_full_ll = compute_tree_log_likelihood(P_branches);
+                    if (new_full_ll < null_ll || !std::isfinite(new_full_ll)) {
+                        branch_alpha = null_alpha;
+                        branch_omegas = null_omegas;
+                        branch_weights = null_weights;
+                        gtr_params = null_gtr;
+                        compute_syn_scale();
+                        P_branches = compute_all_branch_transition_matrices();
+                        new_full_ll = compute_tree_log_likelihood(P_branches);
+                    }
                     if (new_full_ll > full_ll) {
                         full_ll = new_full_ll;
                         full_aicc = compute_aicc(full_ll, current_params);
@@ -1684,35 +1682,23 @@ public:
                         recompute_full_io_cache();
                         full_model_improved = true;
                         break; // Restart Phase 5 so all branches are tested against the improved full model
-                    } else {
-                        branch_alpha = saved_alpha;
-                        branch_omegas = saved_omegas;
-                        branch_weights = saved_weights;
-                        gtr_params = saved_gtr;
-                        compute_syn_scale();
-                        P_branches = compute_all_branch_transition_matrices();
                     }
                 }
 
                 const Matrix& V_branch_full = V_full_all[bid];
                 const Matrix& D_branch_full = D_full_all[bid];
 
-                Scalar lrt = 0.0;
-                if (null_ll <= -1e19 || full_ll <= -1e19 || !std::isfinite(null_ll) || !std::isfinite(full_ll)) {
+                Scalar lrt = (std::isfinite(null_ll) && std::isfinite(full_ll))
+                    ? 2.0 * (full_ll - null_ll)
+                    : 0.0;
+                if (lrt <= 0.0 || !std::isfinite(lrt)) {
                     lrt = 0.0;
                     bres.lrt = 0.0;
-                    bres.uncorrected_p_value = 1.0;
+                    // F-080: When a tested branch had unconstrained omega_K > 1 and lrt == 0.0, set p_value = 0.5 (matching aBSREL.bf:938)
+                    bres.uncorrected_p_value = 0.5;
                 } else {
-                    lrt = 2.0 * (full_ll - null_ll);
-                    if (lrt <= 0.0) {
-                        lrt = 0.0;
-                        bres.lrt = 0.0;
-                        // F-080: When a tested branch had unconstrained omega_K > 1 and lrt == 0.0, set p_value = 0.5 (matching aBSREL.bf:938)
-                        bres.uncorrected_p_value = 0.5;
-                    } else {
-                        bres.lrt = lrt;
-                        bres.uncorrected_p_value = compute_mixture_p_value(lrt);
-                    }
+                    bres.lrt = lrt;
+                    bres.uncorrected_p_value = compute_mixture_p_value(lrt);
                 }
 
                 // Compute Empirical Bayes Factors per site

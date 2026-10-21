@@ -151,6 +151,16 @@ nlohmann::json BUSTEDAnalyzer::to_legacy_json(const BUSTEDResult& res) const {
             return distro;
         };
 
+        auto format_mss_fit_rates = [&](const BUSTEDFit& fit) -> nlohmann::json {
+            nlohmann::json mss_obj = nlohmann::json::object();
+            if (!res.mss_rates.empty() && fit.mss_class_rates.size() == res.mss_rates.size()) {
+                for (size_t c = 0; c < res.mss_rates.size(); ++c) {
+                    mss_obj[res.mss_rates[c].class_name] = fit.mss_class_rates[c];
+                }
+            }
+            return mss_obj;
+        };
+
         nlohmann::json unc_rates = {{"Test", format_distro(res.unconstrained.test_distribution)}};
         if (res.unconstrained.has_background_distribution) {
             unc_rates["Background"] = format_distro(res.unconstrained.background_distribution);
@@ -166,6 +176,9 @@ nlohmann::json BUSTEDAnalyzer::to_legacy_json(const BUSTEDResult& res) const {
             {"Log Likelihood", res.unconstrained.log_likelihood},
             {"Rate Distributions", unc_rates}
         };
+        if (!res.mss_rates.empty() && res.unconstrained.mss_class_rates.size() == res.mss_rates.size()) {
+            unc_fit["MSS Synonymous Rates"] = format_mss_fit_rates(res.unconstrained);
+        }
         if (res.settings.multiple_hits != "None") {
             unc_fit["rate at which 2 nucleotides are changed instantly within a single codon"] = res.unconstrained.delta;
             unc_fit["Fraction of subs rate at which 2 nucleotides are changed instantly within a single codon"] = res.unconstrained.frac_delta;
@@ -191,6 +204,9 @@ nlohmann::json BUSTEDAnalyzer::to_legacy_json(const BUSTEDResult& res) const {
             {"Log Likelihood", res.constrained.log_likelihood},
             {"Rate Distributions", con_rates}
         };
+        if (!res.mss_rates.empty() && res.constrained.mss_class_rates.size() == res.mss_rates.size()) {
+            con_fit["MSS Synonymous Rates"] = format_mss_fit_rates(res.constrained);
+        }
         if (res.settings.multiple_hits != "None") {
             con_fit["rate at which 2 nucleotides are changed instantly within a single codon"] = res.constrained.delta;
             con_fit["Fraction of subs rate at which 2 nucleotides are changed instantly within a single codon"] = res.constrained.frac_delta;
@@ -214,6 +230,9 @@ nlohmann::json BUSTEDAnalyzer::to_legacy_json(const BUSTEDResult& res) const {
                 {"Log Likelihood", res.constrained_background.log_likelihood},
                 {"Rate Distributions", con_bg_rates}
             };
+            if (!res.mss_rates.empty() && res.constrained_background.mss_class_rates.size() == res.mss_rates.size()) {
+                fits["Constrained model (background)"]["MSS Synonymous Rates"] = format_mss_fit_rates(res.constrained_background);
+            }
         }
         if (res.has_background_test || res.has_relax_test) {
             nlohmann::json shared_rates = {
@@ -228,6 +247,9 @@ nlohmann::json BUSTEDAnalyzer::to_legacy_json(const BUSTEDResult& res) const {
                 {"Log Likelihood", res.shared_distributions.log_likelihood},
                 {"Rate Distributions", shared_rates}
             };
+            if (!res.mss_rates.empty() && res.shared_distributions.mss_class_rates.size() == res.mss_rates.size()) {
+                fits["Unconstrained model with shared distributions"]["MSS Synonymous Rates"] = format_mss_fit_rates(res.shared_distributions);
+            }
         }
         if (res.has_relax_test) {
             nlohmann::json relax_rates = {
@@ -243,6 +265,9 @@ nlohmann::json BUSTEDAnalyzer::to_legacy_json(const BUSTEDResult& res) const {
                 {"relaxation or intensification parameter", res.relax_k},
                 {"Rate Distributions", relax_rates}
             };
+            if (!res.mss_rates.empty() && res.relax_alternative.mss_class_rates.size() == res.mss_rates.size()) {
+                fits["RELAX alternative (coupled-k)"]["MSS Synonymous Rates"] = format_mss_fit_rates(res.relax_alternative);
+            }
         }
 
         j["fits"] = fits;
@@ -505,6 +530,13 @@ nlohmann::json BUSTEDAnalyzer::to_modern_json(const BUSTEDResult& res, const Pro
                     f["multiple_hits"]["triple_hit_rate"] = finite_or_null(fit.psi);
                     f["multiple_hits"]["triple_hit_fraction"] = finite_or_null(fit.frac_psi);
                 }
+            }
+            if (!res.mss_rates.empty() && fit.mss_class_rates.size() == res.mss_rates.size()) {
+                nlohmann::json mss_obj = nlohmann::json::object();
+                for (size_t c = 0; c < res.mss_rates.size(); ++c) {
+                    mss_obj[res.mss_rates[c].class_name] = finite_or_null(fit.mss_class_rates[c]);
+                }
+                f["mss_rates"] = mss_obj;
             }
             return f;
         };

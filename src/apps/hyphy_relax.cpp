@@ -48,6 +48,11 @@ static void print_relax_usage(const char* prog) {
               << "                       per-class = legacy hyphy-3 behavior, for comparison)\n"
               << "  " << Console::brand("--relax-mixture") << " <branch-site|site>  Omega mixture level (default: branch-site =\n"
               << "                       P_b = sum_c w_c exp(Q_c t_b) per branch, as in HyPhy 2.5 BS-REL; site = legacy hyphy-3)\n"
+              << "  " << Console::brand("--mode") << " <type>        RELAX test mode (supported: 'Classic mode', default)\n"
+              << "  " << Console::brand("--rates") << " <N>          Number of omega rate classes (supported: 3, default)\n"
+              << "  " << Console::brand("--srv") << " <Yes|No>       Synonymous rate variation (supported: No in standalone hyphy_relax; use hyphy_busted --phenotype --relax)\n"
+              << "  " << Console::brand("--multiple-hits") << " <m>  Multi-hit mode (supported: None in standalone hyphy_relax; use hyphy_busted --phenotype --relax)\n"
+              << "  " << Console::brand("--error-sink") << " <Yes|No> Error-sink class (supported: No in standalone hyphy_relax; use hyphy_busted --phenotype --relax)\n"
               << "  " << Console::brand("--progress") << "           Force interactive progress bar\n"
               << "  " << Console::brand("--no-progress") << "        Disable progress bar\n"
               << "  " << Console::brand("--help, -h") << "           Show this help message\n\n"
@@ -101,6 +106,59 @@ int run_relax(int argc, char* argv[]) {
                 settings.mixture_level = RELAXMixtureLevel::BranchSite;
             } else {
                 std::cerr << "Error: --relax-mixture must be 'site' or 'branch-site' (got '" << lvl << "').\n";
+                return 1;
+            }
+        } else if (arg == "--mode" && i + 1 < argc) {
+            std::string m = argv[++i];
+            if (m != "Classic mode" && m != "Classic" && m != "classic") {
+                std::cerr << "Error: Standalone hyphy_relax implements 'Classic mode' (2-way Test vs Reference); got '" << m << "'.\n";
+                return 1;
+            }
+        } else if (arg == "--rates" && i + 1 < argc) {
+            int r = std::stoi(argv[++i]);
+            if (r != 3) {
+                std::cerr << "Error: Standalone hyphy_relax implements 3 omega classes (--rates 3); got --rates " << r
+                          << ". Use 'hyphy_busted --phenotype --relax --rates " << r << "' for arbitrary K.\n";
+                return 1;
+            }
+        } else if (arg == "--srv") {
+            std::string val = "Yes";
+            if (i + 1 < argc && argv[i + 1][0] != '-') {
+                val = argv[++i];
+            }
+            if (val != "No" && val != "no" && val != "false" && val != "0") {
+                std::cerr << "Error: Synonymous rate variation (--srv) is not supported in standalone hyphy_relax. "
+                          << "Use 'hyphy_busted --phenotype --relax --srv' instead.\n";
+                return 1;
+            }
+        } else if (arg == "--syn-rates" && i + 1 < argc) {
+            int sr = std::stoi(argv[++i]);
+            if (sr > 1) {
+                std::cerr << "Error: --syn-rates > 1 is not supported in standalone hyphy_relax. "
+                          << "Use 'hyphy_busted --phenotype --relax --srv --syn-rates " << sr << "' instead.\n";
+                return 1;
+            }
+        } else if (arg == "--multiple-hits" && i + 1 < argc) {
+            std::string mh = argv[++i];
+            if (mh != "None" && mh != "none" && mh != "No" && mh != "no") {
+                std::cerr << "Error: Multi-hit substitutions (--multiple-hits " << mh << ") are not supported in standalone hyphy_relax. "
+                          << "Use 'hyphy_busted --phenotype --relax --multiple-hits " << mh << "' instead.\n";
+                return 1;
+            }
+        } else if (arg == "--error-sink") {
+            std::string val = "Yes";
+            if (i + 1 < argc && argv[i + 1][0] != '-') {
+                val = argv[++i];
+            }
+            if (val != "No" && val != "no" && val != "false" && val != "0") {
+                std::cerr << "Error: Error-sink mixture component (--error-sink) is not supported in standalone hyphy_relax. "
+                          << "Use 'hyphy_busted --phenotype --relax --error-sink' instead.\n";
+                return 1;
+            }
+        } else if ((arg == "--grid-size" || arg == "--starting-points") && i + 1 < argc) {
+            int n_val = std::stoi(argv[++i]);
+            if (n_val <= 0) {
+                std::cerr << "Error: " << arg << " must be positive.\n";
                 return 1;
             }
         } else if (arg == "--help" || arg == "-h") {

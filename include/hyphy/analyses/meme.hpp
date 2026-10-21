@@ -44,6 +44,7 @@ struct MEMESiteResult {
     Scalar p_value_meme_vs_fel = 1.0;
     Scalar fel_alpha = 0.0;
     Scalar fel_beta = 0.0;
+    Scalar beta_bg = 0.0;
     std::vector<Scalar> branch_ebf;
     SiteSubstitutions subs;
 };
@@ -216,7 +217,7 @@ public:
         std::vector<Matrix> P_branches(num_nodes);
 
         bool has_bg = (num_background > 0);
-        auto eval_pattern_meme_lnl = [&](Scalar a, Scalar w1, Scalar p1, Scalar b_plus) -> Scalar {
+        auto eval_pattern_meme_lnl = [&](Scalar a, Scalar w1, Scalar p1, Scalar b_plus, Scalar b_bg) -> Scalar {
             Scalar b1 = a * w1;
             MG94Parameters p_1 = base_params;
             p_1.alpha = a;
@@ -232,7 +233,7 @@ public:
             if (has_bg) {
                 MG94Parameters p_bg = base_params;
                 p_bg.alpha = a;
-                p_bg.beta = (fel_res.beta_nuisance > 0.0) ? fel_res.beta_nuisance : b1;
+                p_bg.beta = b_bg;
                 mg_bg.update(p_bg, aln.pos_nuc_frequencies, aln.codon_frequencies_f3x4, gcode);
             }
 
@@ -255,6 +256,9 @@ public:
         // Construct grid starting points matching HyPhy 2.5 MEME.bf
         Scalar alpha_fel = std::clamp(fel_res.alpha, 1e-4, 10000.0);
         Scalar beta_fel = std::clamp(fel_res.beta, 1e-4, 100000.0);
+        Scalar beta_bg_0 = (has_bg && fel_res.beta_nuisance > 0.0)
+            ? std::clamp(fel_res.beta_nuisance, 1e-4, 100000.0)
+            : beta_fel;
         std::vector<std::array<Scalar, 4>> start_grid;
 
         Scalar w1_0 = std::clamp(beta_fel / std::max(alpha_fel, 1e-4), 0.0, 1.0);
@@ -285,62 +289,141 @@ public:
             start_grid.push_back({alpha_fel, 1.00, 0.01, std::max(beta_fel, alpha_fel * 1.5)});
         }
 
-        // Optimize Alternative Model (4D Nelder-Mead: alpha, omega1, p1, beta_plus)
-        auto obj_alt = [&](const std::array<Scalar, 4>& x) -> Scalar {
-            return -eval_pattern_meme_lnl(x[0], x[1], x[2], x[3]);
-        };
-
-        std::array<Scalar, 4> lb_alt = {1e-4, 0.0, 1e-6, 1e-4};
-        std::array<Scalar, 4> ub_alt = {10000.0, 1.0, 1.0 - 1e-6, 100000.0};
-        auto opt_alt = NelderMeadND<4>::minimize(obj_alt, start_grid[0], lb_alt, ub_alt, 1e-5, 800, start_grid);
-
-        res.alpha = opt_alt.x[0];
-        Scalar omega1 = opt_alt.x[1];
-        res.p1 = opt_alt.x[2];
-        res.beta_plus = opt_alt.x[3];
-        res.beta1 = res.alpha * omega1;
-        res.p_plus = 1.0 - res.p1;
-        res.log_l_meme = -opt_alt.f;
+        Scalar omega1 = w1_0;
+        if (has_bg) {
+            // F-012: Optimize Alternative Model with free background rate beta_bg (5D Nelder-Mead: alpha, omega1, p1, beta_plus, beta_bg)
+            auto obj_alt5 = [&](const std::array<Scalar, 5>& x) -> Scalar {
+                return -eval_pattern_meme_lnl(x[0], x[1], x[2], x[3], x[4]);
+            };
+            std::vector<std::array<Scalar, 5>> start_grid5;
+            start_grid5.reserve(start_grid.size());
+            for (const auto& pt : start_grid) {
+                start_grid5.push_back({pt[0], pt[1], pt[2], pt[3], beta_bg_0});
+            }
+            std::array<Scalar, 5> lb_alt5 = {1e-4, 0.0, 1e-6, 1e-4, 1e-4};
+            std::array<Scalar, 5> ub_alt5 = {10000.0, 1.0, 1.0 - 1e-6, 100000.0, 100000.0};
+            auto opt_alt5 = NelderMeadND<5>::minimize(obj_alt5, start_grid5[0], lb_alt5, ub_alt5, 1e-5, 800, start_grid5);
+            res.alpha = opt_alt5.x[0];
+            omega1 = opt_alt5.x[1];
+            res.p1 = opt_alt5.x[2];
+            res.beta_plus = opt_alt5.x[3];
+            res.beta_bg = opt_alt5.x[4];
+            res.beta1 = res.alpha * omega1;
+            res.p_plus = 1.0 - res.p1;
+            res.log_l_meme = -opt_alt5.f;
+        } else {
+            // Optimize Alternative Model (4D Nelder-Mead: alpha, omega1, p1, beta_plus)
+            auto obj_alt = [&](const std::array<Scalar, 4>& x) -> Scalar {
+                return -eval_pattern_meme_lnl(x[0], x[1], x[2], x[3], 0.0);
+            };
+            std::array<Scalar, 4> lb_alt = {1e-4, 0.0, 1e-6, 1e-4};
+            std::array<Scalar, 4> ub_alt = {10000.0, 1.0, 1.0 - 1e-6, 100000.0};
+            auto opt_alt = NelderMeadND<4>::minimize(obj_alt, start_grid[0], lb_alt, ub_alt, 1e-5, 800, start_grid);
+            res.alpha = opt_alt.x[0];
+            omega1 = opt_alt.x[1];
+            res.p1 = opt_alt.x[2];
+            res.beta_plus = opt_alt.x[3];
+            res.beta_bg = 0.0;
+            res.beta1 = res.alpha * omega1;
+            res.p_plus = 1.0 - res.p1;
+            res.log_l_meme = -opt_alt.f;
+        }
 
         // Hypothesis Testing: Alternative vs. Null (beta_plus == alpha)
         if (res.beta_plus > res.alpha && res.p_plus > 1e-6) {
-            auto obj_null = [&](const std::array<Scalar, 3>& x) -> Scalar {
-                return -eval_pattern_meme_lnl(x[0], x[1], x[2], x[0]); // beta_plus = alpha
-            };
+            Scalar log_l_null = -1e20;
+            Scalar alpha_null = res.alpha;
+            Scalar omega1_null = omega1;
+            Scalar p1_null = res.p1;
+            Scalar beta_bg_null = res.beta_bg;
 
-            std::vector<std::array<Scalar, 3>> null_grid;
-            null_grid.push_back({res.alpha, omega1, res.p1});
-            null_grid.push_back({std::clamp(fel_res.alpha_null, 1e-4, 50.0), 1.0, 0.5});
-            null_grid.push_back({std::clamp(fel_res.alpha_null, 1e-4, 50.0), omega1, res.p1});
-            null_grid.push_back({std::clamp(res.alpha, 1e-4, 50.0), 1.0, 0.5});
-            for (Scalar a_cand : {0.01, 0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0}) {
-                null_grid.push_back({a_cand, 0.5, 0.5});
-                null_grid.push_back({a_cand, 0.0, 0.9});
-            }
-
-            std::array<Scalar, 3> lb_null = {1e-4, 0.0, 1e-6};
-            std::array<Scalar, 3> ub_null = {10000.0, 1.0, 1.0 - 1e-6};
-            auto opt_null = NelderMeadND<3>::minimize(obj_null, null_grid[0], lb_null, ub_null, 1e-5, 800, null_grid);
-
-            Scalar log_l_null = -opt_null.f;
-            if (log_l_null > res.log_l_meme && std::isfinite(log_l_null)) {
-                // Warm-start alternative model directly from the null MLE (F-074, F-094)
-                Scalar alpha_null = opt_null.x[0];
-                Scalar omega1_null = opt_null.x[1];
-                Scalar p1_null = opt_null.x[2];
-                std::vector<std::array<Scalar, 4>> warm_alt_grid = {
-                    {alpha_null, omega1_null, p1_null, alpha_null},
-                    {alpha_null, omega1_null, 0.99, alpha_null}
+            if (has_bg) {
+                auto obj_null4 = [&](const std::array<Scalar, 4>& x) -> Scalar {
+                    return -eval_pattern_meme_lnl(x[0], x[1], x[2], x[0], x[3]); // beta_plus = alpha, free beta_bg
                 };
-                auto opt_alt2 = NelderMeadND<4>::minimize(obj_alt, warm_alt_grid[0], lb_alt, ub_alt, 1e-5, 800, warm_alt_grid);
-                if (-opt_alt2.f > res.log_l_meme) {
-                    res.alpha = opt_alt2.x[0];
-                    omega1 = opt_alt2.x[1];
-                    res.p1 = opt_alt2.x[2];
-                    res.beta_plus = opt_alt2.x[3];
-                    res.beta1 = res.alpha * omega1;
-                    res.p_plus = 1.0 - res.p1;
-                    res.log_l_meme = -opt_alt2.f;
+                std::vector<std::array<Scalar, 4>> null_grid4;
+                null_grid4.push_back({res.alpha, omega1, res.p1, res.beta_bg});
+                null_grid4.push_back({std::clamp(fel_res.alpha_null, 1e-4, 50.0), 1.0, 0.5, beta_bg_0});
+                null_grid4.push_back({std::clamp(fel_res.alpha_null, 1e-4, 50.0), omega1, res.p1, beta_bg_0});
+                null_grid4.push_back({std::clamp(res.alpha, 1e-4, 50.0), 1.0, 0.5, res.beta_bg});
+                for (Scalar a_cand : {0.01, 0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0}) {
+                    null_grid4.push_back({a_cand, 0.5, 0.5, res.beta_bg});
+                    null_grid4.push_back({a_cand, 0.0, 0.9, res.beta_bg});
+                }
+                std::array<Scalar, 4> lb_null4 = {1e-4, 0.0, 1e-6, 1e-4};
+                std::array<Scalar, 4> ub_null4 = {10000.0, 1.0, 1.0 - 1e-6, 100000.0};
+                auto opt_null4 = NelderMeadND<4>::minimize(obj_null4, null_grid4[0], lb_null4, ub_null4, 1e-5, 800, null_grid4);
+                log_l_null = -opt_null4.f;
+                alpha_null = opt_null4.x[0];
+                omega1_null = opt_null4.x[1];
+                p1_null = opt_null4.x[2];
+                beta_bg_null = opt_null4.x[3];
+
+                if (log_l_null > res.log_l_meme && std::isfinite(log_l_null)) {
+                    auto obj_alt5 = [&](const std::array<Scalar, 5>& x) -> Scalar {
+                        return -eval_pattern_meme_lnl(x[0], x[1], x[2], x[3], x[4]);
+                    };
+                    std::vector<std::array<Scalar, 5>> warm_alt_grid5 = {
+                        {alpha_null, omega1_null, p1_null, alpha_null, beta_bg_null},
+                        {alpha_null, omega1_null, 0.99, alpha_null, beta_bg_null}
+                    };
+                    std::array<Scalar, 5> lb_alt5 = {1e-4, 0.0, 1e-6, 1e-4, 1e-4};
+                    std::array<Scalar, 5> ub_alt5 = {10000.0, 1.0, 1.0 - 1e-6, 100000.0, 100000.0};
+                    auto opt_alt2 = NelderMeadND<5>::minimize(obj_alt5, warm_alt_grid5[0], lb_alt5, ub_alt5, 1e-5, 800, warm_alt_grid5);
+                    if (-opt_alt2.f > res.log_l_meme) {
+                        res.alpha = opt_alt2.x[0];
+                        omega1 = opt_alt2.x[1];
+                        res.p1 = opt_alt2.x[2];
+                        res.beta_plus = opt_alt2.x[3];
+                        res.beta_bg = opt_alt2.x[4];
+                        res.beta1 = res.alpha * omega1;
+                        res.p_plus = 1.0 - res.p1;
+                        res.log_l_meme = -opt_alt2.f;
+                    }
+                }
+            } else {
+                auto obj_null = [&](const std::array<Scalar, 3>& x) -> Scalar {
+                    return -eval_pattern_meme_lnl(x[0], x[1], x[2], x[0], 0.0); // beta_plus = alpha
+                };
+                std::vector<std::array<Scalar, 3>> null_grid;
+                null_grid.push_back({res.alpha, omega1, res.p1});
+                null_grid.push_back({std::clamp(fel_res.alpha_null, 1e-4, 50.0), 1.0, 0.5});
+                null_grid.push_back({std::clamp(fel_res.alpha_null, 1e-4, 50.0), omega1, res.p1});
+                null_grid.push_back({std::clamp(res.alpha, 1e-4, 50.0), 1.0, 0.5});
+                for (Scalar a_cand : {0.01, 0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0}) {
+                    null_grid.push_back({a_cand, 0.5, 0.5});
+                    null_grid.push_back({a_cand, 0.0, 0.9});
+                }
+
+                std::array<Scalar, 3> lb_null = {1e-4, 0.0, 1e-6};
+                std::array<Scalar, 3> ub_null = {10000.0, 1.0, 1.0 - 1e-6};
+                auto opt_null = NelderMeadND<3>::minimize(obj_null, null_grid[0], lb_null, ub_null, 1e-5, 800, null_grid);
+
+                log_l_null = -opt_null.f;
+                alpha_null = opt_null.x[0];
+                omega1_null = opt_null.x[1];
+                p1_null = opt_null.x[2];
+                if (log_l_null > res.log_l_meme && std::isfinite(log_l_null)) {
+                    // Warm-start alternative model directly from the null MLE (F-074, F-094)
+                    auto obj_alt = [&](const std::array<Scalar, 4>& x) -> Scalar {
+                        return -eval_pattern_meme_lnl(x[0], x[1], x[2], x[3], 0.0);
+                    };
+                    std::array<Scalar, 4> lb_alt = {1e-4, 0.0, 1e-6, 1e-4};
+                    std::array<Scalar, 4> ub_alt = {10000.0, 1.0, 1.0 - 1e-6, 100000.0};
+                    std::vector<std::array<Scalar, 4>> warm_alt_grid = {
+                        {alpha_null, omega1_null, p1_null, alpha_null},
+                        {alpha_null, omega1_null, 0.99, alpha_null}
+                    };
+                    auto opt_alt2 = NelderMeadND<4>::minimize(obj_alt, warm_alt_grid[0], lb_alt, ub_alt, 1e-5, 800, warm_alt_grid);
+                    if (-opt_alt2.f > res.log_l_meme) {
+                        res.alpha = opt_alt2.x[0];
+                        omega1 = opt_alt2.x[1];
+                        res.p1 = opt_alt2.x[2];
+                        res.beta_plus = opt_alt2.x[3];
+                        res.beta1 = res.alpha * omega1;
+                        res.p_plus = 1.0 - res.p1;
+                        res.log_l_meme = -opt_alt2.f;
+                    }
                 }
             }
 
@@ -349,14 +432,12 @@ public:
                 res.p_value = 1.0;
                 res.branches_under_selection = 0;
             } else if (log_l_null > res.log_l_meme) {
-                Scalar alpha_null = opt_null.x[0];
-                Scalar omega1_null = opt_null.x[1];
-                Scalar p1_null = opt_null.x[2];
                 Scalar beta1_null = alpha_null * omega1_null;
                 res.alpha = alpha_null;
                 res.beta1 = beta1_null;
                 res.p1 = p1_null;
                 res.beta_plus = alpha_null;
+                res.beta_bg = beta_bg_null;
                 res.p_plus = 1.0 - p1_null;
                 res.log_l_meme = log_l_null;
                 res.lrt = 0.0;
@@ -389,7 +470,7 @@ public:
             if (has_bg) {
                 MG94Parameters p_bg = base_params;
                 p_bg.alpha = res.alpha;
-                p_bg.beta = (fel_res.beta_nuisance > 0.0) ? fel_res.beta_nuisance : res.beta1;
+                p_bg.beta = (res.beta_bg > 0.0) ? res.beta_bg : res.beta1;
                 mg_bg.update(p_bg, aln.pos_nuc_frequencies, aln.codon_frequencies_f3x4, gcode);
             }
 

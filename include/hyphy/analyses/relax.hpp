@@ -428,6 +428,7 @@ public:
         bool has_tagged_test = false;
         bool has_tagged_ref = false;
         std::vector<std::string> distinct_tag_groups;
+        std::vector<std::string> non_empty_tag_groups;
 
         for (const auto& node : tree.nodes) {
             if (node.id == tree.root_id) continue;
@@ -435,6 +436,9 @@ public:
             std::string grp = canonical_group(tl);
             if (std::find(distinct_tag_groups.begin(), distinct_tag_groups.end(), grp) == distinct_tag_groups.end()) {
                 distinct_tag_groups.push_back(grp);
+            }
+            if (!grp.empty() && std::find(non_empty_tag_groups.begin(), non_empty_tag_groups.end(), grp) == non_empty_tag_groups.end()) {
+                non_empty_tag_groups.push_back(grp);
             }
             if (grp == "__test__") {
                 has_tagged_test = true;
@@ -445,6 +449,25 @@ public:
 
         bool explicit_test = !settings.test_branch_regex.empty() || !settings.test_branch_names.empty();
         bool explicit_ref = !settings.reference_branch_regex.empty() || !settings.reference_branch_names.empty();
+
+        // F-095: Support arbitrary single-tag Newick trees (e.g., {Marine} vs untagged) or 2-tag trees where one tag is canonical
+        std::string auto_test_group;
+        std::string auto_ref_group;
+        if (!explicit_test && !has_tagged_test) {
+            if (non_empty_tag_groups.size() == 1 && non_empty_tag_groups[0] != "__ref__") {
+                auto_test_group = non_empty_tag_groups[0];
+            } else if (non_empty_tag_groups.size() == 2 && has_tagged_ref) {
+                auto_test_group = (non_empty_tag_groups[0] == "__ref__") ? non_empty_tag_groups[1] : non_empty_tag_groups[0];
+            } else if (non_empty_tag_groups.size() >= 2) {
+                throw std::runtime_error(
+                    "Multiple branch tag groups exist in the tree without a designated test group. "
+                    "Specify the test group explicitly via --test <group>."
+                );
+            }
+        }
+        if (!explicit_ref && !has_tagged_ref && has_tagged_test && non_empty_tag_groups.size() == 2 && distinct_tag_groups.size() == 2) {
+            auto_ref_group = (non_empty_tag_groups[0] == "__test__") ? non_empty_tag_groups[1] : non_empty_tag_groups[0];
+        }
 
         std::vector<bool> test_sel, ref_sel;
         if (explicit_test) {
@@ -461,12 +484,16 @@ public:
         for (const auto& node : tree.nodes) {
             if (node.id == tree.root_id) continue;
 
+            std::string tl = to_lower(trim(node.model_tag));
+            std::string grp = canonical_group(tl);
+
             bool is_test = false;
             if (explicit_test) {
                 is_test = test_sel[node.id];
             } else if (has_tagged_test) {
-                std::string tl = to_lower(trim(node.model_tag));
-                is_test = (tl == "t" || tl == "test" || tl == "fg" || tl == "foreground");
+                is_test = (grp == "__test__");
+            } else if (!auto_test_group.empty()) {
+                is_test = (grp == auto_test_group);
             }
 
             bool is_ref = false;
@@ -474,8 +501,9 @@ public:
                 if (explicit_ref) {
                     is_ref = ref_sel[node.id];
                 } else if (has_tagged_ref) {
-                    std::string tl = to_lower(trim(node.model_tag));
-                    is_ref = (tl == "r" || tl == "ref" || tl == "reference" || tl == "bg" || tl == "background");
+                    is_ref = (grp == "__ref__");
+                } else if (!auto_ref_group.empty()) {
+                    is_ref = (grp == auto_ref_group);
                 } else if (!multi_group_tree) {
                     is_ref = true;
                 }

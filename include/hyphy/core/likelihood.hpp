@@ -31,17 +31,21 @@ public:
     }
 
     // Neumaier compensated summation for deterministic, high-precision reduction across site patterns
+    static inline void neumaier_acc(Scalar& sum, Scalar& c, Scalar x) {
+        Scalar t = sum + x;
+        if (std::abs(sum) >= std::abs(x)) {
+            c += (sum - t) + x;
+        } else {
+            c += (x - t) + sum;
+        }
+        sum = t;
+    }
+
     static Scalar neumaier_sum(const std::vector<Scalar>& terms) {
         Scalar sum = 0.0;
         Scalar c = 0.0;
         for (Scalar x : terms) {
-            Scalar t = sum + x;
-            if (std::abs(sum) >= std::abs(x)) {
-                c += (sum - t) + x;
-            } else {
-                c += (x - t) + sum;
-            }
-            sum = t;
+            neumaier_acc(sum, c, x);
         }
         return sum + c;
     }
@@ -678,7 +682,7 @@ public:
 
         std::vector<Scalar> pattern_ll(num_patterns, 0.0);
         int n_threads = optimal_omp_threads(num_patterns, 32);
-        const size_t tile_size = std::max<size_t>(16, std::min<size_t>(256, (num_patterns + n_threads - 1) / n_threads));
+        const size_t tile_size = std::min<size_t>(64, std::max<size_t>(1, num_patterns));
         const size_t num_tiles = (num_patterns + tile_size - 1) / tile_size;
 
         #pragma omp parallel num_threads(n_threads)
@@ -715,7 +719,6 @@ public:
         std::vector<Vector> V;
         std::vector<Vector> P_D;
         std::vector<Vector> U;
-        std::vector<double> B;
         std::vector<int> boost_counts;
         std::vector<double> node_log_scale;
         std::vector<Vector> pref;
@@ -732,7 +735,6 @@ public:
                 V.assign(num_nodes, Vector::Zero(S));
                 P_D.assign(num_nodes, Vector::Zero(S));
                 U.assign(num_nodes, Vector::Zero(S));
-                B.assign(num_nodes, 1.0);
                 boost_counts.assign(num_nodes, 0);
                 node_log_scale.assign(num_nodes, 0.0);
                 v_msg.resize(S);
@@ -764,17 +766,14 @@ public:
                 size_t t_idx = leaf_to_taxon[nid];
                 init_leaf_likelihood(pattern, t_idx, S, ws.D[nid]);
                 ws.node_log_scale[nid] = 0.0;
-                ws.B[nid] = 1.0;
                 ws.boost_counts[nid] = 0;
             } else {
                 double child_scale_sum = 0.0;
                 for (int32_t cid : node.children) {
                     ws.P_D[cid].noalias() = P_branches[cid] * ws.D[cid];
                 }
-                double boost_mult = 1.0;
                 int boost_cnt = 0;
-                tree.eval_internal_node(nid, P_branches, ws.D, ws.node_log_scale, ws.D[nid], child_scale_sum, P_bridges, &boost_mult, &boost_cnt);
-                ws.B[nid] = boost_mult;
+                tree.eval_internal_node(nid, P_branches, ws.D, ws.node_log_scale, ws.D[nid], child_scale_sum, P_bridges, nullptr, &boost_cnt);
                 ws.boost_counts[nid] = boost_cnt;
                 ws.node_log_scale[nid] = child_scale_sum;
             }
@@ -985,7 +984,7 @@ public:
         std::vector<Scalar> pattern_ll(num_patterns, 0.0);
         Matrix pattern_grad = Matrix::Zero(num_nodes, num_patterns);
         int n_threads = optimal_omp_threads(num_patterns, 32);
-        const size_t tile_size = std::max<size_t>(16, std::min<size_t>(256, (num_patterns + std::max(1, n_threads) - 1) / std::max(1, n_threads)));
+        const size_t tile_size = std::min<size_t>(64, std::max<size_t>(1, num_patterns));
         const size_t num_tiles = (num_patterns + tile_size - 1) / tile_size;
 
         #pragma omp parallel num_threads(n_threads)
@@ -1136,7 +1135,7 @@ public:
         std::vector<Matrix> V_mat(num_nodes, Matrix::Zero(S, num_patterns));
         std::vector<Matrix> D_mat(num_nodes, Matrix::Zero(S, num_patterns));
         int n_threads = optimal_omp_threads(num_patterns, 32);
-        const size_t tile_size = std::max<size_t>(16, std::min<size_t>(256, (num_patterns + std::max(1, n_threads) - 1) / std::max(1, n_threads)));
+        const size_t tile_size = std::min<size_t>(64, std::max<size_t>(1, num_patterns));
         const size_t num_tiles = (num_patterns + tile_size - 1) / tile_size;
 
         #pragma omp parallel num_threads(n_threads)

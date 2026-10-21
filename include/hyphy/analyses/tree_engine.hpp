@@ -574,15 +574,9 @@ public:
                     }
                 }
 
-                for (size_t p = 0; p < n_pat; ++p) {
-                    total_ll += pat_ll[p];
-                }
+                total_ll = LikelihoodEngine::neumaier_sum(pat_ll);
                 for (int32_t bid : brs) {
-                    Scalar sum_dL = 0.0;
-                    for (size_t p = 0; p < n_pat; ++p) {
-                        sum_dL += pat_dL[bid][p];
-                    }
-                    dL_dt[bid] = sum_dL;
+                    dL_dt[bid] = LikelihoodEngine::neumaier_sum(pat_dL[bid]);
                 }
 
                 grad.resize(static_cast<Eigen::Index>(brs.size()));

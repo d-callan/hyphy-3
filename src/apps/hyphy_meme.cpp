@@ -47,6 +47,11 @@ static void print_usage(const char* prog) {
               << "  " << Console::brand("--modern-json") << "        Emit modern HyPhy 3.0 JSON schema with provenance and columnar data\n"
               << "  " << Console::brand("--full-model") << "         Perform branch length re-optimization under full codon model (default)\n"
               << "  " << Console::brand("--quick") << "              Disable full branch re-optimization (proportional branch scaling)\n"
+              << "  " << Console::brand("--rates") << " <N>          Number of site omega classes (supported: 2, default)\n"
+              << "  " << Console::brand("--multiple-hits") << " <m>  Multi-hit mode (supported: None; use hyphy_busted for multi-hit mixtures)\n"
+              << "  " << Console::brand("--resample") << " <N>       Parametric bootstrap replicates (supported: 0)\n"
+              << "  " << Console::brand("--impute-states") << " <b > Ancestral state imputation mode (supported: No)\n"
+              << "  " << Console::brand("--precision") << " <mode>   Optimization precision ('standard' or 'fast')\n"
               << "  " << Console::brand("--all-sites") << "          Display all codon sites in console table (default: significant only)\n"
               << "  " << Console::brand("--progress") << "           Force interactive progress bar\n"
               << "  " << Console::brand("--no-progress") << "        Disable progress bar\n"
@@ -69,6 +74,44 @@ int run_meme(int argc, char* argv[]) {
             }
         } else if (arg == "--test" && i + 1 < argc) {
             opts.branches = argv[++i];
+        } else if (arg == "--rates" && i + 1 < argc) {
+            int r = std::stoi(argv[++i]);
+            if (r != 2) {
+                std::cerr << Console::danger("Error: ") << "hyphy_meme implements the canonical 2-rate MEME mixture (--rates 2); got --rates " << r << ".\n";
+                return 1;
+            }
+        } else if ((arg == "--multiple-hits" || arg == "--site-multihit") && i + 1 < argc) {
+            std::string mh = argv[++i];
+            if (mh != "None" && mh != "none" && mh != "No" && mh != "no") {
+                std::cerr << Console::danger("Error: ") << "hyphy_meme supports single-hit MG94xREV only (--multiple-hits None); got '" << mh
+                          << "'. Use hyphy_busted --multiple-hits " << mh << " for multi-hit episodic selection testing.\n";
+                return 1;
+            }
+        } else if (arg == "--resample" && i + 1 < argc) {
+            int n_res = std::stoi(argv[++i]);
+            if (n_res > 0) {
+                std::cerr << Console::danger("Error: ") << "Parametric bootstrap (--resample > 0) is not supported in hyphy_meme.\n";
+                return 1;
+            }
+        } else if (arg == "--impute-states") {
+            std::string val = "Yes";
+            if (i + 1 < argc && argv[i + 1][0] != '-') {
+                val = argv[++i];
+            }
+            if (val != "No" && val != "no" && val != "false" && val != "0") {
+                std::cerr << Console::danger("Error: ") << "--impute-states is not supported as a standalone output block in hyphy_meme.\n";
+                return 1;
+            }
+        } else if (arg == "--precision" && i + 1 < argc) {
+            std::string prec = argv[++i];
+            if (prec == "fast" || prec == "faster") {
+                opts.full_model = false;
+            } else if (prec == "standard" || prec == "default") {
+                opts.full_model = true;
+            } else {
+                std::cerr << Console::danger("Error: ") << "--precision must be 'standard' or 'fast' (got '" << prec << "').\n";
+                return 1;
+            }
         } else if (arg == "--help" || arg == "-h") {
             print_usage(argv[0]);
             return 0;

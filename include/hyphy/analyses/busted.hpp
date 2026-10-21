@@ -336,7 +336,7 @@ public:
 
         std::vector<Scalar> pat_ll_vec(num_patterns, -1e20);
         int n_threads = LikelihoodEngine::optimal_omp_threads(num_patterns, 32);
-        const size_t tile_size = std::max<size_t>(16, std::min<size_t>(256, (num_patterns + std::max(1, n_threads) - 1) / std::max(1, n_threads)));
+        const size_t tile_size = std::min<size_t>(64, std::max<size_t>(1, num_patterns));
         const size_t num_tiles = (num_patterns + tile_size - 1) / tile_size;
 
         #pragma omp parallel num_threads(n_threads)
@@ -394,11 +394,11 @@ public:
                 }
             }
         }
-        Scalar total_log_l = 0.0;
+        Scalar total_log_l = 0.0, c_ll = 0.0;
         for (size_t p = 0; p < num_patterns; ++p) {
-            total_log_l += aln.patterns[p].weight * pat_ll_vec[p];
+            LikelihoodEngine::neumaier_acc(total_log_l, c_ll, aln.patterns[p].weight * pat_ll_vec[p]);
         }
-        return total_log_l;
+        return total_log_l + c_ll;
     }
 
     // Expectation Step: Computes new mixture weights (and optional saturation sink weight eps_sink) via batched inside-outside GEMM traversal
@@ -466,7 +466,7 @@ public:
         std::vector<Scalar> pat_sink_accum(num_patterns, 0.0);
         std::vector<Scalar> pat_wt_accum(num_patterns, 0.0);
         int n_threads = LikelihoodEngine::optimal_omp_threads(num_patterns, 32);
-        const size_t tile_size = std::max<size_t>(16, std::min<size_t>(256, (num_patterns + std::max(1, n_threads) - 1) / std::max(1, n_threads)));
+        const size_t tile_size = std::min<size_t>(64, std::max<size_t>(1, num_patterns));
         const size_t num_tiles = (num_patterns + tile_size - 1) / tile_size;
 
         #pragma omp parallel num_threads(n_threads)
@@ -658,7 +658,7 @@ public:
         Matrix pat_syn_accum = Matrix::Zero(M, num_patterns);
         std::vector<Scalar> pat_wt_accum(num_patterns, 0.0);
         int n_threads = LikelihoodEngine::optimal_omp_threads(num_patterns, 32);
-        const size_t tile_size = std::max<size_t>(16, std::min<size_t>(256, (num_patterns + std::max(1, n_threads) - 1) / std::max(1, n_threads)));
+        const size_t tile_size = std::min<size_t>(64, std::max<size_t>(1, num_patterns));
         const size_t num_tiles = (num_patterns + tile_size - 1) / tile_size;
 
         #pragma omp parallel num_threads(n_threads)
@@ -811,7 +811,7 @@ public:
         std::vector<Scalar> pat_ll_vec(num_patterns, 0.0);
         Matrix pat_grad_mat = Matrix::Zero(num_nodes, num_patterns);
         int n_threads = LikelihoodEngine::optimal_omp_threads(num_patterns, 32);
-        const size_t tile_size = std::max<size_t>(16, std::min<size_t>(256, (num_patterns + std::max(1, n_threads) - 1) / std::max(1, n_threads)));
+        const size_t tile_size = std::min<size_t>(64, std::max<size_t>(1, num_patterns));
         const size_t num_tiles = (num_patterns + tile_size - 1) / tile_size;
 
         #pragma omp parallel num_threads(n_threads)
@@ -911,17 +911,14 @@ public:
             }
         }
 
-        Scalar total_log_l = 0.0;
-        for (size_t p = 0; p < num_patterns; ++p) {
-            total_log_l += pat_ll_vec[p];
-        }
+        Scalar total_log_l = LikelihoodEngine::neumaier_sum(pat_ll_vec);
         std::vector<Scalar> grad_b(num_nodes, 0.0);
         for (size_t i = 0; i < num_nodes; ++i) {
-            Scalar s = 0.0;
+            Scalar s_acc = 0.0, c_acc = 0.0;
             for (size_t p = 0; p < num_patterns; ++p) {
-                s += pat_grad_mat(i, p);
+                LikelihoodEngine::neumaier_acc(s_acc, c_acc, pat_grad_mat(i, p));
             }
-            grad_b[i] = s;
+            grad_b[i] = s_acc + c_acc;
         }
 
         return {total_log_l, grad_b};
@@ -2043,6 +2040,9 @@ public:
         fit.error_sink_weight = eps_sink;
         fit.has_gtr_params = true;
         fit.gtr_params = local_base;
+        if (warm_start_fit && !warm_start_fit->mss_class_rates.empty()) {
+            fit.mss_class_rates = warm_start_fit->mss_class_rates;
+        }
         if (local_base.syn_pair_rates != nullptr) {
             fit.mss_syn_pair_rates = *local_base.syn_pair_rates;
             fit.gtr_params.syn_pair_rates = &fit.mss_syn_pair_rates;
@@ -2814,11 +2814,11 @@ public:
                 }
             }
         }
-        Scalar total_log_l = 0.0;
+        Scalar total_log_l = 0.0, c_ll = 0.0;
         for (size_t p = 0; p < num_patterns; ++p) {
-            total_log_l += aln.patterns[p].weight * pat_ll_buf[p];
+            LikelihoodEngine::neumaier_acc(total_log_l, c_ll, aln.patterns[p].weight * pat_ll_buf[p]);
         }
-        return total_log_l;
+        return total_log_l + c_ll;
     }
 
     // Two-set Expectation Step: simultaneously updates Test (partition 0), Background (partition 1), and optional Unclassified (partition 2) mixture weights in one Inside-Outside pass
@@ -3487,13 +3487,14 @@ public:
             }
         }
 
-        Scalar total_log_l = 0.0;
+        Scalar total_log_l = LikelihoodEngine::neumaier_sum(pat_ll_vec);
         std::vector<Scalar> grad_b(num_nodes, 0.0);
-        for (size_t p = 0; p < num_patterns; ++p) {
-            total_log_l += pat_ll_vec[p];
-            for (size_t i = 0; i < num_nodes; ++i) {
-                grad_b[i] += pat_grad[p][i];
+        for (size_t i = 0; i < num_nodes; ++i) {
+            Scalar s_acc = 0.0, c_acc = 0.0;
+            for (size_t p = 0; p < num_patterns; ++p) {
+                LikelihoodEngine::neumaier_acc(s_acc, c_acc, pat_grad[p][i]);
             }
+            grad_b[i] = s_acc + c_acc;
         }
 
         return {total_log_l, grad_b};
@@ -4392,8 +4393,6 @@ public:
                 fit.unclassified_distribution.syn_weights = syn_weights;
             }
         }
-        fit.has_gtr_params = true;
-        fit.gtr_params = local_base;
 
         size_t N_codons = aln.num_codons;
         size_t num_branches = tree.num_nodes() - 1;
@@ -4468,8 +4467,12 @@ public:
 
         Scalar delta = shared_null_fit.delta;
         Scalar psi = shared_null_fit.psi;
-        Scalar eps_sink_t = shared_null_fit.error_sink_weight;
-        Scalar eps_sink_b = shared_null_fit.error_sink_weight;
+        Scalar eps_sink_t = (shared_null_fit.test_distribution.error_sink_weight > 0.0)
+            ? shared_null_fit.test_distribution.error_sink_weight
+            : shared_null_fit.error_sink_weight;
+        Scalar eps_sink_b = (shared_null_fit.has_background_distribution && shared_null_fit.background_distribution.error_sink_weight > 0.0)
+            ? shared_null_fit.background_distribution.error_sink_weight
+            : eps_sink_t;
 
         std::vector<Scalar> base_bl = shared_null_fit.branch_lengths;
         if (base_bl.size() != tree.num_nodes()) {
@@ -4674,7 +4677,7 @@ public:
         int max_ecm = (K == 1 && !srv && !allow_double && !use_error_sink) ? 1 : 15;
         Scalar prev_ecm_ll = best_tracked_ll;
         for (int ecm_iter = 0; ecm_iter < max_ecm; ++ecm_iter) {
-            // 1. Shared weights E-step
+            // 1. Shared weights E-step (F-098: update eps_sink_t and eps_sink_b independently)
             if (K >= 2 || use_error_sink) {
                 Scalar cand_eps_t = eps_sink_t, cand_eps_b = eps_sink_b;
                 std::vector<Scalar> wt_u_cand;
@@ -4693,18 +4696,17 @@ public:
                     sum_w += w_cand[c];
                 }
                 for (size_t c = 0; c < K; ++c) w_cand[c] /= sum_w;
-                Scalar cand_eps = frac_t * cand_eps_t + frac_b * cand_eps_b;
                 const std::vector<Scalar>* p_wu_cand = (has_u && wt_u_cand.size() == K) ? &wt_u_cand : p_weights_u;
                 Scalar cand_ll = evaluate_two_set_log_l(
-                    1.0, omegas_t, w_cand, omegas_b, w_cand, syn_rates, syn_weights, get_scaled_bl(s), nullptr, delta, psi, cand_eps, cand_eps, p_omegas_u, p_wu_cand, &local_base
+                    1.0, omegas_t, w_cand, omegas_b, w_cand, syn_rates, syn_weights, get_scaled_bl(s), nullptr, delta, psi, cand_eps_t, cand_eps_b, p_omegas_u, p_wu_cand, &local_base
                 );
                 if (cand_ll >= best_tracked_ll - 1e-9) {
                     weights = w_cand;
                     if (has_u && wt_u_cand.size() == K) {
                         weights_u = wt_u_cand;
                     }
-                    eps_sink_t = cand_eps;
-                    eps_sink_b = cand_eps;
+                    eps_sink_t = cand_eps_t;
+                    eps_sink_b = cand_eps_b;
                     best_tracked_ll = std::max(best_tracked_ll, cand_ll);
                 }
             }
@@ -4882,6 +4884,7 @@ public:
             fit.error_sink_weight = eps_sink_t;
             fit.has_gtr_params = true;
             fit.gtr_params = local_base;
+            fit.mss_class_rates = shared_null_fit.mss_class_rates;
             if (local_base.syn_pair_rates != nullptr) {
                 fit.mss_syn_pair_rates = *local_base.syn_pair_rates;
                 fit.gtr_params.syn_pair_rates = &fit.mss_syn_pair_rates;
@@ -4936,7 +4939,7 @@ public:
 
         size_t N_codons = aln.num_codons;
         size_t num_branches = tree.num_nodes() - 1;
-        size_t num_mixture_params = (2 * K - 1) + 1 + (has_u ? (2 * K - 1) : 0) + (use_error_sink ? 1 : 0); // shared weights + BG omegas + k_relax
+        size_t num_mixture_params = (2 * K - 1) + 1 + (has_u ? (2 * K - 1) : 0) + (use_error_sink ? 2 : 0); // shared weights + BG omegas + k_relax + (eps_sink_t, eps_sink_b)
         size_t num_syn_params = srv ? 2 * (M - 1) : 0;
         size_t num_mh_params = (allow_double ? 1 : 0) + (allow_triple ? 1 : 0);
         size_t K_params = 14 + (refine_branches ? num_branches : 1) + num_mixture_params + num_syn_params + num_mh_params + num_mss_free_params;
@@ -5398,7 +5401,22 @@ public:
         // or nested fit never aliases or overwrites another fit's gtr_params.syn_pair_rates.
         auto polish_mss_for_fit = [&](BUSTEDFit& target_fit, bool is_two_set, bool update_res_mss) {
             if (!has_mss || mss_part.num_classes() <= 1) return;
-            std::vector<Scalar> rates_vec = !target_fit.mss_class_rates.empty() ? target_fit.mss_class_rates : mss_class_rates;
+            const int S_codons = code->num_sense_codons;
+            std::vector<Scalar> rates_vec;
+            if (!target_fit.mss_class_rates.empty()) {
+                rates_vec = target_fit.mss_class_rates;
+            } else if (target_fit.has_gtr_params && target_fit.gtr_params.syn_pair_rates != nullptr &&
+                       target_fit.gtr_params.syn_pair_rates->size() == static_cast<size_t>(S_codons * S_codons)) {
+                rates_vec.assign(mss_part.num_classes(), 1.0);
+                const auto& mat = *target_fit.gtr_params.syn_pair_rates;
+                for (const auto& sp : mss_part.pairs) {
+                    if (sp.class_id >= 0 && static_cast<size_t>(sp.class_id) < rates_vec.size()) {
+                        rates_vec[sp.class_id] = mat[sp.u * S_codons + sp.v];
+                    }
+                }
+            } else {
+                rates_vec = mss_class_rates;
+            }
             const MG94Parameters* active_base = target_fit.has_gtr_params ? &target_fit.gtr_params : &base_params;
             std::vector<Scalar> syn_r = target_fit.test_distribution.syn_rates.empty() ? std::vector<Scalar>{1.0} : target_fit.test_distribution.syn_rates;
             std::vector<Scalar> syn_w = target_fit.test_distribution.syn_weights.empty() ? std::vector<Scalar>{1.0} : target_fit.test_distribution.syn_weights;
@@ -5413,7 +5431,7 @@ public:
                 auto [r_opt, nll_opt] = Brent1D::minimize([&](Scalar cand_r) {
                     std::vector<Scalar> cand_rates = rates_vec;
                     cand_rates[c] = cand_r;
-                    std::vector<Scalar> cand_mat = mss_part.expand_to_matrix(code->num_sense_codons, cand_rates);
+                    std::vector<Scalar> cand_mat = mss_part.expand_to_matrix(S_codons, cand_rates);
                     MG94Parameters p_cand = *active_base;
                     p_cand.syn_pair_rates = &cand_mat;
                     if (is_two_set) {
@@ -5440,7 +5458,9 @@ public:
                 }
             }
             target_fit.mss_class_rates = rates_vec;
-            target_fit.mss_syn_pair_rates = mss_part.expand_to_matrix(code->num_sense_codons, rates_vec);
+            if (mss_improved || target_fit.mss_syn_pair_rates.empty()) {
+                target_fit.mss_syn_pair_rates = mss_part.expand_to_matrix(S_codons, rates_vec);
+            }
             target_fit.has_gtr_params = true;
             target_fit.gtr_params.syn_pair_rates = &target_fit.mss_syn_pair_rates;
             if (update_res_mss) {
