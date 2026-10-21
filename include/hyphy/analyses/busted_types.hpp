@@ -53,6 +53,66 @@ struct BUSTEDFit {
     Scalar error_sink_weight = 0.0; // Fitted contamination proportion epsilon
     bool has_gtr_params = false;
     MG94Parameters gtr_params;      // Polished nucleotide substitution rates (theta_AC..GT)
+    std::vector<Scalar> mss_syn_pair_rates; // Per-fit expanded S x S MSS synonymous rate matrix
+    std::vector<Scalar> mss_class_rates;    // Per-fit polished MSS class rates
+
+    BUSTEDFit() = default;
+    BUSTEDFit(const BUSTEDFit& other) { *this = other; }
+    BUSTEDFit(BUSTEDFit&& other) noexcept { *this = std::move(other); }
+    BUSTEDFit& operator=(const BUSTEDFit& other) {
+        if (this == &other) return *this;
+        log_likelihood = other.log_likelihood;
+        aicc = other.aicc;
+        tree_scale = other.tree_scale;
+        num_rate_classes = other.num_rate_classes;
+        test_distribution = other.test_distribution;
+        has_background_distribution = other.has_background_distribution;
+        background_distribution = other.background_distribution;
+        has_unclassified_distribution = other.has_unclassified_distribution;
+        unclassified_distribution = other.unclassified_distribution;
+        branch_lengths = other.branch_lengths;
+        site_log_likelihoods = other.site_log_likelihoods;
+        delta = other.delta;
+        psi = other.psi;
+        frac_delta = other.frac_delta;
+        frac_psi = other.frac_psi;
+        error_sink_weight = other.error_sink_weight;
+        has_gtr_params = other.has_gtr_params;
+        gtr_params = other.gtr_params;
+        mss_syn_pair_rates = other.mss_syn_pair_rates;
+        mss_class_rates = other.mss_class_rates;
+        if (!mss_syn_pair_rates.empty()) {
+            gtr_params.syn_pair_rates = &mss_syn_pair_rates;
+        }
+        return *this;
+    }
+    BUSTEDFit& operator=(BUSTEDFit&& other) noexcept {
+        if (this == &other) return *this;
+        log_likelihood = other.log_likelihood;
+        aicc = other.aicc;
+        tree_scale = other.tree_scale;
+        num_rate_classes = other.num_rate_classes;
+        test_distribution = std::move(other.test_distribution);
+        has_background_distribution = other.has_background_distribution;
+        background_distribution = std::move(other.background_distribution);
+        has_unclassified_distribution = other.has_unclassified_distribution;
+        unclassified_distribution = std::move(other.unclassified_distribution);
+        branch_lengths = std::move(other.branch_lengths);
+        site_log_likelihoods = std::move(other.site_log_likelihoods);
+        delta = other.delta;
+        psi = other.psi;
+        frac_delta = other.frac_delta;
+        frac_psi = other.frac_psi;
+        error_sink_weight = other.error_sink_weight;
+        has_gtr_params = other.has_gtr_params;
+        gtr_params = other.gtr_params;
+        mss_syn_pair_rates = std::move(other.mss_syn_pair_rates);
+        mss_class_rates = std::move(other.mss_class_rates);
+        if (!mss_syn_pair_rates.empty()) {
+            gtr_params.syn_pair_rates = &mss_syn_pair_rates;
+        }
+        return *this;
+    }
 };
 
 struct BUSTEDAutoDiagnostics {

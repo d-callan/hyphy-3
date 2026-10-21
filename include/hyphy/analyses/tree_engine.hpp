@@ -474,6 +474,8 @@ public:
 
                 Scalar total_ll = 0.0;
                 std::vector<Scalar> dL_dt(n_nodes, 0.0);
+                std::vector<Scalar> pat_ll(n_pat, 0.0);
+                std::vector<std::vector<Scalar>> pat_dL(n_nodes, std::vector<Scalar>(n_pat, 0.0));
 
                 #ifdef _OPENMP
                 #pragma omp parallel if(!omp_in_parallel())
@@ -485,9 +487,6 @@ public:
                     std::vector<int> boost_counts(n_nodes, 0);
                     std::vector<Vector4> U(n_nodes, Vector4::Zero());
                     std::vector<Vector4> V(n_nodes, Vector4::Zero());
-
-                    Scalar local_ll = 0.0;
-                    std::vector<Scalar> local_dL(n_nodes, 0.0);
 
                     #pragma omp for schedule(static)
                     for (size_t p = 0; p < n_pat; ++p) {
@@ -508,7 +507,7 @@ public:
                                     }
                                 } else {
                                     node_L[nid].setOnes();
-                                                                }
+                                }
                                 node_log_scale[nid] = 0.0;
                                 boost_counts[nid] = 0;
                             } else {
@@ -526,7 +525,7 @@ public:
 
                         Scalar pat_l = gtr_ref.pi.dot(node_L[tree_ref.root_id]);
                         if (pat_l > 0.0) {
-                            local_ll += pattern.weight * (std::log(pat_l) + node_log_scale[tree_ref.root_id]);
+                            pat_ll[p] = pattern.weight * (std::log(pat_l) + node_log_scale[tree_ref.root_id]);
                             Scalar inv_L = pattern.weight / pat_l;
 
                             // 2. Pre-order traversal (Outside pass)
@@ -568,19 +567,22 @@ public:
                                     U[vid] = P_b[vid].transpose() * v_msg;
 
                                     Scalar dL = v_msg.dot(dP_b[vid] * node_L[vid]);
-                                    local_dL[vid] += inv_L * dL;
+                                    pat_dL[vid][p] = inv_L * dL;
                                 }
                             }
                         }
                     }
+                }
 
-                    #pragma omp critical
-                    {
-                        total_ll += local_ll;
-                        for (size_t i = 0; i < n_nodes; ++i) {
-                            dL_dt[i] += local_dL[i];
-                        }
+                for (size_t p = 0; p < n_pat; ++p) {
+                    total_ll += pat_ll[p];
+                }
+                for (int32_t bid : brs) {
+                    Scalar sum_dL = 0.0;
+                    for (size_t p = 0; p < n_pat; ++p) {
+                        sum_dL += pat_dL[bid][p];
                     }
+                    dL_dt[bid] = sum_dL;
                 }
 
                 grad.resize(static_cast<Eigen::Index>(brs.size()));

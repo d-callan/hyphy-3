@@ -151,6 +151,8 @@ int run_fel(int argc, char* argv[]) {
     base_p.theta_GT = gtr_res.params.theta_GT;
 
     MG94Fitter mg_fitter(gtr_res.tree, aln);
+    auto sel = gtr_res.tree.select_branches(test_branches, test_branch_regex, {}, true);
+    const std::vector<bool>* p_sel = (sel.num_selected > 0 && sel.num_unselected > 0) ? &sel.is_selected : nullptr;
     FitResult mg_res;
     if (full_model) {
         std::function<void(const std::string&, double)> mg_cb = nullptr;
@@ -159,7 +161,7 @@ int run_fel(int argc, char* argv[]) {
                 std::cout << "  " << Console::muted("↳ ") << msg << "...\n";
             };
         }
-        mg_res = mg_fitter.fit_full_model(1.0, base_p, mg_cb);
+        mg_res = mg_fitter.fit_full_model(1.0, base_p, mg_cb, 250, 1e-5, p_sel);
         base_p = mg_res.params;
     } else {
         mg_res = mg_fitter.fit_omega_and_scale(1.0, base_p);
@@ -180,7 +182,7 @@ int run_fel(int argc, char* argv[]) {
 
     FELAnalyzer fel(mg_res.tree, aln, base_p, fel_settings);
     fel.global_log_l = mg_res.log_likelihood;
-    size_t K_mg = 5 + 1 + (mg_res.tree.num_nodes() - 1);
+    size_t K_mg = 5 + (p_sel ? 2 : 1) + (mg_res.tree.num_nodes() - 1);
     size_t N_codons = aln.num_codons;
     fel.global_aicc = -2.0 * mg_res.log_likelihood + 2.0 * K_mg * N_codons / (N_codons - K_mg - 1.0);
 

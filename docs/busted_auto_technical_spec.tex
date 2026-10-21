@@ -52,9 +52,9 @@ Two statistical failure modes occur when these components are enabled manually o
 
 \subsection{Formulation of the Replacement Kernel}
 
-In \textsc{HyPhy}~2.5, \texttt{--error-sink} added a fourth rate class with fixed $\omega_{\text{sink}} = 100$ and weight $p_{\text{sink}} \le 0.01$. That formulation had three defects. First, its transition probabilities depended on branch length $t_b$, so it failed to absorb errors on terminal branches of length $t_b \to 0$. Second, it only increased single-nucleotide non-synonymous rates and could not absorb 2-nt or 3-nt frameshift codons in one step unless $\delta, \psi > 0$. Third, it required an extra $61 \times 61$ matrix exponential per branch.
+In \textsc{HyPhy}~2.5, \texttt{--error-sink} added a fourth rate class with bounded $\omega_{\text{sink}} \in [1, 100]$ (initialized at $100$) and weight $p_{\text{sink}} \le 0.01$. That formulation had three defects. First, its transition probabilities depended on branch length $t_b$, so it failed to absorb errors on terminal branches of length $t_b \to 0$. Second, it only increased single-nucleotide non-synonymous rates and could not absorb 2-nt or 3-nt frameshift codons in one step unless $\delta, \psi > 0$. Third, it required an extra $61 \times 61$ matrix exponential per branch.
 
-In \textsc{HyPhy}~3, we replace the $\omega = 100$ rate class with an exact branch-length-independent off-diagonal replacement kernel $\bm{P}_{\text{sink}} \in \mathbb{R}^{S \times S}$ ($S = 61$ sense codons):
+In \textsc{HyPhy}~3, we replace the $\omega_{\text{sink}} \in [1, 100]$ rate class with an exact branch-length-independent off-diagonal replacement kernel $\bm{P}_{\text{sink}} \in \mathbb{R}^{S \times S}$ ($S = 61$ sense codons):
 \begin{equation}
     P_{\text{sink}}(i, j) = \begin{cases}
     0 & \text{if } i = j, \\

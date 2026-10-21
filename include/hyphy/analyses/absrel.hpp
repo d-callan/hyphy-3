@@ -723,14 +723,14 @@ public:
                 };
 
                 Scalar init_log_a = std::log(cur_alpha);
-                std::array<Scalar, 3> lb = {init_log_a - 5.0, -6.0, -8.0};
-                std::array<Scalar, 3> ub = {init_log_a + 6.0,  6.0,  5.0};
+                std::array<Scalar, 3> lb = {init_log_a - 5.0, -6.0, -14.0};
+                std::array<Scalar, 3> ub = {init_log_a + 6.0,  6.0,   6.0};
 
                 // Warm-start from current branch state if available
                 Scalar cur_p1 = cur_weights.empty() ? 0.90 : cur_weights[0];
                 Scalar cur_w1 = cur_omegas.empty() ? 0.20 : cur_omegas[0];
-                cur_p1 = std::clamp(cur_p1, 0.01, 0.99);
-                cur_w1 = std::clamp(cur_w1, 1e-4, 0.99);
+                cur_p1 = std::clamp(cur_p1, 0.005, 0.995);
+                cur_w1 = std::clamp(cur_w1, 1e-6, 0.995);
                 std::array<Scalar, 3> best_pt = {
                     init_log_a,
                     std::log(cur_p1 / (1.0 - cur_p1)),
@@ -741,12 +741,13 @@ public:
                 // Precompute eigendecompositions for the 5 w1 grid values, and PD = P(a)*D_mat for each (a_mult, w)
                 constexpr std::array<Scalar, 6> a_grid = {0.25, 0.5, 1.0, 2.0, 4.0, 8.0};
                 constexpr std::array<Scalar, 5> p1_grid = {0.98, 0.90, 0.75, 0.50, 0.20};
-                constexpr std::array<Scalar, 5> w1_grid = {0.005, 0.05, 0.20, 0.50, 0.80};
+                constexpr std::array<Scalar, 5> w1_grid = {0.0, 0.05, 0.20, 0.50, 0.80};
 
                 std::array<MG94Matrix, 5> mat_w1_grid;
                 std::array<Scalar, 5> x2_grid;
                 for (size_t iw1 = 0; iw1 < 5; ++iw1) {
-                    Scalar x2 = std::log(w1_grid[iw1] / (1.0 - w1_grid[iw1]));
+                    Scalar w1_c = std::clamp(w1_grid[iw1], 1.0 / (1.0 + std::exp(14.0)), 1.0 / (1.0 + std::exp(-6.0)));
+                    Scalar x2 = std::log(w1_c / (1.0 - w1_c));
                     x2_grid[iw1] = x2;
                     Scalar w1_exact = 1.0 / (1.0 + std::exp(-x2));
                     mat_w1_grid[iw1] = build_q_matrix(w1_exact);
@@ -843,10 +844,11 @@ public:
                 };
                 Scalar best_sc = obj_4d(best_pt);
 
-                // F-053: Factorized 4D grid search expanded to cover HyPhy's full grid space:
-                // 5 w1 values ({0.0, 0.05, 0.20, 0.50, 0.80}) and 10 w2 values ({0.25, 0.5, 0.75, 1.0, 1.5, 4.0, 15.0, 80.0, 500.0, 2500.0}).
-                constexpr std::array<Scalar, 4> a_grid = {0.5, 1.0, 2.0, 6.0};
-                constexpr std::array<Scalar, 4> p1_grid = {0.98, 0.92, 0.80, 0.50};
+                // F-053: Factorized 4D grid search expanded to cover HyPhy's full 5x5x5x10 grid space:
+                // 5 a_grid values, 5 p1 values ({0.98, 0.95, 0.90, 0.75, 0.50}),
+                // 5 w1 values ({0.0, 0.05, 0.20, 0.50, 0.80}), and 10 w2 values ({0.25, 0.5, 0.75, 1.0, 1.5, 4.0, 15.0, 80.0, 500.0, 2500.0}).
+                constexpr std::array<Scalar, 5> a_grid = {0.25, 0.5, 1.0, 2.0, 6.0};
+                constexpr std::array<Scalar, 5> p1_grid = {0.98, 0.95, 0.90, 0.75, 0.50};
                 constexpr std::array<Scalar, 5> w1_grid = {0.0, 0.05, 0.20, 0.50, 0.80};
                 constexpr std::array<Scalar, 10> w2_grid = {0.25, 0.5, 0.75, 1.0, 1.5, 4.0, 15.0, 80.0, 500.0, 2500.0};
 
@@ -1506,7 +1508,8 @@ public:
         Matrix V_null_mat(S, num_patterns);
         Matrix D_null_mat(S, num_patterns);
 
-        for (int p5_restart = 0; p5_restart < 3; ++p5_restart) {
+        const int max_p5_restarts = 5;
+        for (int p5_restart = 0; p5_restart < max_p5_restarts; ++p5_restart) {
             bool full_model_improved = false;
             size_t t_idx = 0;
             for (const std::string& bname : to_test) {
@@ -1648,8 +1651,15 @@ public:
                     compute_syn_scale();
                 }
 
-                // F-080: If null_ll > full_ll + 1e-4, warm-start the full model from the null configuration
-                if (std::isfinite(null_ll) && null_ll > full_ll + 1e-4) {
+                // F-080: If null_ll > full_ll + 1e-4 and a restart round remains, warm-start the full model
+                // from the null configuration and restart Phase 5 so all branches are tested against a single
+                // consistent full model.
+                if (std::isfinite(null_ll) && null_ll > full_ll + 1e-4 && (p5_restart + 1 < max_p5_restarts)) {
+                    const auto saved_alpha = branch_alpha;
+                    const auto saved_omegas = branch_omegas;
+                    const auto saved_weights = branch_weights;
+                    const auto saved_gtr = gtr_params;
+
                     branch_alpha = null_alpha;
                     branch_omegas = null_omegas;
                     branch_weights = null_weights;
@@ -1657,7 +1667,7 @@ public:
                     compute_syn_scale();
 
                     Scalar prev_ws_ll = null_ll;
-                    for (int ws_pass = 0; ws_pass < 4; ++ws_pass) {
+                    for (int ws_pass = 0; ws_pass < 15; ++ws_pass) {
                         run_joint_branch_length_lbfgs();
                         run_gtr_optimization();
                         Scalar cur_ws_ll = run_mixture_refinement();
@@ -1672,10 +1682,15 @@ public:
                         result.full_adaptive_fit = {full_ll, current_params, full_aicc};
                         update_full_branch_summaries();
                         recompute_full_io_cache();
-                        if (p5_restart < 2) {
-                            full_model_improved = true;
-                            break; // Restart Phase 5 so all branches are tested against the improved full model
-                        }
+                        full_model_improved = true;
+                        break; // Restart Phase 5 so all branches are tested against the improved full model
+                    } else {
+                        branch_alpha = saved_alpha;
+                        branch_omegas = saved_omegas;
+                        branch_weights = saved_weights;
+                        gtr_params = saved_gtr;
+                        compute_syn_scale();
+                        P_branches = compute_all_branch_transition_matrices();
                     }
                 }
 

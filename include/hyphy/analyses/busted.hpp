@@ -1875,13 +1875,13 @@ public:
         auto optimize_gtr_theta = [&](Scalar cur_s, const std::vector<Scalar>* bl_ptr) {
             Scalar cur_ll = evaluate_log_l(cur_s, omegas, weights, syn_rates, syn_weights, bl_ptr, nullptr, delta, psi, eps_sink, &local_base);
             std::vector<Scalar> x0 = {
-                std::log(std::clamp(local_base.theta_AC, 1e-4, 1000.0)),
-                std::log(std::clamp(local_base.theta_AT, 1e-4, 1000.0)),
-                std::log(std::clamp(local_base.theta_CG, 1e-4, 1000.0)),
-                std::log(std::clamp(local_base.theta_CT, 1e-4, 1000.0)),
-                std::log(std::clamp(local_base.theta_GT, 1e-4, 1000.0))
+                std::log(std::clamp(local_base.theta_AC, 1e-4, 1e4)),
+                std::log(std::clamp(local_base.theta_AT, 1e-4, 1e4)),
+                std::log(std::clamp(local_base.theta_CG, 1e-4, 1e4)),
+                std::log(std::clamp(local_base.theta_CT, 1e-4, 1e4)),
+                std::log(std::clamp(local_base.theta_GT, 1e-4, 1e4))
             };
-            std::vector<Scalar> lb(5, std::log(1e-4)), ub(5, std::log(1000.0));
+            std::vector<Scalar> lb(5, std::log(1e-4)), ub(5, std::log(1e4));
             auto opt = NelderMeadDynamic::minimize([&](const std::vector<Scalar>& x) {
                 MG94Parameters cand = local_base;
                 cand.theta_AC = std::exp(x[0]);
@@ -1916,7 +1916,7 @@ public:
             optimize_mh(s, ecm_bl_ptr, 30);
 
             Scalar cur_ecm_ll = evaluate_log_l(s, omegas, weights, syn_rates, syn_weights, ecm_bl_ptr, nullptr, delta, psi, eps_sink, &local_base);
-            if (pbar && ecm_iter < 6) {
+            if (pbar) {
                 std::ostringstream ss;
                 ss << model_desc << " (ECM " << (ecm_iter + 1) << "): lnL = "
                    << std::fixed << std::setprecision(2) << cur_ecm_ll;
@@ -1994,9 +1994,7 @@ public:
                 }
 
                 // Re-polish the 5 GTR nucleotide exchangeabilities theta_AC..GT (F-049)
-                if (cycle == 0 || cycle == 2) {
-                    optimize_gtr_theta(1.0, &bl);
-                }
+                optimize_gtr_theta(1.0, &bl);
 
                 Scalar cur_cycle_ll = evaluate_log_l(1.0, omegas, weights, syn_rates, syn_weights, &bl, nullptr, delta, psi, eps_sink, &local_base);
                 if (cycle >= 2 && std::abs(cur_cycle_ll - prev_cycle_ll) < 1e-3) {
@@ -2045,6 +2043,10 @@ public:
         fit.error_sink_weight = eps_sink;
         fit.has_gtr_params = true;
         fit.gtr_params = local_base;
+        if (local_base.syn_pair_rates != nullptr) {
+            fit.mss_syn_pair_rates = *local_base.syn_pair_rates;
+            fit.gtr_params.syn_pair_rates = &fit.mss_syn_pair_rates;
+        }
 
         // Compute substitution rates and fractions
         Scalar total_rate = 0.0;
@@ -2486,8 +2488,8 @@ public:
         Scalar active_p = (diag.selected_multiple_hits == "Double+Triple") ? 0.04 : 0.0;
         Scalar pre_srv_ll = evaluate_log_l(s0, omegas0, weights0, {1.0}, {1.0}, nullptr, nullptr, active_d, active_p, eps_active);
 
-        std::vector<Scalar> syn_r3 = {0.20, 0.75, 2.05};
-        std::vector<Scalar> syn_w3 = {1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0};
+        std::vector<Scalar> syn_r3 = {0.30, 1.00, 3.10};
+        std::vector<Scalar> syn_w3 = {0.30, 0.60, 0.10};
         Scalar s_srv3 = s0;
         for (int it = 0; it < 2; ++it) {
             syn_w3 = compute_expected_syn_weights(s_srv3, omegas0, weights0, syn_r3, syn_w3, nullptr, active_d, active_p, eps_active);
@@ -3788,8 +3790,8 @@ public:
             syn_rates = {0.35, 1.65};
             syn_weights = {0.50, 0.50};
         } else if (srv && M == 3) {
-            syn_rates = {0.20, 0.60, 2.20};
-            syn_weights = {1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0};
+            syn_rates = {0.30, 1.00, 3.10};
+            syn_weights = {0.30, 0.60, 0.10};
         } else if (srv && M >= 4) {
             Scalar mean_r = 0.0;
             for (size_t m = 0; m < M; ++m) {
@@ -3804,56 +3806,121 @@ public:
             syn_weights = init_test_dist->syn_weights;
         }
 
-        // Multi-candidate initial grid search when not warm-started (F-008)
-        if (!init_test_dist && !init_bg_dist && K == 3) {
+        // Multi-candidate initial grid search for K >= 2 (F-008, F-059)
+        if (K >= 2) {
+            auto build_k_cands = [&](bool is_con, const BUSTEDRateDistribution* warm) {
+                std::vector<std::pair<std::vector<Scalar>, std::vector<Scalar>>> cands;
+                if (K == 2) {
+                    if (is_con) {
+                        cands = {
+                            {{0.10, 1.0}, {0.75, 0.25}},
+                            {{0.02, 1.0}, {0.85, 0.15}},
+                            {{0.25, 1.0}, {0.60, 0.40}},
+                            {{0.0, 1.0},  {0.70, 0.30}}
+                        };
+                    } else {
+                        cands = {
+                            {{0.10, 3.0}, {0.75, 0.25}},
+                            {{0.02, 4.5}, {0.90, 0.10}},
+                            {{0.05, 2.0}, {0.80, 0.20}},
+                            {{0.02, 3.0}, {0.95, 0.05}}
+                        };
+                    }
+                } else if (K == 3) {
+                    if (is_con) {
+                        cands = {
+                            {{0.05, 0.50, 1.0}, {0.45, 0.45, 0.10}},
+                            {{0.02, 0.30, 1.0}, {0.50, 0.35, 0.15}},
+                            {{0.10, 0.70, 1.0}, {0.40, 0.40, 0.20}},
+                            {{0.0, 1.0, 1.0},   {0.40, 0.30, 0.30}}
+                        };
+                    } else {
+                        cands = {
+                            {{0.05, 0.40, 2.0}, {0.55, 0.35, 0.10}},
+                            {{0.02, 0.25, 8.0}, {0.60, 0.35, 0.05}},
+                            {{0.10, 0.80, 4.0}, {0.45, 0.45, 0.10}},
+                            {{0.005, 0.10, 1.8}, {0.45, 0.15, 0.40}}
+                        };
+                    }
+                } else {
+                    for (Scalar top_o : (is_con ? std::vector<Scalar>{1.0} : std::vector<Scalar>{2.0, 4.0})) {
+                        for (Scalar p_top : {0.10, 0.25}) {
+                            std::vector<Scalar> co(K), cw(K);
+                            Scalar rem_w = 1.0 - p_top;
+                            for (size_t k = 0; k + 1 < K; ++k) {
+                                Scalar frac = (K > 2) ? (static_cast<Scalar>(k) / static_cast<Scalar>(K - 2)) : 0.5;
+                                co[k] = 0.01 * std::pow(80.0, frac);
+                                cw[k] = rem_w / static_cast<Scalar>(K - 1);
+                            }
+                            co[K - 1] = top_o;
+                            cw[K - 1] = p_top;
+                            cands.push_back({co, cw});
+                        }
+                    }
+                }
+                if (warm && warm->omegas.size() == K && warm->weights.size() == K) {
+                    auto co = warm->omegas;
+                    auto cw = warm->weights;
+                    for (size_t k = 0; k + 1 < K; ++k) co[k] = std::clamp(co[k], 0.0, 1.0);
+                    co[K - 1] = is_con ? 1.0 : std::max(1.0, co[K - 1]);
+                    cands.push_back({co, cw});
+                }
+                return cands;
+            };
+
             Scalar best_init_ll = evaluate_two_set_log_l(
                 s, omegas_t, weights_t, omegas_b, weights_b, syn_rates, syn_weights,
                 ecm_bl_ptr, nullptr, delta, psi, eps_sink_t, eps_sink_b, p_omegas_u, p_weights_u, &local_base
             );
-            std::vector<std::pair<std::vector<Scalar>, std::vector<Scalar>>> cands_t, cands_b;
-            if (constrain_test) {
-                cands_t = {
-                    {{0.02, 0.30, 1.0}, {0.50, 0.35, 0.15}},
-                    {{0.10, 0.70, 1.0}, {0.40, 0.40, 0.20}}
-                };
-            } else {
-                cands_t = {
-                    {{0.05, 0.40, 2.0}, {0.55, 0.35, 0.10}},
-                    {{0.02, 0.25, 8.0}, {0.60, 0.35, 0.05}},
-                    {{0.10, 0.80, 4.0}, {0.45, 0.45, 0.10}}
-                };
-            }
-            if (constrain_bg) {
-                cands_b = {
-                    {{0.02, 0.30, 1.0}, {0.50, 0.35, 0.15}},
-                    {{0.10, 0.70, 1.0}, {0.40, 0.40, 0.20}}
-                };
-            } else {
-                cands_b = {
-                    {{0.05, 0.40, 2.0}, {0.55, 0.35, 0.10}},
-                    {{0.02, 0.25, 8.0}, {0.60, 0.35, 0.05}}
-                };
-            }
-            for (const auto& [ot_c, wt_c] : cands_t) {
-                Scalar ll_c = evaluate_two_set_log_l(
-                    s, ot_c, wt_c, omegas_b, weights_b, syn_rates, syn_weights,
-                    ecm_bl_ptr, nullptr, delta, psi, eps_sink_t, eps_sink_b, p_omegas_u, p_weights_u, &local_base
-                );
-                if (ll_c > best_init_ll) {
-                    best_init_ll = ll_c;
-                    omegas_t = ot_c;
-                    weights_t = wt_c;
+            auto cands_t = build_k_cands(constrain_test, init_test_dist);
+            auto cands_b = build_k_cands(constrain_bg, init_bg_dist);
+            std::vector<Scalar> eps_cands = use_error_sink
+                ? std::vector<Scalar>{eps_sink_t, std::min(0.001, max_eps_sink), std::min(0.005, max_eps_sink), std::min(0.01, max_eps_sink)}
+                : std::vector<Scalar>{0.0};
+
+            for (Scalar cand_e : eps_cands) {
+                for (const auto& [ot_c, wt_c] : cands_t) {
+                    Scalar ll_c = evaluate_two_set_log_l(
+                        s, ot_c, wt_c, omegas_b, weights_b, syn_rates, syn_weights,
+                        ecm_bl_ptr, nullptr, delta, psi, cand_e, eps_sink_b, p_omegas_u, p_weights_u, &local_base
+                    );
+                    if (ll_c > best_init_ll) {
+                        best_init_ll = ll_c;
+                        omegas_t = ot_c;
+                        weights_t = wt_c;
+                        eps_sink_t = cand_e;
+                    }
+                }
+                for (const auto& [ob_c, wb_c] : cands_b) {
+                    Scalar ll_c = evaluate_two_set_log_l(
+                        s, omegas_t, weights_t, ob_c, wb_c, syn_rates, syn_weights,
+                        ecm_bl_ptr, nullptr, delta, psi, eps_sink_t, cand_e, p_omegas_u, p_weights_u, &local_base
+                    );
+                    if (ll_c > best_init_ll) {
+                        best_init_ll = ll_c;
+                        omegas_b = ob_c;
+                        weights_b = wb_c;
+                        eps_sink_b = cand_e;
+                    }
                 }
             }
-            for (const auto& [ob_c, wb_c] : cands_b) {
-                Scalar ll_c = evaluate_two_set_log_l(
-                    s, omegas_t, weights_t, ob_c, wb_c, syn_rates, syn_weights,
-                    ecm_bl_ptr, nullptr, delta, psi, eps_sink_t, eps_sink_b, p_omegas_u, p_weights_u, &local_base
-                );
-                if (ll_c > best_init_ll) {
-                    best_init_ll = ll_c;
-                    omegas_b = ob_c;
-                    weights_b = wb_c;
+            if ((constrain_test || constrain_bg) && ecm_bl_ptr != nullptr) {
+                std::vector<Scalar> fresh_syn_r = (srv && M == 3) ? std::vector<Scalar>{0.30, 1.00, 3.10} : syn_rates;
+                std::vector<Scalar> fresh_syn_w = (srv && M == 3) ? std::vector<Scalar>{0.30, 0.60, 0.10} : syn_weights;
+                for (const auto& [ot_c, wt_c] : cands_t) {
+                    Scalar ll_fresh = evaluate_two_set_log_l(
+                        1.0, ot_c, wt_c, omegas_b, weights_b, fresh_syn_r, fresh_syn_w,
+                        nullptr, nullptr, delta, psi, eps_sink_t, eps_sink_b, p_omegas_u, p_weights_u, &local_base
+                    );
+                    if (ll_fresh > best_init_ll) {
+                        best_init_ll = ll_fresh;
+                        omegas_t = ot_c;
+                        weights_t = wt_c;
+                        ecm_bl_ptr = nullptr;
+                        s = 1.0;
+                        syn_rates = fresh_syn_r;
+                        syn_weights = fresh_syn_w;
+                    }
                 }
             }
         }
@@ -4018,6 +4085,40 @@ public:
             }
         };
 
+        auto try_rescue_two_set_collapsed_classes = [&](Scalar cur_s, const std::vector<Scalar>* bl_ptr) {
+            if (K != 3) return;
+            auto rescue_partition = [&](bool is_con, std::vector<Scalar>& cur_o, std::vector<Scalar>& cur_w, bool is_test) {
+                bool collapsed = (cur_w[0] < 0.005) || (cur_w[1] < 0.005) || (std::abs(cur_o[1] - cur_o[0]) < 1e-3);
+                if (!collapsed) return;
+                Scalar base_ll = evaluate_two_set_log_l(cur_s, omegas_t, weights_t, omegas_b, weights_b, syn_rates, syn_weights, bl_ptr, nullptr, delta, psi, eps_sink_t, eps_sink_b, p_omegas_u, p_weights_u, &local_base);
+                size_t dom = (cur_w[0] >= cur_w[1]) ? 0 : 1;
+                Scalar w_pur = std::clamp(cur_w[0] + cur_w[1], 0.04, 0.99);
+                Scalar w_top = std::clamp(1.0 - w_pur, 0.01, 0.96);
+                Scalar o_dom = std::clamp(cur_o[dom], 0.002, 0.80);
+                Scalar o_mg = std::clamp(mg94_omega, 0.01, 0.80);
+                Scalar o_top = is_con ? 1.0 : std::max(1.05, cur_o[2]);
+                std::vector<std::pair<std::vector<Scalar>, std::vector<Scalar>>> rescue_cands = {
+                    {{0.0, std::min(0.95, std::max(0.02, o_dom * 2.2)), o_top}, {0.65 * w_pur, 0.35 * w_pur, w_top}},
+                    {{0.0, std::min(0.95, std::max(0.02, o_mg * 0.5)), o_top},  {0.65 * w_pur, 0.35 * w_pur, w_top}},
+                    {{0.0, std::min(0.95, o_mg), o_top},                        {0.70 * w_pur, 0.30 * w_pur, w_top}}
+                };
+                for (const auto& [rc_o, rc_w] : rescue_cands) {
+                    const auto& ot = is_test ? rc_o : omegas_t;
+                    const auto& wt = is_test ? rc_w : weights_t;
+                    const auto& ob = is_test ? omegas_b : rc_o;
+                    const auto& wb = is_test ? weights_b : rc_w;
+                    Scalar ll = evaluate_two_set_log_l(cur_s, ot, wt, ob, wb, syn_rates, syn_weights, bl_ptr, nullptr, delta, psi, eps_sink_t, eps_sink_b, p_omegas_u, p_weights_u, &local_base);
+                    if (ll > base_ll + 1e-4) {
+                        base_ll = ll;
+                        cur_o = rc_o;
+                        cur_w = rc_w;
+                    }
+                }
+            };
+            rescue_partition(constrain_test, omegas_t, weights_t, true);
+            rescue_partition(constrain_bg, omegas_b, weights_b, false);
+        };
+
         auto optimize_two_set_mh = [&](Scalar cur_s, const std::vector<Scalar>* bl_ptr, int max_it) {
             if (allow_triple) {
                 auto mh_opt = NelderMeadND<2>::minimize([&](const std::array<Scalar, 2>& x) {
@@ -4035,13 +4136,13 @@ public:
         auto optimize_two_set_gtr_theta = [&](Scalar cur_s, const std::vector<Scalar>* bl_ptr) {
             Scalar cur_ll = evaluate_two_set_log_l(cur_s, omegas_t, weights_t, omegas_b, weights_b, syn_rates, syn_weights, bl_ptr, nullptr, delta, psi, eps_sink_t, eps_sink_b, p_omegas_u, p_weights_u, &local_base);
             std::vector<Scalar> x0 = {
-                std::log(std::clamp(local_base.theta_AC, 1e-4, 1000.0)),
-                std::log(std::clamp(local_base.theta_AT, 1e-4, 1000.0)),
-                std::log(std::clamp(local_base.theta_CG, 1e-4, 1000.0)),
-                std::log(std::clamp(local_base.theta_CT, 1e-4, 1000.0)),
-                std::log(std::clamp(local_base.theta_GT, 1e-4, 1000.0))
+                std::log(std::clamp(local_base.theta_AC, 1e-4, 1e4)),
+                std::log(std::clamp(local_base.theta_AT, 1e-4, 1e4)),
+                std::log(std::clamp(local_base.theta_CG, 1e-4, 1e4)),
+                std::log(std::clamp(local_base.theta_CT, 1e-4, 1e4)),
+                std::log(std::clamp(local_base.theta_GT, 1e-4, 1e4))
             };
-            std::vector<Scalar> lb(5, std::log(1e-4)), ub(5, std::log(1000.0));
+            std::vector<Scalar> lb(5, std::log(1e-4)), ub(5, std::log(1e4));
             auto opt = NelderMeadDynamic::minimize([&](const std::vector<Scalar>& x) {
                 MG94Parameters cand = local_base;
                 cand.theta_AC = std::exp(x[0]);
@@ -4124,6 +4225,10 @@ public:
                 optimize_partition_omegas(false, omegas_u, weights_u, s, ecm_bl_ptr, true, 35);
             }
 
+            if (ecm_iter == 1 || ecm_iter == 4) {
+                try_rescue_two_set_collapsed_classes(s, ecm_bl_ptr);
+            }
+
             if (srv && M >= 2) {
                 optimize_two_set_srv_rates(s, nullptr, 30);
             }
@@ -4132,7 +4237,7 @@ public:
             }
 
             Scalar cur_ecm_ll = evaluate_two_set_log_l(s, omegas_t, weights_t, omegas_b, weights_b, syn_rates, syn_weights, ecm_bl_ptr, nullptr, delta, psi, eps_sink_t, eps_sink_b, p_omegas_u, p_weights_u, &local_base);
-            if (pbar && ecm_iter < 6) {
+            if (pbar) {
                 std::ostringstream ss;
                 ss << model_desc << " (ECM " << (ecm_iter + 1) << "): lnL = "
                    << std::fixed << std::setprecision(2) << cur_ecm_ll;
@@ -4189,15 +4294,16 @@ public:
                 if (has_u) {
                     optimize_partition_omegas(false, omegas_u, weights_u, one_s, &bl, false, 35);
                 }
+                if (cycle == 0 || cycle == 2) {
+                    try_rescue_two_set_collapsed_classes(1.0, &bl);
+                }
                 if (srv && M >= 2) {
                     optimize_two_set_srv_rates(one_s, &bl, 30);
                 }
                 if (allow_double) {
                     optimize_two_set_mh(1.0, &bl, 25);
                 }
-                if (cycle == 0 || cycle == 2) {
-                    optimize_two_set_gtr_theta(1.0, &bl);
-                }
+                optimize_two_set_gtr_theta(1.0, &bl);
 
                 Scalar cur_cycle_ll = evaluate_two_set_log_l(1.0, omegas_t, weights_t, omegas_b, weights_b, syn_rates, syn_weights, &bl, nullptr, delta, psi, eps_sink_t, eps_sink_b, p_omegas_u, p_weights_u, &local_base);
                 if (cycle >= 2 && std::abs(cur_cycle_ll - prev_cycle_ll) < 1e-3) {
@@ -4240,6 +4346,10 @@ public:
         fit.error_sink_weight = eps_sink_t;
         fit.has_gtr_params = true;
         fit.gtr_params = local_base;
+        if (local_base.syn_pair_rates != nullptr) {
+            fit.mss_syn_pair_rates = *local_base.syn_pair_rates;
+            fit.gtr_params.syn_pair_rates = &fit.mss_syn_pair_rates;
+        }
 
         // Compute substitution rates and fractions
         Scalar total_rate = 0.0;
@@ -4500,27 +4610,28 @@ public:
         auto optimize_relax_gtr_theta = [&](Scalar cur_s, const std::vector<Scalar>* bl_ptr, int max_it = 35) {
             const std::vector<Scalar>* active_bl = bl_ptr ? bl_ptr : get_scaled_bl(cur_s);
             std::array<Scalar, 5> x0 = {
-                std::clamp(local_base.theta_AC, 1e-4, 10000.0),
-                std::clamp(local_base.theta_AT, 1e-4, 10000.0),
-                std::clamp(local_base.theta_CG, 1e-4, 10000.0),
-                std::clamp(local_base.theta_CT, 1e-4, 10000.0),
-                std::clamp(local_base.theta_GT, 1e-4, 10000.0)
+                std::log(std::clamp(local_base.theta_AC, 1e-4, 1e4)),
+                std::log(std::clamp(local_base.theta_AT, 1e-4, 1e4)),
+                std::log(std::clamp(local_base.theta_CG, 1e-4, 1e4)),
+                std::log(std::clamp(local_base.theta_CT, 1e-4, 1e4)),
+                std::log(std::clamp(local_base.theta_GT, 1e-4, 1e4))
             };
+            const Scalar lo = std::log(1e-4), hi = std::log(1e4);
             auto opt_gtr = NelderMeadND<5>::minimize([&](const std::array<Scalar, 5>& x) {
                 MG94Parameters cand_p = local_base;
-                cand_p.theta_AC = x[0];
-                cand_p.theta_AT = x[1];
-                cand_p.theta_CG = x[2];
-                cand_p.theta_CT = x[3];
-                cand_p.theta_GT = x[4];
+                cand_p.theta_AC = std::exp(x[0]);
+                cand_p.theta_AT = std::exp(x[1]);
+                cand_p.theta_CG = std::exp(x[2]);
+                cand_p.theta_CT = std::exp(x[3]);
+                cand_p.theta_GT = std::exp(x[4]);
                 return -evaluate_two_set_log_l(1.0, omegas_t, weights, omegas_b, weights, syn_rates, syn_weights, active_bl, nullptr, delta, psi, eps_sink_t, eps_sink_b, p_omegas_u, p_weights_u, &cand_p);
-            }, x0, {1e-4, 1e-4, 1e-4, 1e-4, 1e-4}, {10000.0, 10000.0, 10000.0, 10000.0, 10000.0}, 1e-4, max_it);
+            }, x0, {lo, lo, lo, lo, lo}, {hi, hi, hi, hi, hi}, 1e-4, max_it);
             if (-opt_gtr.f > best_tracked_ll) {
-                local_base.theta_AC = opt_gtr.x[0];
-                local_base.theta_AT = opt_gtr.x[1];
-                local_base.theta_CG = opt_gtr.x[2];
-                local_base.theta_CT = opt_gtr.x[3];
-                local_base.theta_GT = opt_gtr.x[4];
+                local_base.theta_AC = std::exp(opt_gtr.x[0]);
+                local_base.theta_AT = std::exp(opt_gtr.x[1]);
+                local_base.theta_CG = std::exp(opt_gtr.x[2]);
+                local_base.theta_CT = std::exp(opt_gtr.x[3]);
+                local_base.theta_GT = std::exp(opt_gtr.x[4]);
                 best_tracked_ll = -opt_gtr.f;
             }
         };
@@ -4771,6 +4882,10 @@ public:
             fit.error_sink_weight = eps_sink_t;
             fit.has_gtr_params = true;
             fit.gtr_params = local_base;
+            if (local_base.syn_pair_rates != nullptr) {
+                fit.mss_syn_pair_rates = *local_base.syn_pair_rates;
+                fit.gtr_params.syn_pair_rates = &fit.mss_syn_pair_rates;
+            }
 
             if (delta > 0.0 || psi > 0.0) {
                 MG94Parameters p_mh = local_base;
@@ -5278,6 +5393,88 @@ public:
             );
         }
 
+        // Helper to re-polish MSS synonymous class rates under any BUSTED or BUSTED-PH mixture fit (F-026).
+        // Each BUSTEDFit owns its own mss_class_rates and mss_syn_pair_rates buffer so polishing a constrained
+        // or nested fit never aliases or overwrites another fit's gtr_params.syn_pair_rates.
+        auto polish_mss_for_fit = [&](BUSTEDFit& target_fit, bool is_two_set, bool update_res_mss) {
+            if (!has_mss || mss_part.num_classes() <= 1) return;
+            std::vector<Scalar> rates_vec = !target_fit.mss_class_rates.empty() ? target_fit.mss_class_rates : mss_class_rates;
+            const MG94Parameters* active_base = target_fit.has_gtr_params ? &target_fit.gtr_params : &base_params;
+            std::vector<Scalar> syn_r = target_fit.test_distribution.syn_rates.empty() ? std::vector<Scalar>{1.0} : target_fit.test_distribution.syn_rates;
+            std::vector<Scalar> syn_w = target_fit.test_distribution.syn_weights.empty() ? std::vector<Scalar>{1.0} : target_fit.test_distribution.syn_weights;
+            const std::vector<Scalar>* p_om_u = target_fit.has_unclassified_distribution ? &target_fit.unclassified_distribution.omegas : nullptr;
+            const std::vector<Scalar>* p_wt_u = target_fit.has_unclassified_distribution ? &target_fit.unclassified_distribution.weights : nullptr;
+            Scalar cur_mss_ll = target_fit.log_likelihood;
+            bool mss_improved = false;
+            for (size_t c = 0; c < mss_part.num_classes(); ++c) {
+                if (mss_norm == MSSNormalization::NeutralRef && static_cast<int>(c) == mss_part.neutral_class_id) continue;
+                if (mss_norm != MSSNormalization::NeutralRef && c == 0) continue; // fix class 0 as gauge reference during 1D polish
+                Scalar init_r = rates_vec[c];
+                auto [r_opt, nll_opt] = Brent1D::minimize([&](Scalar cand_r) {
+                    std::vector<Scalar> cand_rates = rates_vec;
+                    cand_rates[c] = cand_r;
+                    std::vector<Scalar> cand_mat = mss_part.expand_to_matrix(code->num_sense_codons, cand_rates);
+                    MG94Parameters p_cand = *active_base;
+                    p_cand.syn_pair_rates = &cand_mat;
+                    if (is_two_set) {
+                        return -evaluate_two_set_log_l(
+                            1.0,
+                            target_fit.test_distribution.omegas, target_fit.test_distribution.weights,
+                            target_fit.background_distribution.omegas, target_fit.background_distribution.weights,
+                            syn_r, syn_w, &target_fit.branch_lengths, nullptr,
+                            target_fit.delta, target_fit.psi,
+                            target_fit.test_distribution.error_sink_weight, target_fit.background_distribution.error_sink_weight,
+                            p_om_u, p_wt_u, &p_cand
+                        );
+                    }
+                    return -evaluate_log_l(
+                        1.0, target_fit.test_distribution.omegas, target_fit.test_distribution.weights,
+                        syn_r, syn_w, &target_fit.branch_lengths, nullptr,
+                        target_fit.delta, target_fit.psi, target_fit.error_sink_weight, &p_cand
+                    );
+                }, std::max(0.05, init_r * 0.25), init_r, std::min(20.0, std::max(3.0, init_r * 4.0)), 1e-3, 15);
+                if (-nll_opt > cur_mss_ll + 1e-3) {
+                    rates_vec[c] = r_opt;
+                    cur_mss_ll = -nll_opt;
+                    mss_improved = true;
+                }
+            }
+            target_fit.mss_class_rates = rates_vec;
+            target_fit.mss_syn_pair_rates = mss_part.expand_to_matrix(code->num_sense_codons, rates_vec);
+            target_fit.has_gtr_params = true;
+            target_fit.gtr_params.syn_pair_rates = &target_fit.mss_syn_pair_rates;
+            if (update_res_mss) {
+                mss_class_rates = rates_vec;
+                syn_pair_rates_storage = target_fit.mss_syn_pair_rates;
+                base_params.syn_pair_rates = &syn_pair_rates_storage;
+                for (size_t c = 0; c < mss_part.num_classes() && c < res.mss_rates.size(); ++c) {
+                    res.mss_rates[c].rate = rates_vec[c];
+                }
+            }
+            if (mss_improved) {
+                Scalar old_ll = target_fit.log_likelihood;
+                Scalar aicc_penalty = target_fit.aicc + 2.0 * old_ll;
+                if (is_two_set) {
+                    target_fit.log_likelihood = evaluate_two_set_log_l(
+                        1.0,
+                        target_fit.test_distribution.omegas, target_fit.test_distribution.weights,
+                        target_fit.background_distribution.omegas, target_fit.background_distribution.weights,
+                        syn_r, syn_w, &target_fit.branch_lengths, &target_fit.site_log_likelihoods,
+                        target_fit.delta, target_fit.psi,
+                        target_fit.test_distribution.error_sink_weight, target_fit.background_distribution.error_sink_weight,
+                        p_om_u, p_wt_u, &target_fit.gtr_params
+                    );
+                } else {
+                    target_fit.log_likelihood = evaluate_log_l(
+                        1.0, target_fit.test_distribution.omegas, target_fit.test_distribution.weights,
+                        syn_r, syn_w, &target_fit.branch_lengths, &target_fit.site_log_likelihoods,
+                        target_fit.delta, target_fit.psi, target_fit.error_sink_weight, &target_fit.gtr_params
+                    );
+                }
+                target_fit.aicc = -2.0 * target_fit.log_likelihood + aicc_penalty;
+            }
+        };
+
         if (settings.phenotype_mode) {
             size_t K = settings.num_rate_classes;
             res.optimal_k = K;
@@ -5290,6 +5487,7 @@ public:
                 settings.multiple_hits, pbar.get(), "Unconstrained Two-Set K=" + std::to_string(K),
                 settings.error_sink, settings.error_sink_max_weight
             );
+            polish_mss_for_fit(res.unconstrained, true, true);
             const BUSTEDRateDistribution* warm_u = res.unconstrained.has_unclassified_distribution
                 ? &res.unconstrained.unclassified_distribution : nullptr;
             const std::vector<Scalar>* warm_bl = !res.unconstrained.branch_lengths.empty()
@@ -5305,6 +5503,7 @@ public:
                 &res.unconstrained.test_distribution, &res.unconstrained.background_distribution, warm_u,
                 warm_bl, warm_gtr, res.unconstrained.delta, res.unconstrained.psi
             );
+            polish_mss_for_fit(res.constrained, true, false);
 
             // 3. Fit Constrained Background Model warm-started from Unconstrained MLE (F-007: M_null_B: omega_K^(T) >= 1, omega_K^(B) = 1)
             res.constrained_background = fit_two_set_model(
@@ -5314,11 +5513,13 @@ public:
                 &res.unconstrained.test_distribution, &res.unconstrained.background_distribution, warm_u,
                 warm_bl, warm_gtr, res.unconstrained.delta, res.unconstrained.psi
             );
+            polish_mss_for_fit(res.constrained_background, true, false);
 
             // 4. Fit Shared Distributions Model (M_shared: D_T == D_B on Test U Background; also exact RELAX Null k = 1)
             res.shared_distributions = fit_shared_distribution_model(
                 K, settings, pbar.get(), "Shared Dist (RELAX Null k=1) K=" + std::to_string(K), &res.unconstrained
             );
+            polish_mss_for_fit(res.shared_distributions, !res.shared_distributions.background_distribution.omegas.empty(), false);
 
             // 4b. Fit Coupled-k RELAX Alternative Model (M_RELAX: omega_FG = omega_BG^k, shared weights)
             if (run_relax_in_ph) {
@@ -5328,6 +5529,7 @@ public:
                     settings.multiple_hits, pbar.get(), "RELAX Coupled-k K=" + std::to_string(K),
                     settings.error_sink, settings.error_sink_max_weight, &res.relax_k
                 );
+                polish_mss_for_fit(res.relax_alternative, true, false);
                 res.relax_lrt = std::max(0.0, 2.0 * (res.relax_alternative.log_likelihood - res.shared_distributions.log_likelihood));
                 res.relax_p_value = busted_chi2_p_value(res.relax_lrt, 1.0);
                 if (res.relax_p_value <= settings.p_value_threshold) {
@@ -5358,14 +5560,18 @@ public:
                     &best_nested->test_distribution, &best_nested->background_distribution, retry_u,
                     retry_bl, retry_gtr, best_nested->delta, best_nested->psi
                 );
+                reopt_unc.mss_class_rates = best_nested->mss_class_rates;
+                polish_mss_for_fit(reopt_unc, true, false);
                 if (reopt_unc.log_likelihood > res.unconstrained.log_likelihood) {
                     res.unconstrained = std::move(reopt_unc);
+                    polish_mss_for_fit(res.unconstrained, true, true);
                 }
             }
             if (res.unconstrained.log_likelihood < best_nested->log_likelihood) {
                 Scalar saved_aicc_diff = res.unconstrained.aicc + 2.0 * res.unconstrained.log_likelihood;
                 res.unconstrained = *best_nested;
                 res.unconstrained.aicc = -2.0 * res.unconstrained.log_likelihood + saved_aicc_diff;
+                polish_mss_for_fit(res.unconstrained, true, true);
             }
 
             bool unc_failed = (res.unconstrained.log_likelihood <= -1e19 || !std::isfinite(res.unconstrained.log_likelihood));
@@ -5441,6 +5647,7 @@ public:
             res.optimal_k = opt_k;
             res.k_null_fits = null_fits;
             res.constrained = null_fits[opt_k - 1];
+            polish_mss_for_fit(res.constrained, num_background_branches > 0, false);
             if (num_background_branches > 0) {
                 const BUSTEDRateDistribution* warm_u = res.constrained.has_unclassified_distribution
                     ? &res.constrained.unclassified_distribution : nullptr;
@@ -5455,6 +5662,7 @@ public:
                     &res.constrained.test_distribution, &res.constrained.background_distribution, warm_u,
                     warm_bl, warm_gtr, res.constrained.delta, res.constrained.psi
                 );
+                polish_mss_for_fit(res.unconstrained, true, true);
                 if (opt_k >= 2) {
                     const BUSTEDRateDistribution* alt_u = res.unconstrained.has_unclassified_distribution
                         ? &res.unconstrained.unclassified_distribution : nullptr;
@@ -5468,6 +5676,7 @@ public:
                         &res.unconstrained.test_distribution, &res.unconstrained.background_distribution, alt_u,
                         alt_bl, alt_gtr, res.unconstrained.delta, res.unconstrained.psi
                     );
+                    polish_mss_for_fit(null_from_alt, true, false);
                     if (null_from_alt.log_likelihood > res.constrained.log_likelihood) {
                         res.constrained = std::move(null_from_alt);
                     }
@@ -5486,11 +5695,13 @@ public:
                     settings.error_sink_max_weight,
                     &res.constrained
                 );
+                polish_mss_for_fit(res.unconstrained, false, true);
                 if (opt_k >= 2) {
                     BUSTEDFit null_from_alt = fit_model(
                         true, opt_k, settings.refine_branch_lengths, settings.srv, settings.num_syn_rate_classes,
                         settings.multiple_hits, nullptr, "", settings.error_sink, settings.error_sink_max_weight, &res.unconstrained
                     );
+                    polish_mss_for_fit(null_from_alt, false, false);
                     if (null_from_alt.log_likelihood > res.constrained.log_likelihood) {
                         res.constrained = std::move(null_from_alt);
                     }
@@ -5507,6 +5718,7 @@ public:
                 settings.multiple_hits, pbar.get(), "Unconstrained K=" + std::to_string(K_fit),
                 settings.error_sink, settings.error_sink_max_weight
             );
+            polish_mss_for_fit(res.unconstrained, true, true);
             const BUSTEDRateDistribution* warm_u = res.unconstrained.has_unclassified_distribution
                 ? &res.unconstrained.unclassified_distribution : nullptr;
             const std::vector<Scalar>* warm_bl = !res.unconstrained.branch_lengths.empty()
@@ -5520,6 +5732,7 @@ public:
                 &res.unconstrained.test_distribution, &res.unconstrained.background_distribution, warm_u,
                 warm_bl, warm_gtr, res.unconstrained.delta, res.unconstrained.psi
             );
+            polish_mss_for_fit(res.constrained, true, false);
             if (res.constrained.log_likelihood > res.unconstrained.log_likelihood + 1e-5) {
                 const std::vector<Scalar>* con_bl = !res.constrained.branch_lengths.empty()
                     ? &res.constrained.branch_lengths : warm_bl;
@@ -5531,8 +5744,11 @@ public:
                     &res.constrained.test_distribution, &res.constrained.background_distribution, warm_u,
                     con_bl, con_gtr, res.constrained.delta, res.constrained.psi
                 );
+                alt_rescued.mss_class_rates = res.constrained.mss_class_rates;
+                polish_mss_for_fit(alt_rescued, true, false);
                 if (alt_rescued.log_likelihood > res.unconstrained.log_likelihood) {
                     res.unconstrained = std::move(alt_rescued);
+                    polish_mss_for_fit(res.unconstrained, true, true);
                 }
             }
         } else {
@@ -5552,65 +5768,7 @@ public:
                 settings.error_sink,
                 settings.error_sink_max_weight
             );
-
-            // Helper to re-polish MSS synonymous class rates under a BUSTED mixture fit (F-026)
-            std::vector<Scalar> alt_syn_pair_rates_storage;
-            auto polish_mss_for_fit = [&](BUSTEDFit& target_fit, std::vector<Scalar>& rates_vec, bool update_res_mss) {
-                if (!has_mss || mss_part.num_classes() <= 1) return;
-                const MG94Parameters* active_base = target_fit.has_gtr_params ? &target_fit.gtr_params : &base_params;
-                std::vector<Scalar> syn_r = target_fit.test_distribution.syn_rates.empty() ? std::vector<Scalar>{1.0} : target_fit.test_distribution.syn_rates;
-                std::vector<Scalar> syn_w = target_fit.test_distribution.syn_weights.empty() ? std::vector<Scalar>{1.0} : target_fit.test_distribution.syn_weights;
-                Scalar cur_mss_ll = target_fit.log_likelihood;
-                bool mss_improved = false;
-                for (size_t c = 0; c < mss_part.num_classes(); ++c) {
-                    if (mss_norm == MSSNormalization::NeutralRef && static_cast<int>(c) == mss_part.neutral_class_id) continue;
-                    if (mss_norm != MSSNormalization::NeutralRef && c == 0) continue; // fix class 0 as gauge reference during 1D polish
-                    Scalar init_r = rates_vec[c];
-                    auto [r_opt, nll_opt] = Brent1D::minimize([&](Scalar cand_r) {
-                        std::vector<Scalar> cand_rates = rates_vec;
-                        cand_rates[c] = cand_r;
-                        std::vector<Scalar> cand_mat = mss_part.expand_to_matrix(code->num_sense_codons, cand_rates);
-                        MG94Parameters p_cand = *active_base;
-                        p_cand.syn_pair_rates = &cand_mat;
-                        return -evaluate_log_l(
-                            1.0, target_fit.test_distribution.omegas, target_fit.test_distribution.weights,
-                            syn_r, syn_w, &target_fit.branch_lengths, nullptr,
-                            target_fit.delta, target_fit.psi, target_fit.error_sink_weight, &p_cand
-                        );
-                    }, std::max(0.05, init_r * 0.25), init_r, std::min(20.0, std::max(3.0, init_r * 4.0)), 1e-3, 15);
-                    if (-nll_opt > cur_mss_ll + 1e-3) {
-                        rates_vec[c] = r_opt;
-                        cur_mss_ll = -nll_opt;
-                        mss_improved = true;
-                    }
-                }
-                if (mss_improved) {
-                    syn_pair_rates_storage = mss_part.expand_to_matrix(code->num_sense_codons, rates_vec);
-                    base_params.syn_pair_rates = &syn_pair_rates_storage;
-                    if (target_fit.has_gtr_params) {
-                        target_fit.gtr_params.syn_pair_rates = &syn_pair_rates_storage;
-                    }
-                    if (update_res_mss) {
-                        for (size_t c = 0; c < mss_part.num_classes() && c < res.mss_rates.size(); ++c) {
-                            res.mss_rates[c].rate = rates_vec[c];
-                        }
-                    }
-                    Scalar old_ll = target_fit.log_likelihood;
-                    Scalar aicc_penalty = target_fit.aicc + 2.0 * old_ll;
-                    target_fit.log_likelihood = evaluate_log_l(
-                        1.0, target_fit.test_distribution.omegas, target_fit.test_distribution.weights,
-                        syn_r, syn_w, &target_fit.branch_lengths, &target_fit.site_log_likelihoods,
-                        target_fit.delta, target_fit.psi, target_fit.error_sink_weight,
-                        target_fit.has_gtr_params ? &target_fit.gtr_params : &base_params
-                    );
-                    target_fit.aicc = -2.0 * target_fit.log_likelihood + aicc_penalty;
-                }
-            };
-
-            if (has_mss && mss_part.num_classes() > 1) {
-                polish_mss_for_fit(res.unconstrained, mss_class_rates, true);
-                alt_syn_pair_rates_storage = syn_pair_rates_storage;
-            }
+            polish_mss_for_fit(res.unconstrained, false, true);
 
             res.constrained = fit_model(
                 true,
@@ -5625,17 +5783,7 @@ public:
                 settings.error_sink_max_weight,
                 &res.unconstrained
             );
-
-            if (has_mss && mss_part.num_classes() > 1) {
-                std::vector<Scalar> null_mss_rates = mss_class_rates;
-                polish_mss_for_fit(res.constrained, null_mss_rates, false);
-                // Restore unconstrained MSS rates in syn_pair_rates_storage for post-fit diagnostics
-                syn_pair_rates_storage = alt_syn_pair_rates_storage;
-                base_params.syn_pair_rates = &syn_pair_rates_storage;
-                if (res.unconstrained.has_gtr_params) {
-                    res.unconstrained.gtr_params.syn_pair_rates = &syn_pair_rates_storage;
-                }
-            }
+            polish_mss_for_fit(res.constrained, false, false);
 
             if (settings.srv && (2.0 * (res.unconstrained.log_likelihood - res.constrained.log_likelihood)) > 11.5) {
                 BUSTEDFit con_indep = fit_model(
@@ -5651,6 +5799,7 @@ public:
                     settings.error_sink_max_weight,
                     nullptr
                 );
+                polish_mss_for_fit(con_indep, false, false);
                 if (con_indep.log_likelihood > res.constrained.log_likelihood) {
                     res.constrained = std::move(con_indep);
                 }
@@ -5662,8 +5811,11 @@ public:
                     false, K_fit, settings.refine_branch_lengths, settings.srv, settings.num_syn_rate_classes,
                     settings.multiple_hits, nullptr, "", settings.error_sink, settings.error_sink_max_weight, &res.constrained
                 );
+                alt_rescued.mss_class_rates = res.constrained.mss_class_rates;
+                polish_mss_for_fit(alt_rescued, false, false);
                 if (alt_rescued.log_likelihood > res.unconstrained.log_likelihood) {
                     res.unconstrained = std::move(alt_rescued);
+                    polish_mss_for_fit(res.unconstrained, false, true);
                 } else {
                     break;
                 }

@@ -498,8 +498,9 @@ public:
         }
         if (ref_branch_names.empty()) {
             throw std::runtime_error(
-                "No reference branches were selected for RELAX. "
-                "When all branches match the test branch set, specify reference branches explicitly via --reference <group>."
+                "No reference branches were selected for RELAX (either all branches matched the test branch set, "
+                "or multiple branch tag groups exist without a designated reference group). "
+                "Specify reference branches explicitly via --reference <group>."
             );
         }
     }
@@ -1538,7 +1539,7 @@ public:
                 eval_sep_mg94_u,
                 {0.1, 0.5, 0.3, 1.0},
                 {1e-4, 1e-4, 1e-4, 0.1},
-                {10.0, 10.0, 10.0, 10.0},
+                {kMaxOmega, kMaxOmega, kMaxOmega, 10.0},
                 1e-4, 120
             );
             mg_wR = opt_sep.x[0];
@@ -1557,7 +1558,7 @@ public:
                 eval_sep_mg94,
                 {0.1, 0.5, 1.0},
                 {1e-4, 1e-4, 0.1},
-                {10.0, 10.0, 10.0},
+                {kMaxOmega, kMaxOmega, 10.0},
                 1e-4, 100
             );
             mg_wR = opt_sep.x[0];
@@ -1589,7 +1590,7 @@ public:
                         return -evaluate_relax_mixture(tree, {x[0], x[0], x[0]}, one_class, mg94_k(x[0], x[1]), 1.0, nullptr, &mg_bl,
                                                        &base_params, &cand_u, &one_class);
                     };
-                    auto o3 = NelderMeadND<3>::minimize(eval_w3, {mg_wR, mg_wT, mg_wU}, {1e-4, 1e-4, 1e-4}, {10.0, 10.0, 10.0}, 1e-5, 200);
+                    auto o3 = NelderMeadND<3>::minimize(eval_w3, {mg_wR, mg_wT, mg_wU}, {1e-4, 1e-4, 1e-4}, {kMaxOmega, kMaxOmega, kMaxOmega}, 1e-5, 200);
                     if (-o3.f > mg_ll) {
                         mg_wR = o3.x[0];
                         mg_wT = o3.x[1];
@@ -1603,7 +1604,7 @@ public:
                         return -evaluate_relax_mixture(tree, {x[0], x[0], x[0]}, one_class, mg94_k(x[0], x[1]), 1.0, nullptr, &mg_bl,
                                                        &base_params, &mg_om_u, &one_class);
                     };
-                    auto o2 = NelderMeadND<2>::minimize(eval_w, {mg_wR, mg_wT}, {1e-4, 1e-4}, {10.0, 10.0}, 1e-5, 200);
+                    auto o2 = NelderMeadND<2>::minimize(eval_w, {mg_wR, mg_wT}, {1e-4, 1e-4}, {kMaxOmega, kMaxOmega}, 1e-5, 200);
                     if (-o2.f > mg_ll) {
                         mg_wR = o2.x[0];
                         mg_wT = o2.x[1];
@@ -1666,8 +1667,9 @@ public:
         }
 
         // Seed unclassified distribution from dataset Phase-2 MG94 unclassified omega
-        Scalar w_mean = std::clamp(has_unclassified ? mg_wU : (0.5 * (mg_wR + mg_wT)), 1e-3, 0.95);
-        omegas_uncl = {std::clamp(0.1 * w_mean, 0.0, 0.9), w_mean, std::max(1.5, 2.0 * w_mean)};
+        Scalar w_u_raw = has_unclassified ? mg_wU : (0.5 * (mg_wR + mg_wT));
+        Scalar w_mean = std::clamp(w_u_raw, 1e-3, 0.95);
+        omegas_uncl = {std::clamp(0.1 * w_mean, 0.0, 0.9), w_mean, std::max({Scalar(1.5), Scalar(2.0) * w_mean, w_u_raw})};
         weights_uncl = {0.50, 0.40, 0.10};
 
         update_progress(with_stats("Phase 2: MG94 separate rates fit complete", mg_ll), 0.40);

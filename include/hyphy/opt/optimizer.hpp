@@ -918,9 +918,7 @@ public:
         size_t B = branch_node_ids.size();
         size_t num_nodes = cur_tree.num_nodes();
 
-        if (max_iters <= 100) {
-            max_iters = std::max<int>(max_iters, std::min<int>(500, 5 * static_cast<int>(B) + 60));
-        }
+        max_iters = std::max<int>(max_iters, std::min<int>(500, 5 * static_cast<int>(B) + 60));
 
         // Check if a partitioned 2-omega model (test vs background) is requested and non-trivial
         bool has_bg_omega = false;

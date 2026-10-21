@@ -48,7 +48,7 @@ static void print_mss_usage(const char* prog) {
               << "                       • " << Console::bold("unweighted") << "   : Arithmetic mean of class rates = 1.0 (default when --omega Fix without neutral class)\n"
               << "                       • " << Console::bold("neutral_ref") << "  : Reference class fixed at 1.0 (default when --neutral or NEUTRAL class present)\n"
               << "  " << Console::brand("--omega") << " <Fix|Fit>    Fix gene omega at MG94 baseline ('Fix') or jointly re-optimize ('Fit', default)\n"
-              << "  " << Console::brand("--f81") << "                Zero out nucleotide GTR biases (theta_ij = 1) to isolate codon selection from mutation bias\n\n"
+              << "  " << Console::brand("--f81") << "                Zero out nucleotide GTR biases (theta_ij = 1) with coordinate-wise cavity branch optimization\n\n"
               << Console::bold("Fast Partition Selector Options:") << "\n"
               << "  " << Console::brand("--select") << "             Discover optimal synonymous rate partition via 1D profile curvature DP + local search\n"
               << "  " << Console::brand("--classes") << " <K>        Number of synonymous rate classes K for --select (default: 5, max: 12)\n"

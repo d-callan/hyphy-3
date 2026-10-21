@@ -707,9 +707,14 @@ public:
                     site_res.prob_pos = sum_p_pos * inv_draws;
                 }
 
-                auto [psrf_val, neff_val] = compute_psrf_and_neff(chain_trace);
-                site_res.psrf = psrf_val;
-                site_res.neff = neff_val;
+                if (settings.method == FUBARMethod::MetropolisHastings) {
+                    auto [psrf_val, neff_val] = compute_psrf_and_neff(chain_trace);
+                    site_res.psrf = psrf_val;
+                    site_res.neff = neff_val;
+                } else {
+                    site_res.psrf = 0.0;
+                    site_res.neff = 0.0;
+                }
             }
         }
 
@@ -754,25 +759,21 @@ public:
         return res;
     }
 
-    // Compute Gelman-Rubin PSRF (R-hat) and Effective Sample Size (N_eff) across chains
+    // Compute Gelman-Rubin PSRF (R-hat) and Effective Sample Size (N_eff) across chains (FUBAR.bf ComputeRandNeff)
     static std::pair<Scalar, Scalar> compute_psrf_and_neff(const std::vector<std::vector<Scalar>>& raw_chains) {
-        const bool single_chain_input = (raw_chains.size() <= 1);
+        if (raw_chains.size() <= 1) {
+            return {0.0, 0.0};
+        }
         std::vector<std::vector<Scalar>> chains;
-        if (raw_chains.size() == 1 && raw_chains[0].size() >= 4) {
-            size_t half = raw_chains[0].size() / 2;
-            chains.emplace_back(raw_chains[0].begin(), raw_chains[0].begin() + half);
-            chains.emplace_back(raw_chains[0].begin() + half, raw_chains[0].begin() + 2 * half);
-        } else {
-            for (const auto& ch : raw_chains) {
-                if (ch.size() >= 2) chains.push_back(ch);
-            }
+        for (const auto& ch : raw_chains) {
+            if (ch.size() >= 2) chains.push_back(ch);
         }
 
         size_t M = chains.size();
-        if (M == 0) return {0.0, 0.0};
+        if (M <= 1) return {0.0, 0.0};
         size_t N = chains[0].size();
         for (const auto& ch : chains) N = std::min(N, ch.size());
-        if (N < 2) return {0.0, static_cast<Scalar>(M * N)};
+        if (N < 2) return {0.0, 0.0};
 
         std::vector<Scalar> chain_means(M, 0.0);
         std::vector<Scalar> chain_vars(M, 0.0);
@@ -799,46 +800,20 @@ public:
         W /= static_cast<Scalar>(M);
 
         Scalar B = 0.0;
-        if (M > 1) {
-            for (size_t c = 0; c < M; ++c) {
-                Scalar d = chain_means[c] - grand_mean;
-                B += d * d;
-            }
-            B *= static_cast<Scalar>(N) / static_cast<Scalar>(M - 1);
+        for (size_t c = 0; c < M; ++c) {
+            Scalar d = chain_means[c] - grand_mean;
+            B += d * d;
+        }
+        B *= static_cast<Scalar>(N) / static_cast<Scalar>(M - 1);
+
+        if (W <= 1e-16 || B <= 1e-16) {
+            return {0.0, 0.0};
         }
 
         Scalar total_draws = static_cast<Scalar>(M * N);
-        if (W <= 1e-16) {
-            return {single_chain_input ? 0.0 : 1.0, total_draws};
-        }
-
         Scalar var_hat = ((static_cast<Scalar>(N - 1)) / static_cast<Scalar>(N)) * W + (B / static_cast<Scalar>(N));
-        Scalar psrf = (!single_chain_input && M > 1) ? std::sqrt(std::max<Scalar>(1.0, var_hat / W)) : 0.0;
-
-        Scalar neff = total_draws;
-        if (!single_chain_input && M > 1) {
-            // Match HyPhy's ComputeRandNeff (FUBAR.bf:621): N_eff = M * N * var_hat / B
-            if (B > 1e-16) {
-                neff = std::clamp<Scalar>(total_draws * var_hat / B, 1.0, total_draws);
-            }
-        } else {
-            // Single-chain fallback: lag-1 autocorrelation effective sample size
-            Scalar rho1_sum = 0.0;
-            int valid_chains = 0;
-            for (size_t c = 0; c < M; ++c) {
-                if (chain_vars[c] <= 1e-16) continue;
-                Scalar cov1 = 0.0;
-                for (size_t i = 1; i < N; ++i) {
-                    cov1 += (chains[c][i] - chain_means[c]) * (chains[c][i - 1] - chain_means[c]);
-                }
-                cov1 /= static_cast<Scalar>(N - 1);
-                rho1_sum += cov1 / chain_vars[c];
-                valid_chains++;
-            }
-            Scalar rho1 = (valid_chains > 0) ? (rho1_sum / static_cast<Scalar>(valid_chains)) : 0.0;
-            rho1 = std::clamp<Scalar>(rho1, -0.95, 0.99);
-            neff = std::clamp<Scalar>(total_draws * (1.0 - rho1) / (1.0 + rho1), 1.0, total_draws);
-        }
+        Scalar psrf = std::sqrt(var_hat / W);
+        Scalar neff = total_draws * var_hat / B;
 
         return {psrf, neff};
     }
@@ -1019,6 +994,7 @@ public:
         if (samples > 0) out_samples.reserve(static_cast<size_t>(samples));
         int64_t samples_drawn = 0;
         int64_t accepted_steps = 0;
+        const int64_t contracting_interval = std::max<int64_t>(1, 50 * chain_length);
 
         for (int64_t step = 1; step <= chain_length; ++step) {
             size_t idx1 = portable_uniform_int(rng, G);
@@ -1027,8 +1003,8 @@ public:
                 idx2 = portable_uniform_int(rng, G);
             }
 
-            // Freeze step adaptation strictly after burn_in so sampling kernel is stationary (F-039)
-            if (step < burn_in && step % 50000 == 0) {
+            // Match grid_compute.ibf:150 contracting = 50 * total_steps while keeping kernel stationary after burn_in (F-039)
+            if (step < burn_in && step % contracting_interval == 0) {
                 Scalar acc_rate = static_cast<Scalar>(accepted_steps) / static_cast<Scalar>(step);
                 if (acc_rate < 0.25) baseline_step /= 1.6;
                 else if (acc_rate > 0.5) baseline_step *= 1.6;
