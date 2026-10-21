@@ -793,7 +793,8 @@ public:
         OhmicNetwork ohm_net = OhmicNetwork::infer(aln, ohm_s);
         const Matrix* omega_ptr = (ohm_net.Omega.rows() == static_cast<Eigen::Index>(N)) ? &ohm_net.Omega : nullptr;
 
-        auto eval_window_lnl = [&](const Alignment& a, size_t w_start, size_t w_end) -> Scalar {
+        // Joint MG94 Substitution + Phylogenetic Branch-Indel (Sankoff/Dollo birth-death) log-likelihood
+        auto eval_joint_tree_indel_lnl = [&](const Alignment& a, size_t w_start, size_t w_end) -> Scalar {
             Scalar total = 0.0;
             std::vector<Vector> node_L(tree.num_nodes(), Vector::Zero(S));
             std::vector<double> node_scale(tree.num_nodes(), 0.0);
@@ -806,22 +807,91 @@ public:
                     tree, pat, leaf_to_taxon, mg94, P_branches, node_L, node_scale
                 );
             }
-            for (size_t t = 0; t < N; ++t) {
-                bool in_gap = false;
-                for (size_t c = w_start; c < w_end; ++c) {
-                    if (a.sequences[t].codons[c] < 0) {
-                        if (!in_gap) {
-                            total -= settings.gap_open_penalty;
-                            in_gap = true;
-                        } else {
-                            total -= settings.gap_extend_penalty;
+            size_t W_len = w_end - w_start;
+            if (W_len == 0) return total;
+            size_t num_nodes = tree.num_nodes();
+            const Scalar lam_open = 0.035;
+            const Scalar eps_ext = 0.65;
+            std::vector<std::array<Scalar, 2>> dp(W_len * num_nodes, {0.0, 0.0});
+            std::vector<uint8_t> anc_state(W_len * num_nodes, 1);
+
+            for (int32_t nid : tree.post_order) {
+                const auto& node = tree.nodes[nid];
+                if (node.is_leaf) {
+                    int32_t tid = (nid < static_cast<int32_t>(leaf_to_taxon.size())) ? leaf_to_taxon[nid] : -1;
+                    for (size_t w = 0; w < W_len; ++w) {
+                        bool present = (tid >= 0 && a.sequences[tid].codons[w_start + w] >= 0);
+                        dp[w * num_nodes + nid][present ? 1 : 0] = 0.0;
+                        dp[w * num_nodes + nid][present ? 0 : 1] = -1e6;
+                    }
+                } else {
+                    for (size_t w = 0; w < W_len; ++w) {
+                        for (int su = 0; su <= 1; ++su) {
+                            Scalar acc = 0.0;
+                            for (int32_t cid : node.children) {
+                                Scalar tb = std::max<Scalar>(0.005, tree.nodes[cid].branch_length);
+                                Scalar p_chg = 1.0 - std::exp(-lam_open * tb);
+                                Scalar s_same = dp[w * num_nodes + cid][su] + std::log(1.0 - p_chg);
+                                Scalar s_diff = dp[w * num_nodes + cid][1 - su] + std::log(p_chg);
+                                acc += std::max(s_same, s_diff);
+                            }
+                            dp[w * num_nodes + nid][su] = acc;
                         }
-                    } else {
-                        in_gap = false;
                     }
                 }
             }
+            for (size_t w = 0; w < W_len; ++w) {
+                anc_state[w * num_nodes + tree.root_id] =
+                    (dp[w * num_nodes + tree.root_id][1] >= dp[w * num_nodes + tree.root_id][0]) ? 1 : 0;
+            }
+            for (auto it = tree.post_order.rbegin(); it != tree.post_order.rend(); ++it) {
+                int32_t nid = *it;
+                const auto& node = tree.nodes[nid];
+                for (int32_t cid : node.children) {
+                    Scalar tb = std::max<Scalar>(0.005, tree.nodes[cid].branch_length);
+                    Scalar p_chg = 1.0 - std::exp(-lam_open * tb);
+                    for (size_t w = 0; w < W_len; ++w) {
+                        int su = anc_state[w * num_nodes + nid];
+                        Scalar s_same = dp[w * num_nodes + cid][su] + std::log(1.0 - p_chg);
+                        Scalar s_diff = dp[w * num_nodes + cid][1 - su] + std::log(p_chg);
+                        anc_state[w * num_nodes + cid] = (s_same >= s_diff) ? su : (1 - su);
+                    }
+                }
+            }
+            for (int32_t nid : tree.post_order) {
+                const auto& node = tree.nodes[nid];
+                for (int32_t cid : node.children) {
+                    Scalar tb = std::max<Scalar>(0.005, tree.nodes[cid].branch_length);
+                    Scalar p_open = 1.0 - std::exp(-lam_open * tb);
+                    int in_ev = 0;
+                    for (size_t w = 0; w < W_len; ++w) {
+                        int su = anc_state[w * num_nodes + nid];
+                        int sv = anc_state[w * num_nodes + cid];
+                        if (su == sv) {
+                            if (in_ev != 0) {
+                                total += std::log(1.0 - eps_ext);
+                                in_ev = 0;
+                            }
+                            if (su == 1) total += -lam_open * tb;
+                        } else {
+                            int ev_t = (su == 0 && sv == 1) ? 1 : 2;
+                            if (in_ev == ev_t) {
+                                total += std::log(eps_ext);
+                            } else {
+                                if (in_ev != 0) total += std::log(1.0 - eps_ext);
+                                total += std::log(0.5 * p_open);
+                                in_ev = ev_t;
+                            }
+                        }
+                    }
+                    if (in_ev != 0) total += std::log(1.0 - eps_ext);
+                }
+            }
             return total;
+        };
+
+        auto eval_window_lnl = [&](const Alignment& a, size_t w_start, size_t w_end) -> Scalar {
+            return eval_joint_tree_indel_lnl(a, w_start, w_end);
         };
 
         for (size_t wi = 0; wi < windows.size(); ++wi) {
@@ -904,7 +974,7 @@ public:
         // If Stage 1 window realignment evacuated any slack columns (leaving an all-gap column)
         // or left two adjacent/near-adjacent complementary columns (with disjoint taxon sets and
         // no intermediate codons in any taxon), collapse them into a single colinear column
-        // when doing so strictly improves the joint MG94 + affine indel log-posterior!
+        // when doing so strictly improves the joint MG94 + phylogenetic branch-indel log-likelihood!
         auto erase_alignment_column = [&](size_t col_idx) {
             for (size_t t = 0; t < N; ++t) {
                 aln.sequences[t].codons.erase(aln.sequences[t].codons.begin() + static_cast<std::ptrdiff_t>(col_idx));
@@ -935,7 +1005,7 @@ public:
             }
         }
 
-        // 2. Collapse disjoint order-preserving split columns within radius 5 if joint score improves
+        // 2. Collapse disjoint order-preserving split columns within radius 5 if joint phylogenetic score strictly improves
         bool compacted = true;
         while (compacted && aln.num_codons > 2) {
             compacted = false;
@@ -987,7 +1057,7 @@ public:
                     test_aln.num_codons--;
                     Scalar score_after = eval_window_lnl(test_aln, w_lo, w_hi - 1);
 
-                    if (score_after >= score_before - 2.0) {
+                    if (score_after > score_before) {
                         for (size_t t = 0; t < N; ++t) {
                             if (aln.sequences[t].codons[c2] >= 0) {
                                 aln.sequences[t].codons[c1] = aln.sequences[t].codons[c2];
@@ -1092,7 +1162,7 @@ public:
 
                     Scalar score_after = eval_window_lnl(test_aln, w_lo, new_w_hi);
 
-                    if (score_after >= score_before - 1.0) {
+                    if (score_after > score_before) {
                         aln = std::move(test_aln);
                         if (c1 + min_gaps_in_span <= out_site_homology_posteriors.size()) {
                             out_site_homology_posteriors.erase(
@@ -1106,107 +1176,6 @@ public:
                 }
             }
         }
-
-        // 4. Option 1 Phylogenetic Branch-Indel Terminal Consolidation Pass:
-        // Evaluate the exact Joint MG94 Substitution + Phylogenetic Branch-Indel (Sankoff/Dollo birth-death)
-        // log-likelihood at the N-terminal and C-terminal indel windows. If a taxon (or clade) has a terminal
-        // deletion that was split into 2 deletions around a single island codon (e.g. `---H------LTR` vs
-        // `---------HLTR`, or `K-N` vs `KN-`), test consolidating the terminal gap block flush against the
-        // N- or C-terminus and accept if and only if the Joint MG94 + Branch-Indel Log-Likelihood improves!
-        auto eval_joint_tree_indel_lnl = [&](const Alignment& a, size_t w_start, size_t w_end) -> Scalar {
-            Scalar total = 0.0;
-            std::vector<Vector> node_L(tree.num_nodes(), Vector::Zero(S));
-            std::vector<double> node_scale(tree.num_nodes(), 0.0);
-            for (size_t c = w_start; c < w_end; ++c) {
-                SitePattern pat;
-                pat.states.resize(N);
-                for (size_t t = 0; t < N; ++t) pat.states[t] = a.sequences[t].codons[c];
-                pat.weight = 1;
-                total += FELAnalyzer::compute_pattern_log_likelihood(
-                    tree, pat, leaf_to_taxon, mg94, P_branches, node_L, node_scale
-                );
-            }
-            size_t W_len = w_end - w_start;
-            size_t num_nodes = tree.num_nodes();
-            const Scalar lam_open = 0.035;
-            const Scalar eps_ext = 0.65;
-            std::vector<std::array<Scalar, 2>> dp(W_len * num_nodes, {0.0, 0.0});
-            std::vector<uint8_t> anc_state(W_len * num_nodes, 1);
-
-            for (int32_t nid : tree.post_order) {
-                const auto& node = tree.nodes[nid];
-                if (node.is_leaf) {
-                    int32_t tid = (nid < static_cast<int32_t>(leaf_to_taxon.size())) ? leaf_to_taxon[nid] : -1;
-                    for (size_t w = 0; w < W_len; ++w) {
-                        bool present = (tid >= 0 && a.sequences[tid].codons[w_start + w] >= 0);
-                        dp[w * num_nodes + nid][present ? 1 : 0] = 0.0;
-                        dp[w * num_nodes + nid][present ? 0 : 1] = -1e6;
-                    }
-                } else {
-                    for (size_t w = 0; w < W_len; ++w) {
-                        for (int su = 0; su <= 1; ++su) {
-                            Scalar acc = 0.0;
-                            for (int32_t cid : node.children) {
-                                Scalar tb = std::max<Scalar>(0.005, tree.nodes[cid].branch_length);
-                                Scalar p_chg = 1.0 - std::exp(-lam_open * tb);
-                                Scalar s_same = dp[w * num_nodes + cid][su] + std::log(1.0 - p_chg);
-                                Scalar s_diff = dp[w * num_nodes + cid][1 - su] + std::log(p_chg);
-                                acc += std::max(s_same, s_diff);
-                            }
-                            dp[w * num_nodes + nid][su] = acc;
-                        }
-                    }
-                }
-            }
-            for (size_t w = 0; w < W_len; ++w) {
-                anc_state[w * num_nodes + tree.root_id] =
-                    (dp[w * num_nodes + tree.root_id][1] >= dp[w * num_nodes + tree.root_id][0]) ? 1 : 0;
-            }
-            for (auto it = tree.post_order.rbegin(); it != tree.post_order.rend(); ++it) {
-                int32_t nid = *it;
-                const auto& node = tree.nodes[nid];
-                for (int32_t cid : node.children) {
-                    Scalar tb = std::max<Scalar>(0.005, tree.nodes[cid].branch_length);
-                    Scalar p_chg = 1.0 - std::exp(-lam_open * tb);
-                    for (size_t w = 0; w < W_len; ++w) {
-                        int su = anc_state[w * num_nodes + nid];
-                        Scalar s_same = dp[w * num_nodes + cid][su] + std::log(1.0 - p_chg);
-                        Scalar s_diff = dp[w * num_nodes + cid][1 - su] + std::log(p_chg);
-                        anc_state[w * num_nodes + cid] = (s_same >= s_diff) ? su : (1 - su);
-                    }
-                }
-            }
-            for (int32_t nid : tree.post_order) {
-                const auto& node = tree.nodes[nid];
-                for (int32_t cid : node.children) {
-                    Scalar tb = std::max<Scalar>(0.005, tree.nodes[cid].branch_length);
-                    Scalar p_open = 1.0 - std::exp(-lam_open * tb);
-                    int in_ev = 0;
-                    for (size_t w = 0; w < W_len; ++w) {
-                        int su = anc_state[w * num_nodes + nid];
-                        int sv = anc_state[w * num_nodes + cid];
-                        if (su == sv) {
-                            if (in_ev != 0) {
-                                total += std::log(1.0 - eps_ext);
-                                in_ev = 0;
-                            }
-                            if (su == 1) total += -lam_open * tb;
-                        } else {
-                            int ev_t = (su == 0 && sv == 1) ? 1 : 2;
-                            if (in_ev == ev_t) {
-                                total += std::log(eps_ext);
-                            } else {
-                                if (in_ev != 0) total += std::log(1.0 - eps_ext);
-                                total += std::log(0.5 * p_open);
-                                in_ev = ev_t;
-                            }
-                        }
-                    }
-                    if (in_ev != 0) total += std::log(1.0 - eps_ext);
-                }
-            }
-            return total;
-        };
 
         if (aln.num_codons >= 6) {
             // Check N-terminal window [0 .. min(12, C)) for split terminal deletions
@@ -2477,9 +2446,9 @@ public:
         auto log_odds_merge = [&](const Vector& d1, const Vector& d1_deep, Scalar occ1,
                                   const Vector& d2, const Vector& d2_deep, Scalar occ2) -> Scalar {
             // Multi-scale Phylogenetic Bayes Factor:
-            // Combines exact branch-length MG94 homology odds (70%) with deep-homology MG94 kernel (30%)
-            // plus a structural colinearity floor so positively selected columns (omega > 1) are not
-            // falsely split into staggered insertion/deletion pairs when both columns have high occupancy.
+            // Combines exact branch-length MG94 homology odds (70%) with deep-homology MG94 kernel (30%).
+            // A small Laplace pseudocount (0.15) prevents -Inf log-odds on highly variable sites while
+            // ensuring truly incompatible codons have BF < 1.0 (negative log-odds).
             Scalar bf_exact = 0.0;
             Scalar bf_deep = 0.0;
             for (int s = 0; s < S; ++s) {
@@ -2487,16 +2456,11 @@ public:
                 bf_exact += (d1(s) * d2(s)) / pi_s;
                 bf_deep  += (d1_deep(s) * d2_deep(s)) / pi_s;
             }
-            Scalar min_occ = std::min(occ1, occ2);
-            Scalar max_occ = std::max(occ1, occ2);
-            // If both columns are present in the majority of their respective subtrees (min_occ >= 0.5),
-            // they represent core structural positions rather than rare lineage-specific insertions:
-            Scalar colinear_floor = 0.65 + 1.15 * min_occ * max_occ;
-            Scalar bf = 0.70 * bf_exact + 0.30 * bf_deep + colinear_floor;
-            Scalar llr = std::log(std::max<Scalar>(1e-6, bf));
+            Scalar bf = 0.70 * bf_exact + 0.30 * bf_deep + 0.15;
+            Scalar llr = std::log(std::max<Scalar>(1e-4, bf));
             // Reward matching columns of similar taxon occupancy (prevents splitting shared framework/loop columns)
             Scalar occ_balance = 1.0 - 0.85 * std::abs(occ1 - occ2);
-            return llr + 0.9 * std::log(std::max<Scalar>(0.15, occ_balance));
+            return llr + 0.6 * std::log(std::max<Scalar>(0.15, occ_balance));
         };
 
         auto align_two_profiles = [&](const NodeProfile& left, Scalar bl_left,
@@ -2535,7 +2499,11 @@ public:
             //   State 1 (I): Insert from left (i, -)
             //   State 2 (D): Delete / Insert from right (-, j)
             const Scalar NEG_INF = -1e18;
-            const Scalar g_open = settings.gap_open_penalty;
+            // Scale gap-open penalty with evolutionary distance t_pair = t1 + t2 so longer branches
+            // permit true indel events while short sister branches resist spurious gaps:
+            Scalar t_pair = std::clamp(bl_left + bl_right, 0.02, 1.20);
+            Scalar branch_scale = std::clamp(1.15 - 0.35 * std::min<Scalar>(1.0, t_pair / 0.40), 0.75, 1.15);
+            const Scalar g_open = settings.gap_open_penalty * branch_scale;
             const Scalar g_ext = settings.gap_extend_penalty;
 
             Eigen::MatrixXd dp_M = Eigen::MatrixXd::Constant(L1 + 1, L2 + 1, NEG_INF);
@@ -2558,9 +2526,12 @@ public:
 
             for (size_t i = 1; i <= L1; ++i) {
                 for (size_t j = 1; j <= L2; ++j) {
-                    // 1. State I: align left[i-1] to gap (if left[i-1] is already a rare insertion, propagating it costs less)
-                    Scalar eff_open_I = g_open * (0.25 + 0.75 * left.occupancy[i - 1]);
-                    Scalar eff_ext_I  = g_ext  * (0.25 + 0.75 * left.occupancy[i - 1]);
+                    // 1. State I: align left[i-1] to gap. If left.occupancy[i-1] < 1.0, an indel event
+                    // already occurred inside the left subtree; propagating an existing partial column
+                    // across the parent node is a continuation rather than a full new indel event.
+                    Scalar occ_L = left.occupancy[i - 1];
+                    Scalar eff_open_I = g_open * (0.15 + 0.85 * occ_L * occ_L);
+                    Scalar eff_ext_I  = g_ext  * (0.15 + 0.85 * occ_L);
                     Scalar i_from_m = dp_M(i - 1, j) - eff_open_I;
                     Scalar i_from_i = dp_I(i - 1, j) - eff_ext_I;
                     if (i_from_m >= i_from_i) {
@@ -2572,8 +2543,9 @@ public:
                     }
 
                     // 2. State D: align right[j-1] to gap
-                    Scalar eff_open_D = g_open * (0.25 + 0.75 * right.occupancy[j - 1]);
-                    Scalar eff_ext_D  = g_ext  * (0.25 + 0.75 * right.occupancy[j - 1]);
+                    Scalar occ_R = right.occupancy[j - 1];
+                    Scalar eff_open_D = g_open * (0.15 + 0.85 * occ_R * occ_R);
+                    Scalar eff_ext_D  = g_ext  * (0.15 + 0.85 * occ_R);
                     Scalar d_from_m = dp_M(i, j - 1) - eff_open_D;
                     Scalar d_from_d = dp_D(i, j - 1) - eff_ext_D;
                     if (d_from_m >= d_from_d) {
@@ -2691,8 +2663,9 @@ public:
                 if (L_cur < 2) break;
 
                 // Pass A: Multi-column staggered block compaction [col .. col+k-1] + [col+k .. col+2k-1] -> k columns
-                // Handles cases where Phase B opened a k-codon I-block followed by a k-codon D-block (k = 1..5)
-                // across two disjoint sets of taxa (even if a third taxon is gapped in some of the k columns).
+                // Only collapse when the paired columns exhibit genuine evolutionary homology (BF > 1.0, i.e. above random chance),
+                // or when every active taxon is present in one of the two complementary blocks (n_left + n_right == n_active,
+                // meaning a core block was split by an I-then-D path) with compatible codons (BF > 0.35).
                 for (size_t k = 1; k <= 5 && !merged_any; ++k) {
                     if (L_cur < 2 * k) continue;
                     for (size_t col = 0; col + 2 * k <= L_cur; ++col) {
@@ -2723,7 +2696,8 @@ public:
                             }
                         }
                         Scalar mean_bf = sum_bf / static_cast<Scalar>(k);
-                        if (mean_bf > 0.03 || (n_left_taxa + n_right_taxa >= n_active / 2 && mean_bf > 0.005)) {
+                        bool full_complement = (n_left_taxa + n_right_taxa == n_active);
+                        if (mean_bf > 1.25 || (full_complement && mean_bf > 0.35)) {
                             for (size_t r = 0; r < k; ++r) {
                                 size_t n1 = 0, n2 = 0;
                                 for (size_t t = 0; t < N; ++t) {
@@ -2751,7 +2725,7 @@ public:
                 }
                 if (merged_any) continue;
 
-                // Pass B: Single-column sliding compaction across intermediate gap columns (up to radius 6)
+                // Pass B: Single-column sliding compaction across intermediate gap columns (up to radius 4)
                 for (size_t col = 0; col < L_cur; ++col) {
                     size_t n1 = 0;
                     for (size_t t = 0; t < N; ++t) {
@@ -2759,7 +2733,7 @@ public:
                     }
                     if (n1 == 0 || n1 >= n_active) continue;
 
-                    size_t max_other = std::min(L_cur - 1, col + 6);
+                    size_t max_other = std::min(L_cur - 1, col + 4);
                     bool did_merge = false;
                     for (size_t other = col + 1; other <= max_other; ++other) {
                         bool disjoint_and_ordered = true;
@@ -2790,7 +2764,8 @@ public:
                         for (int s = 0; s < S; ++s) {
                             bf += (d1_deep(s) * d2_deep(s)) / std::max<Scalar>(1e-8, pi_codon(s));
                         }
-                        if (bf > 0.015 || (n1 + n2 >= n_active / 2 && bf > 0.002)) {
+                        bool full_complement = (n1 + n2 == n_active);
+                        if (bf > 1.50 || (full_complement && bf > 0.50)) {
                             Scalar w1 = static_cast<Scalar>(n1) / static_cast<Scalar>(n1 + n2);
                             Scalar w2 = static_cast<Scalar>(n2) / static_cast<Scalar>(n1 + n2);
                             prof.D[col] = w1 * prof.D[col] + w2 * prof.D[other];
@@ -2850,7 +2825,8 @@ public:
                                 }
                             }
                             Scalar mean_bf = sum_bf / static_cast<Scalar>(k);
-                            if (mean_bf > 0.015 || (n_left_taxa + n_right_taxa >= n_active / 2 && mean_bf > 0.002)) {
+                            bool full_complement = (n_left_taxa + n_right_taxa == n_active);
+                            if (mean_bf > 1.25 || (full_complement && mean_bf > 0.35)) {
                                 for (size_t r = 0; r < k; ++r) {
                                     size_t n1 = 0, n2 = 0;
                                     for (size_t t = 0; t < N; ++t) {
