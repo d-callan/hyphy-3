@@ -496,6 +496,12 @@ public:
                 branch_class[node.name] = "Unclassified";
             }
         }
+        if (ref_branch_names.empty()) {
+            throw std::runtime_error(
+                "No reference branches were selected for RELAX. "
+                "When all branches match the test branch set, specify reference branches explicitly via --reference <group>."
+            );
+        }
     }
 
     // Branch-length -> rate-matrix time conversion factor for each of the 3 omega classes
@@ -594,8 +600,9 @@ public:
         }
 
         // Transition matrices for every (class, branch); classes with zero weight are never used
-        // by the pruning below and are skipped. In BranchSite mode the classes are mixed inside
-        // each branch matrix (stored in slot 0), so pruning runs once with a single class.
+        // by the pruning below and are skipped. In BranchSite mode (or on unclassified branches,
+        // whose 3-class BS-REL mixture (om_U, wt_U) is independent of the Test/Reference coupling)
+        // the classes are mixed on the branch using br_w.
         #pragma omp parallel for schedule(static)
         for (size_t bi = 0; bi < branch_ids.size(); ++bi) {
             const int nid = branch_ids[bi];
@@ -603,23 +610,32 @@ public:
             Scalar bl = custom_branch_lengths ? (*custom_branch_lengths)[nid] : (node.branch_length * tree_scale);
             const int part = branch_partition[nid];
             const std::vector<Scalar>& br_w = (part == 2) ? wt_U : weights;
-            for (int c = 0; c < 3; ++c) {
-                if (br_w[c] <= 1e-12 && (branch_site || weights[c] <= 1e-12)) continue;
-                if (part == 1) {
-                    P_branches[c][nid] = mats_T[c].transition_matrix(bl * convs_T[c]);
-                } else if (part == 2) {
-                    P_branches[c][nid] = mats_U[c].transition_matrix(bl * convs_U[c]);
-                } else {
-                    P_branches[c][nid] = mats_R[c].transition_matrix(bl * convs_R[c]);
-                }
-            }
-            if (branch_site) {
+            if (branch_site || part == 2) {
                 Matrix P_mix = Matrix::Zero(S, S);
                 for (int c = 0; c < 3; ++c) {
                     if (br_w[c] <= 1e-12) continue;
-                    P_mix.noalias() += br_w[c] * P_branches[c][nid];
+                    if (part == 1) {
+                        P_mix.noalias() += br_w[c] * mats_T[c].transition_matrix(bl * convs_T[c]);
+                    } else if (part == 2) {
+                        P_mix.noalias() += br_w[c] * mats_U[c].transition_matrix(bl * convs_U[c]);
+                    } else {
+                        P_mix.noalias() += br_w[c] * mats_R[c].transition_matrix(bl * convs_R[c]);
+                    }
                 }
-                P_branches[0][nid] = std::move(P_mix);
+                P_branches[0][nid] = P_mix;
+                if (!branch_site) {
+                    P_branches[1][nid] = P_mix;
+                    P_branches[2][nid] = std::move(P_mix);
+                }
+            } else {
+                for (int c = 0; c < 3; ++c) {
+                    if (weights[c] <= 1e-12) continue;
+                    if (part == 1) {
+                        P_branches[c][nid] = mats_T[c].transition_matrix(bl * convs_T[c]);
+                    } else {
+                        P_branches[c][nid] = mats_R[c].transition_matrix(bl * convs_R[c]);
+                    }
+                }
             }
         }
 
@@ -773,40 +789,55 @@ public:
         }
 
         // P and dP/dt for every contributing (class, branch), built in parallel over branches.
-        // In BranchSite mode the classes are mixed into slot 0:
-        //   P_mix = sum_c w_c P_c,  dP_mix = sum_c w_c conv_c Q_c P_c.
+        // In BranchSite mode (or on unclassified branches) the classes are mixed using br_w:
+        //   P_mix = sum_c br_w[c] P_c,  dP_mix = sum_c br_w[c] conv_c Q_c P_c.
         #pragma omp parallel for schedule(static)
         for (size_t bi = 0; bi < branch_ids.size(); ++bi) {
             const int nid = branch_ids[bi];
             const Scalar bl = branch_lengths[nid];
             const int part = branch_partition[nid];
             const std::vector<Scalar>& br_w = (part == 2) ? wt_U : weights;
-            for (int c = 0; c < 3; ++c) {
-                if (br_w[c] <= 1e-12 && (branch_site || weights[c] <= 1e-12)) continue;
-                if (part == 1) {
-                    Matrix P = mats_T[c].transition_matrix(bl * convs_T[c]);
-                    dP_c[c][nid] = convs_T[c] * (mats_T[c].Q * P);
-                    P_c[c][nid] = std::move(P);
-                } else if (part == 2) {
-                    Matrix P = mats_U[c].transition_matrix(bl * convs_U[c]);
-                    dP_c[c][nid] = convs_U[c] * (mats_U[c].Q * P);
-                    P_c[c][nid] = std::move(P);
-                } else {
-                    Matrix P = mats_R[c].transition_matrix(bl * convs_R[c]);
-                    dP_c[c][nid] = convs_R[c] * (mats_R[c].Q * P);
-                    P_c[c][nid] = std::move(P);
-                }
-            }
-            if (branch_site) {
+            if (branch_site || part == 2) {
                 Matrix P_mix = Matrix::Zero(S, S);
                 Matrix dP_mix = Matrix::Zero(S, S);
                 for (int c = 0; c < 3; ++c) {
                     if (br_w[c] <= 1e-12) continue;
-                    P_mix.noalias() += br_w[c] * P_c[c][nid];
-                    dP_mix.noalias() += br_w[c] * dP_c[c][nid];
+                    Matrix P;
+                    Matrix dP;
+                    if (part == 1) {
+                        P = mats_T[c].transition_matrix(bl * convs_T[c]);
+                        dP = convs_T[c] * (mats_T[c].Q * P);
+                    } else if (part == 2) {
+                        P = mats_U[c].transition_matrix(bl * convs_U[c]);
+                        dP = convs_U[c] * (mats_U[c].Q * P);
+                    } else {
+                        P = mats_R[c].transition_matrix(bl * convs_R[c]);
+                        dP = convs_R[c] * (mats_R[c].Q * P);
+                    }
+                    P_mix.noalias() += br_w[c] * P;
+                    dP_mix.noalias() += br_w[c] * dP;
                 }
-                P_c[0][nid] = std::move(P_mix);
-                dP_c[0][nid] = std::move(dP_mix);
+                P_c[0][nid] = P_mix;
+                dP_c[0][nid] = dP_mix;
+                if (!branch_site) {
+                    P_c[1][nid] = P_mix;
+                    P_c[2][nid] = std::move(P_mix);
+                    dP_c[1][nid] = dP_mix;
+                    dP_c[2][nid] = std::move(dP_mix);
+                }
+            } else {
+                for (int c = 0; c < 3; ++c) {
+                    if (weights[c] <= 1e-12) continue;
+                    if (part == 1) {
+                        Matrix P = mats_T[c].transition_matrix(bl * convs_T[c]);
+                        dP_c[c][nid] = convs_T[c] * (mats_T[c].Q * P);
+                        P_c[c][nid] = std::move(P);
+                    } else {
+                        Matrix P = mats_R[c].transition_matrix(bl * convs_R[c]);
+                        dP_c[c][nid] = convs_R[c] * (mats_R[c].Q * P);
+                        P_c[c][nid] = std::move(P);
+                    }
+                }
             }
         }
 
@@ -1269,7 +1300,9 @@ public:
         J.ll = loglik_at(decode_theta(J.theta, has_k), J.bl, nullptr,
                          &J.fit_base, &J.omegas_uncl, &J.weights_uncl);
 
-        const int cycles = std::max(1, settings.max_joint_cycles);
+        const int cycles = settings.refine_branch_lengths
+            ? std::max(1, settings.max_joint_cycles)
+            : std::max(3, settings.max_joint_cycles);
         for (int cycle = 0; cycle < cycles; ++cycle) {
             Scalar start_ll = J.ll;
             if (settings.refine_branch_lengths) {
@@ -1308,7 +1341,8 @@ public:
             }
 
             // F-043: Re-optimize the 5 GTR nucleotide exchangeabilities inside joint_optimize
-            if (settings.refine_branch_lengths) {
+            // (active under both refine_branch_lengths and --no-branch-opt)
+            {
                 RELAXDist d_cur = decode_theta(J.theta, has_k);
                 const MG94Parameters saved_base = J.fit_base;
                 auto with_rates = [&](const std::array<Scalar, 5>& x) {
@@ -1321,13 +1355,13 @@ public:
                     return p;
                 };
                 std::array<Scalar, 5> x0 = {
-                    std::log(std::max(1e-3, saved_base.theta_AC)),
-                    std::log(std::max(1e-3, saved_base.theta_AT)),
-                    std::log(std::max(1e-3, saved_base.theta_CG)),
-                    std::log(std::max(1e-3, saved_base.theta_CT)),
-                    std::log(std::max(1e-3, saved_base.theta_GT))
+                    std::log(std::clamp(saved_base.theta_AC, 1e-4, 1e4)),
+                    std::log(std::clamp(saved_base.theta_AT, 1e-4, 1e4)),
+                    std::log(std::clamp(saved_base.theta_CG, 1e-4, 1e4)),
+                    std::log(std::clamp(saved_base.theta_CT, 1e-4, 1e4)),
+                    std::log(std::clamp(saved_base.theta_GT, 1e-4, 1e4))
                 };
-                const Scalar lo = std::log(1e-3), hi = std::log(1e3);
+                const Scalar lo = std::log(1e-4), hi = std::log(1e4);
                 auto eval_nuc = [&](const std::array<Scalar, 5>& x) -> Scalar {
                     MG94Parameters cand_p = with_rates(x);
                     return -loglik_at(d_cur, J.bl, nullptr, &cand_p, &J.omegas_uncl, &J.weights_uncl);
@@ -1340,12 +1374,9 @@ public:
             }
 
             J.cycles = cycle + 1;
-            if (!settings.refine_branch_lengths) {
-                J.converged = true;
-                break;
-            }
             Scalar gain = J.ll - start_ll;
-            if (cycle >= 2 && gain < settings.joint_tolerance) {
+            const int min_conv_cycle = settings.refine_branch_lengths ? 2 : 1;
+            if (cycle >= min_conv_cycle && gain < settings.joint_tolerance) {
                 J.converged = true;
                 break;
             }
@@ -1396,9 +1427,8 @@ public:
         auto gtr_res = gtr_fitter.fit();
 
         // Polish the GTR fit. GTRFitter estimates the exchangeabilities once, from the initial
-        // branch lengths; here rates and branch lengths are alternated to convergence. This
-        // matters because HyPhy 2.5 RELAX fixes the nucleotide rates at the GTR MLE for every
-        // codon fit (RELAX.bf: estimators.fixSubsetOfEstimates(relax.gtr_results, ...)).
+        // branch lengths; here rates and branch lengths are alternated to convergence to provide
+        // high-accuracy starting values before Phase 2/3/4 refine them under the codon models.
         if (settings.refine_branch_lengths && gtr_res.tree.bridges.empty()) {
             const Alignment& nuc = gtr_fitter.nuc_aln;
             const std::vector<size_t> l2t = LikelihoodEngine::build_leaf_to_taxon_map(gtr_res.tree, nuc);
@@ -1417,13 +1447,13 @@ public:
                 return p;
             };
             Scalar cur = eval_gtr(gtr_res.tree, gtr_res.params);
-            const Scalar lo = std::log(1e-3), hi = std::log(1e3);
+            const Scalar lo = std::log(1e-4), hi = std::log(1e4);
             for (int cycle = 0; cycle < 10; ++cycle) {
                 const Scalar start_ll = cur;
                 std::array<Scalar, 5> x0 = {
-                    std::log(std::max(1e-3, gtr_res.params.theta_AC)), std::log(std::max(1e-3, gtr_res.params.theta_AT)),
-                    std::log(std::max(1e-3, gtr_res.params.theta_CG)), std::log(std::max(1e-3, gtr_res.params.theta_CT)),
-                    std::log(std::max(1e-3, gtr_res.params.theta_GT))
+                    std::log(std::clamp(gtr_res.params.theta_AC, 1e-4, 1e4)), std::log(std::clamp(gtr_res.params.theta_AT, 1e-4, 1e4)),
+                    std::log(std::clamp(gtr_res.params.theta_CG, 1e-4, 1e4)), std::log(std::clamp(gtr_res.params.theta_CT, 1e-4, 1e4)),
+                    std::log(std::clamp(gtr_res.params.theta_GT, 1e-4, 1e4))
                 };
                 auto f = [&](const std::array<Scalar, 5>& x) -> Scalar { return -eval_gtr(gtr_res.tree, with_rates(x)); };
                 auto o = NelderMeadND<5>::minimize(f, x0, {lo, lo, lo, lo, lo}, {hi, hi, hi, hi, hi}, 1e-6, 400);
@@ -1489,29 +1519,55 @@ public:
                 ? (std::log(std::max(1e-5, w_T)) / std::log(std::max(1e-5, w_R)))
                 : 1.0;
         };
+        const bool has_unclassified = !unclassified_branch_names.empty();
         const std::vector<Scalar> one_class = {1.0, 0.0, 0.0};
-        const std::vector<Scalar> mg_om_u = {unclassified_omega, unclassified_omega, unclassified_omega};
+        Scalar mg_wU = unclassified_omega;
+        std::vector<Scalar> mg_om_u = {mg_wU, mg_wU, mg_wU};
 
-        auto eval_sep_mg94 = [&](const std::array<Scalar, 3>& x) -> Scalar {
-            return -evaluate_relax_mixture(gtr_res.tree, {x[0], x[0], x[0]}, one_class, mg94_k(x[0], x[1]), x[2],
-                                           nullptr, nullptr, &base_params, &mg_om_u, &one_class);
-        };
-
-        auto opt_sep = NelderMeadND<3>::minimize(
-            eval_sep_mg94,
-            {0.1, 0.5, 1.0},
-            {1e-4, 1e-4, 0.1},
-            {10.0, 10.0, 10.0},
-            1e-4, 100
-        );
-
-        Scalar mg_wR = opt_sep.x[0];
-        Scalar mg_wT = opt_sep.x[1];
-        Scalar sep_scale = opt_sep.x[2];
-        Scalar mg_ll = -opt_sep.f;
+        Scalar mg_wR = 0.1;
+        Scalar mg_wT = 0.5;
+        Scalar sep_scale = 1.0;
+        Scalar mg_ll = -1e20;
+        if (has_unclassified) {
+            auto eval_sep_mg94_u = [&](const std::array<Scalar, 4>& x) -> Scalar {
+                std::vector<Scalar> cand_u = {x[2], x[2], x[2]};
+                return -evaluate_relax_mixture(gtr_res.tree, {x[0], x[0], x[0]}, one_class, mg94_k(x[0], x[1]), x[3],
+                                               nullptr, nullptr, &base_params, &cand_u, &one_class);
+            };
+            auto opt_sep = NelderMeadND<4>::minimize(
+                eval_sep_mg94_u,
+                {0.1, 0.5, 0.3, 1.0},
+                {1e-4, 1e-4, 1e-4, 0.1},
+                {10.0, 10.0, 10.0, 10.0},
+                1e-4, 120
+            );
+            mg_wR = opt_sep.x[0];
+            mg_wT = opt_sep.x[1];
+            mg_wU = opt_sep.x[2];
+            sep_scale = opt_sep.x[3];
+            mg_ll = -opt_sep.f;
+            unclassified_omega = mg_wU;
+            mg_om_u = {mg_wU, mg_wU, mg_wU};
+        } else {
+            auto eval_sep_mg94 = [&](const std::array<Scalar, 3>& x) -> Scalar {
+                return -evaluate_relax_mixture(gtr_res.tree, {x[0], x[0], x[0]}, one_class, mg94_k(x[0], x[1]), x[2],
+                                               nullptr, nullptr, &base_params, &mg_om_u, &one_class);
+            };
+            auto opt_sep = NelderMeadND<3>::minimize(
+                eval_sep_mg94,
+                {0.1, 0.5, 1.0},
+                {1e-4, 1e-4, 0.1},
+                {10.0, 10.0, 10.0},
+                1e-4, 100
+            );
+            mg_wR = opt_sep.x[0];
+            mg_wT = opt_sep.x[1];
+            sep_scale = opt_sep.x[2];
+            mg_ll = -opt_sep.f;
+        }
         std::vector<Scalar> mg_bl = scale_bl(gtr_bl, sep_scale);
 
-        // Per-branch refinement of the MG94 fit, alternating with (omega_R, omega_T).
+        // Per-branch refinement of the MG94 fit, alternating with (omega_R, omega_T[, omega_U]).
         // The RELAX fits below start from these branch lengths.
         if (settings.refine_branch_lengths) {
             update_progress("Phase 2: Refining MG94 branch lengths", 0.35);
@@ -1527,15 +1583,32 @@ public:
                     mg_bl = std::move(nbl);
                     mg_ll = nll;
                 }
-                auto eval_w = [&](const std::array<Scalar, 2>& x) -> Scalar {
-                    return -evaluate_relax_mixture(tree, {x[0], x[0], x[0]}, one_class, mg94_k(x[0], x[1]), 1.0, nullptr, &mg_bl,
-                                                   &base_params, &mg_om_u, &one_class);
-                };
-                auto o2 = NelderMeadND<2>::minimize(eval_w, {mg_wR, mg_wT}, {1e-4, 1e-4}, {10.0, 10.0}, 1e-5, 200);
-                if (-o2.f > mg_ll) {
-                    mg_wR = o2.x[0];
-                    mg_wT = o2.x[1];
-                    mg_ll = -o2.f;
+                if (has_unclassified) {
+                    auto eval_w3 = [&](const std::array<Scalar, 3>& x) -> Scalar {
+                        std::vector<Scalar> cand_u = {x[2], x[2], x[2]};
+                        return -evaluate_relax_mixture(tree, {x[0], x[0], x[0]}, one_class, mg94_k(x[0], x[1]), 1.0, nullptr, &mg_bl,
+                                                       &base_params, &cand_u, &one_class);
+                    };
+                    auto o3 = NelderMeadND<3>::minimize(eval_w3, {mg_wR, mg_wT, mg_wU}, {1e-4, 1e-4, 1e-4}, {10.0, 10.0, 10.0}, 1e-5, 200);
+                    if (-o3.f > mg_ll) {
+                        mg_wR = o3.x[0];
+                        mg_wT = o3.x[1];
+                        mg_wU = o3.x[2];
+                        unclassified_omega = mg_wU;
+                        mg_om_u = {mg_wU, mg_wU, mg_wU};
+                        mg_ll = -o3.f;
+                    }
+                } else {
+                    auto eval_w = [&](const std::array<Scalar, 2>& x) -> Scalar {
+                        return -evaluate_relax_mixture(tree, {x[0], x[0], x[0]}, one_class, mg94_k(x[0], x[1]), 1.0, nullptr, &mg_bl,
+                                                       &base_params, &mg_om_u, &one_class);
+                    };
+                    auto o2 = NelderMeadND<2>::minimize(eval_w, {mg_wR, mg_wT}, {1e-4, 1e-4}, {10.0, 10.0}, 1e-5, 200);
+                    if (-o2.f > mg_ll) {
+                        mg_wR = o2.x[0];
+                        mg_wT = o2.x[1];
+                        mg_ll = -o2.f;
+                    }
                 }
 
                 // Nucleotide exchangeabilities (log scale, A<->G = 1 reference). HyPhy 2.5 RELAX
@@ -1558,11 +1631,11 @@ public:
                                                        &base_params, &mg_om_u, &one_class);
                     };
                     std::array<Scalar, 5> x0 = {
-                        std::log(std::max(1e-3, saved.theta_AC)), std::log(std::max(1e-3, saved.theta_AT)),
-                        std::log(std::max(1e-3, saved.theta_CG)), std::log(std::max(1e-3, saved.theta_CT)),
-                        std::log(std::max(1e-3, saved.theta_GT))
+                        std::log(std::clamp(saved.theta_AC, 1e-4, 1e4)), std::log(std::clamp(saved.theta_AT, 1e-4, 1e4)),
+                        std::log(std::clamp(saved.theta_CG, 1e-4, 1e4)), std::log(std::clamp(saved.theta_CT, 1e-4, 1e4)),
+                        std::log(std::clamp(saved.theta_GT, 1e-4, 1e4))
                     };
-                    const Scalar lo = std::log(1e-3), hi = std::log(1e3);
+                    const Scalar lo = std::log(1e-4), hi = std::log(1e4);
                     auto o5 = NelderMeadND<5>::minimize(eval_nuc, x0, {lo, lo, lo, lo, lo}, {hi, hi, hi, hi, hi}, 1e-5, 300);
                     if (-o5.f > mg_ll) {
                         set_rates(o5.x);
@@ -1580,7 +1653,7 @@ public:
         result.mg94_omega_T = mg_wT;
 
         size_t B = tree.num_nodes() - 1;
-        result.mg94_parameters = 5 + B + 2 + 6; // GTR rates + branches + 2 omegas + CF3x4
+        result.mg94_parameters = 5 + B + (has_unclassified ? 3 : 2) + 6; // GTR rates + branches + partition omegas + CF3x4
         Scalar n_codons = static_cast<Scalar>(aln.num_codons);
         Scalar k_mg = static_cast<Scalar>(result.mg94_parameters);
         result.mg94_aicc = 2.0 * k_mg - 2.0 * result.mg94_log_likelihood +
@@ -1592,8 +1665,8 @@ public:
             }
         }
 
-        // Seed unclassified distribution from dataset Phase-2 MG94 mean omega
-        Scalar w_mean = std::clamp(0.5 * (mg_wR + mg_wT), 1e-3, 0.95);
+        // Seed unclassified distribution from dataset Phase-2 MG94 unclassified omega
+        Scalar w_mean = std::clamp(has_unclassified ? mg_wU : (0.5 * (mg_wR + mg_wT)), 1e-3, 0.95);
         omegas_uncl = {std::clamp(0.1 * w_mean, 0.0, 0.9), w_mean, std::max(1.5, 2.0 * w_mean)};
         weights_uncl = {0.50, 0.40, 0.10};
 
@@ -1695,19 +1768,27 @@ public:
         {
             RELAXDist d_hat = decode_theta(J_alt.theta, true);
             if (std::abs(J_alt.ll - J_null.ll) < 5.0) {
-                Scalar opp_min_k = (d_hat.k > 1.0) ? kMinK : 1.0;
-                Scalar opp_max_k = (d_hat.k > 1.0) ? 1.0   : kMaxK;
-                Scalar seed_k    = (d_hat.k > 1.0) ? 0.5   : 2.0;
-                RELAXJointFit J_opp = joint_optimize(
-                    add_k(J_null.theta, seed_k), J_null.bl, true,
-                    &J_null.fit_base, &J_null.omegas_uncl, &J_null.weights_uncl,
-                    opp_min_k, opp_max_k);
-                if (J_opp.ll > J_alt.ll) {
-                    J_alt = std::move(J_opp);
-                    RELAXJointFit J_null_opp = joint_optimize(
-                        drop_k(J_alt.theta), J_alt.bl, false,
-                        &J_alt.fit_base, &J_alt.omegas_uncl, &J_alt.weights_uncl);
-                    if (J_null_opp.ll > J_null.ll) J_null = std::move(J_null_opp);
+                std::vector<std::tuple<Scalar, Scalar, Scalar>> probes;
+                if (d_hat.k > 1.0 + 1e-6) {
+                    probes.emplace_back(kMinK, 1.0, 0.5);
+                } else if (d_hat.k < 1.0 - 1e-6) {
+                    probes.emplace_back(1.0, kMaxK, 2.0);
+                } else {
+                    probes.emplace_back(kMinK, 1.0, 0.5);
+                    probes.emplace_back(1.0, kMaxK, 2.0);
+                }
+                for (const auto& [opp_min_k, opp_max_k, seed_k] : probes) {
+                    RELAXJointFit J_opp = joint_optimize(
+                        add_k(J_null.theta, seed_k), J_null.bl, true,
+                        &J_null.fit_base, &J_null.omegas_uncl, &J_null.weights_uncl,
+                        opp_min_k, opp_max_k);
+                    if (J_opp.ll > J_alt.ll) {
+                        J_alt = std::move(J_opp);
+                        RELAXJointFit J_null_opp = joint_optimize(
+                            drop_k(J_alt.theta), J_alt.bl, false,
+                            &J_alt.fit_base, &J_alt.omegas_uncl, &J_alt.weights_uncl);
+                        if (J_null_opp.ll > J_null.ll) J_null = std::move(J_null_opp);
+                    }
                 }
             }
         }
@@ -1733,6 +1814,8 @@ public:
             J_alt.omegas_uncl = J_null.omegas_uncl;
             J_alt.weights_uncl = J_null.weights_uncl;
             J_alt.ll = J_null.ll;
+            J_alt.cycles = J_null.cycles;
+            J_alt.converged = J_null.converged;
         }
 
         update_progress(with_stats("Phase 4: RELAX fits complete; alternative", J_alt.ll), 0.90);

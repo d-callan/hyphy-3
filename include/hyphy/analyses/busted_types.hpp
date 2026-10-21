@@ -153,6 +153,7 @@ struct BUSTEDResult {
     std::map<std::string, std::vector<Scalar>> branch_empirical_bayes_factors; // Per-branch, per-site EBF for omega_K
     std::map<std::string, std::vector<Scalar>> branch_er_2h; // Per-branch, per-site 2-hit evidence ratio when --multiple-hits is active
     std::map<std::string, std::vector<Scalar>> branch_er_3h; // Per-branch, per-site 3-hit evidence ratio when --multiple-hits Double+Triple is active
+    std::map<std::string, std::vector<Scalar>> branch_er_23h; // Per-branch, per-site combined 2H+3H evidence ratio when --multiple-hits Double+Triple is active
     std::vector<Scalar> site_error_bfs;  // Max error sink Bayes factor across branches per site
     std::vector<BUSTEDErrorEvent> flagged_error_events; // Branch-site pairs with BF_sink >= threshold
     double runtime_seconds = 0.0;

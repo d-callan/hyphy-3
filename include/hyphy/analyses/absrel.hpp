@@ -67,8 +67,6 @@ struct ABSRELSettings {
     int max_rate_classes = 3;
     Scalar p_threshold = 0.05;
     std::string test_branches = "All"; // "All", "Internal", "Leaves"
-    bool do_srv = false;
-    int syn_rate_classes = 3;
     bool verbose = false;
 };
 
@@ -547,7 +545,7 @@ public:
                 }
             }
 
-            // F-052: Monotonicity guard on Jacobi update (damped log-space backtracking or rollback)
+            // F-052: Monotonicity guard on Jacobi update (damped log-space backtracking, then Gauss-Seidel fallback)
             std::vector<Scalar> prev_alpha = branch_alpha;
             std::vector<Scalar> prev_omega_0(num_nodes, 0.5);
             for (int32_t bid : branch_ids) {
@@ -576,6 +574,7 @@ public:
                 step *= 0.5;
             }
             if (!accepted) {
+                // Roll back Jacobi step and perform a serial Gauss-Seidel sweep so Phase 2 continues making monotone progress
                 for (int32_t bid : branch_ids) {
                     branch_alpha[bid] = prev_alpha[bid];
                     branch_omegas[bid][0] = prev_omega_0[bid];
@@ -583,6 +582,30 @@ public:
                 }
                 P_branches = compute_all_branch_transition_matrices();
                 cur_ll = prev_ll;
+                Matrix V_gs(S, num_patterns);
+                Matrix D_gs(S, num_patterns);
+                Matrix PD_gs(S, num_patterns);
+                for (int32_t bid : branch_ids) {
+                    Scalar gs_offset = 0.0;
+                    compute_branch_context_matrices(bid, P_branches, V_gs, D_gs, gs_offset);
+                    auto gs_obj = [&](Scalar log_alpha, Scalar log_omega) -> Scalar {
+                        Scalar ca = std::exp(log_alpha);
+                        Scalar cw = std::exp(log_omega);
+                        if (ca > 50.0 || cw > 5000.0) return 1e20;
+                        MG94Matrix mat = build_q_matrix(cw);
+                        Matrix P_b = mat.transition_matrix(ca);
+                        return -eval_branch_ll_from_matrices(P_b, V_gs, D_gs, gs_offset, PD_gs);
+                    };
+                    Scalar init_la = std::log(std::clamp(branch_alpha[bid], 1e-4, 20.0));
+                    Scalar init_lw = std::log(std::clamp(branch_omegas[bid][0], 1e-3, 50.0));
+                    auto opt_gs = NelderMead2D::minimize(gs_obj, init_la, init_lw, -10.0, 10.0, 1e-4, 60);
+                    if (-opt_gs.f >= cur_ll) {
+                        branch_alpha[bid] = std::exp(opt_gs.a);
+                        branch_omegas[bid][0] = std::exp(opt_gs.b);
+                        P_branches[bid] = build_q_matrix(branch_omegas[bid][0]).transition_matrix(branch_alpha[bid]);
+                        cur_ll = -opt_gs.f;
+                    }
+                }
             }
 
             if (progress_cb) {
@@ -801,15 +824,15 @@ public:
                 };
 
                 Scalar init_log_a = std::log(cur_alpha);
-                std::array<Scalar, 4> lb = {init_log_a - 5.0, -6.0, -8.0, -2.3};
-                std::array<Scalar, 4> ub = {init_log_a + 8.0,  6.0,  6.0, 10.0};
+                std::array<Scalar, 4> lb = {init_log_a - 5.0, -6.0, -14.0, -2.3};
+                std::array<Scalar, 4> ub = {init_log_a + 8.0,  6.0,   6.0, 10.0};
 
                 // Warm-start from current branch state if available
                 Scalar cur_p1 = cur_weights.empty() ? 0.90 : cur_weights[0];
                 Scalar cur_w1 = cur_omegas.empty() ? 0.20 : cur_omegas[0];
                 Scalar cur_w2 = cur_omegas.size() > 1 ? cur_omegas[1] : 5.0;
                 cur_p1 = std::clamp(cur_p1, 0.005, 0.995);
-                cur_w1 = std::clamp(cur_w1, 1e-4, 0.995);
+                cur_w1 = std::clamp(cur_w1, 1e-6, 0.995);
                 cur_w2 = std::clamp(cur_w2, 0.1, 20000.0);
 
                 std::array<Scalar, 4> best_pt = {
@@ -821,25 +844,25 @@ public:
                 Scalar best_sc = obj_4d(best_pt);
 
                 // F-053: Factorized 4D grid search expanded to cover HyPhy's full grid space:
-                // 5 w1 values ({0.0, 0.05, 0.20, 0.50, 0.80}) and 7 w2 values ({0.5, 1.5, 4.0, 15.0, 80.0, 500.0, 2500.0}).
+                // 5 w1 values ({0.0, 0.05, 0.20, 0.50, 0.80}) and 10 w2 values ({0.25, 0.5, 0.75, 1.0, 1.5, 4.0, 15.0, 80.0, 500.0, 2500.0}).
                 constexpr std::array<Scalar, 4> a_grid = {0.5, 1.0, 2.0, 6.0};
                 constexpr std::array<Scalar, 4> p1_grid = {0.98, 0.92, 0.80, 0.50};
                 constexpr std::array<Scalar, 5> w1_grid = {0.0, 0.05, 0.20, 0.50, 0.80};
-                constexpr std::array<Scalar, 7> w2_grid = {0.5, 1.5, 4.0, 15.0, 80.0, 500.0, 2500.0};
+                constexpr std::array<Scalar, 10> w2_grid = {0.25, 0.5, 0.75, 1.0, 1.5, 4.0, 15.0, 80.0, 500.0, 2500.0};
 
                 std::array<MG94Matrix, 5> mat_w1_grid;
                 std::array<Scalar, 5> x2_grid;
                 for (size_t iw1 = 0; iw1 < 5; ++iw1) {
-                    Scalar w1_c = std::clamp(w1_grid[iw1], 1.0 / (1.0 + std::exp(8.0)), 1.0 / (1.0 + std::exp(-6.0)));
+                    Scalar w1_c = std::clamp(w1_grid[iw1], 1.0 / (1.0 + std::exp(14.0)), 1.0 / (1.0 + std::exp(-6.0)));
                     Scalar x2 = std::log(w1_c / (1.0 - w1_c));
                     x2_grid[iw1] = x2;
                     Scalar w1_exact = 1.0 / (1.0 + std::exp(-x2));
                     mat_w1_grid[iw1] = build_q_matrix(w1_exact);
                 }
 
-                std::array<MG94Matrix, 7> mat_w2_grid;
-                std::array<Scalar, 7> x3_grid;
-                for (size_t iw2 = 0; iw2 < 7; ++iw2) {
+                std::array<MG94Matrix, 10> mat_w2_grid;
+                std::array<Scalar, 10> x3_grid;
+                for (size_t iw2 = 0; iw2 < 10; ++iw2) {
                     Scalar x3 = std::log(w2_grid[iw2]);
                     x3_grid[iw2] = x3;
                     Scalar w2_exact = std::exp(x3);
@@ -847,9 +870,9 @@ public:
                 }
 
                 std::array<Vector, 5> L_w1;
-                std::array<Vector, 7> L_w2;
+                std::array<Vector, 10> L_w2;
                 for (size_t iw1 = 0; iw1 < 5; ++iw1) L_w1[iw1].resize(num_patterns);
-                for (size_t iw2 = 0; iw2 < 7; ++iw2) L_w2[iw2].resize(num_patterns);
+                for (size_t iw2 = 0; iw2 < 10; ++iw2) L_w2[iw2].resize(num_patterns);
 
                 for (Scalar a_mult : a_grid) {
                     Scalar cand_log_a = std::log(cur_alpha * a_mult);
@@ -861,7 +884,7 @@ public:
                             L_w1[iw1](p) = V_mat.col(p).dot(PD_scratch.col(p));
                         }
                     }
-                    for (size_t iw2 = 0; iw2 < 7; ++iw2) {
+                    for (size_t iw2 = 0; iw2 < 10; ++iw2) {
                         PD_scratch.noalias() = mat_w2_grid[iw2].transition_matrix(a) * D_mat;
                         for (size_t p = 0; p < num_patterns; ++p) {
                             L_w2[iw2](p) = V_mat.col(p).dot(PD_scratch.col(p));
@@ -873,7 +896,7 @@ public:
                         Scalar p1 = 1.0 / (1.0 + std::exp(-cand_x1));
                         Scalar p2 = 1.0 - p1;
                         for (size_t iw1 = 0; iw1 < 5; ++iw1) {
-                            for (size_t iw2 = 0; iw2 < 7; ++iw2) {
+                            for (size_t iw2 = 0; iw2 < 10; ++iw2) {
                                 Scalar ll = log_scale_offset;
                                 for (size_t p = 0; p < num_patterns; ++p) {
                                     Scalar Lp = p1 * L_w1[iw1](p) + p2 * L_w2[iw2](p);
@@ -1483,238 +1506,264 @@ public:
         Matrix V_null_mat(S, num_patterns);
         Matrix D_null_mat(S, num_patterns);
 
-        size_t t_idx = 0;
-        for (const std::string& bname : to_test) {
-            auto& bres = result.branches[bname];
-            int32_t bid = bres.node_id;
+        for (int p5_restart = 0; p5_restart < 3; ++p5_restart) {
+            bool full_model_improved = false;
+            size_t t_idx = 0;
+            for (const std::string& bname : to_test) {
+                auto& bres = result.branches[bname];
+                int32_t bid = bres.node_id;
 
-            if (pbar_p5) {
-                size_t cpos = cand_pos_count.load(std::memory_order_relaxed);
-                std::string tag = (cpos > 0) ? (" (+" + std::to_string(cpos) + " pos)") : "";
-                pbar_p5->set_status(bname + tag);
-            }
-
-            Scalar max_omega = *std::max_element(branch_omegas[bid].begin(), branch_omegas[bid].end());
-            if (max_omega <= 1.0) {
-                bres.lrt = 0.0;
-                bres.uncorrected_p_value = 1.0;
-                bres.sites_ebf_100 = 0;
-                if (pbar_p5) {
-                    pbar_p5->tick();
-                }
-                t_idx++;
-                if (progress_cb) {
-                    double frac = 0.80 + 0.15 * (static_cast<double>(t_idx) / static_cast<double>(to_test.size()));
-                    progress_cb("Phase 5: Hypothesis Testing (" + bname + ": w_max <= 1)", frac);
-                }
-                continue;
-            }
-
-            // Full tree optimization under Null Hypothesis (omega_max <= 1.0 on branch bid)
-            // Hot start from global best-fit model
-            std::vector<Scalar> null_alpha = branch_alpha;
-            std::vector<std::vector<Scalar>> null_omegas = branch_omegas;
-            std::vector<std::vector<Scalar>> null_weights = branch_weights;
-            GTRParameters null_gtr = gtr_params;
-
-            Scalar null_ll = -1e20;
-
-            if (bres.rate_classes == 1) {
-                Scalar full_omega = null_omegas[bid][0];
-                null_omegas[bid] = {1.0};
-                null_weights[bid] = {1.0};
-
-                // Hot-start alpha to preserve expected substitutions per site
-                Scalar cur_exp = syn_scale_factor + full_omega * nonsyn_scale_factor;
-                Scalar null_exp = syn_scale_factor + nonsyn_scale_factor;
-                if (null_exp > 1e-12) {
-                    null_alpha[bid] = std::clamp(branch_alpha[bid] * (cur_exp / null_exp), 1e-6, 1000.0);
+                if (pbar_p5 && p5_restart == 0) {
+                    size_t cpos = cand_pos_count.load(std::memory_order_relaxed);
+                    std::string tag = (cpos > 0) ? (" (+" + std::to_string(cpos) + " pos)") : "";
+                    pbar_p5->set_status(bname + tag);
                 }
 
-                // Full tree optimization using Fréchet derivative quasi-Newton (L-BFGS-B)
-                null_ll = run_joint_branch_length_lbfgs_with_params(null_alpha, null_omegas, null_weights);
-            } else {
-                // Rate classes >= 2: constrain omega_max = 1.0 on branch bid
-                Scalar full_omega_max = null_omegas[bid].back();
-                null_omegas[bid].back() = 1.0;
-                if (full_omega_max > 2.0) {
-                    Scalar cur_exp = syn_scale_factor + full_omega_max * nonsyn_scale_factor;
+                Scalar max_omega = *std::max_element(branch_omegas[bid].begin(), branch_omegas[bid].end());
+                if (max_omega <= 1.0) {
+                    bres.lrt = 0.0;
+                    bres.uncorrected_p_value = 1.0;
+                    bres.sites_ebf_100 = 0;
+                    if (pbar_p5 && p5_restart == 0) {
+                        pbar_p5->tick();
+                    }
+                    t_idx++;
+                    if (progress_cb && p5_restart == 0) {
+                        double frac = 0.80 + 0.15 * (static_cast<double>(t_idx) / static_cast<double>(to_test.size()));
+                        progress_cb("Phase 5: Hypothesis Testing (" + bname + ": w_max <= 1)", frac);
+                    }
+                    continue;
+                }
+
+                // Full tree optimization under Null Hypothesis (omega_max <= 1.0 on branch bid)
+                // Hot start from global best-fit model
+                std::vector<Scalar> null_alpha = branch_alpha;
+                std::vector<std::vector<Scalar>> null_omegas = branch_omegas;
+                std::vector<std::vector<Scalar>> null_weights = branch_weights;
+                GTRParameters null_gtr = gtr_params;
+
+                Scalar null_ll = -1e20;
+
+                if (bres.rate_classes == 1) {
+                    Scalar full_omega = null_omegas[bid][0];
+                    null_omegas[bid] = {1.0};
+                    null_weights[bid] = {1.0};
+
+                    // Hot-start alpha to preserve expected substitutions per site
+                    Scalar cur_exp = syn_scale_factor + full_omega * nonsyn_scale_factor;
                     Scalar null_exp = syn_scale_factor + nonsyn_scale_factor;
-                    Scalar p_max = null_weights[bid].back();
-                    if (null_exp > 1e-12 && p_max > 0.05) {
-                        Scalar scale_ratio = 1.0 + p_max * (cur_exp / null_exp - 1.0);
-                        scale_ratio = std::clamp(scale_ratio, 1.0, 10.0);
-                        null_alpha[bid] = std::clamp(branch_alpha[bid] * scale_ratio, 1e-6, 1000.0);
+                    if (null_exp > 1e-12) {
+                        null_alpha[bid] = std::clamp(branch_alpha[bid] * (cur_exp / null_exp), 1e-6, 1000.0);
                     }
-                }
 
-                // F-016 & F-017: Up to 6 passes with 1e-3 threshold
-                const int max_null_passes = 6;
-                Scalar prev_nll = -1e20;
+                    // F-017: Multi-pass null optimization for 1-class branches (matching M >= 2)
+                    const int max_null_passes = 6;
+                    Scalar prev_nll = -1e20;
+                    for (int n_pass = 0; n_pass < max_null_passes; ++n_pass) {
+                        auto P_null = compute_all_branch_transition_matrices_with(null_alpha, null_omegas, null_weights);
+                        Scalar null_scale_offset = 0.0;
+                        compute_branch_context_matrices(bid, P_null, V_null_mat, D_null_mat, null_scale_offset);
+                        LocalBranchFit fit = optimize_branch_mixture_mat(
+                            bid, 1, V_null_mat, D_null_mat, true,
+                            null_alpha[bid], &null_omegas[bid], &null_weights[bid], null_scale_offset
+                        );
+                        null_alpha[bid] = fit.alpha;
+                        null_omegas[bid] = fit.omegas;
+                        null_weights[bid] = fit.weights;
 
-                for (int n_pass = 0; n_pass < max_null_passes; ++n_pass) {
-                    auto P_null = compute_all_branch_transition_matrices_with(null_alpha, null_omegas, null_weights);
-
-                    Scalar null_scale_offset = 0.0;
-                    compute_branch_context_matrices(bid, P_null, V_null_mat, D_null_mat, null_scale_offset);
-
-                    LocalBranchFit fit = optimize_branch_mixture_mat(
-                        bid, bres.rate_classes, V_null_mat, D_null_mat, true,
-                        null_alpha[bid], &null_omegas[bid], &null_weights[bid], null_scale_offset
-                    );
-                    null_alpha[bid] = fit.alpha;
-                    null_omegas[bid] = fit.omegas;
-                    null_weights[bid] = fit.weights;
-
-                    Scalar cur_nll = run_joint_branch_length_lbfgs_with_params(null_alpha, null_omegas, null_weights);
-                    if (n_pass > 0 && std::abs(cur_nll - prev_nll) < 1e-3) {
+                        Scalar cur_nll = run_joint_branch_length_lbfgs_with_params(null_alpha, null_omegas, null_weights);
+                        if (n_pass > 0 && std::abs(cur_nll - prev_nll) < 1e-3) {
+                            null_ll = cur_nll;
+                            break;
+                        }
                         null_ll = cur_nll;
-                        break;
+                        prev_nll = cur_nll;
                     }
-                    null_ll = cur_nll;
-                    prev_nll = cur_nll;
-                }
-            }
+                } else {
+                    // Rate classes >= 2: constrain omega_max = 1.0 on branch bid
+                    Scalar full_omega_max = null_omegas[bid].back();
+                    null_omegas[bid].back() = 1.0;
+                    if (full_omega_max > 2.0) {
+                        Scalar cur_exp = syn_scale_factor + full_omega_max * nonsyn_scale_factor;
+                        Scalar null_exp = syn_scale_factor + nonsyn_scale_factor;
+                        Scalar p_max = null_weights[bid].back();
+                        if (null_exp > 1e-12 && p_max > 0.05) {
+                            Scalar scale_ratio = 1.0 + p_max * (cur_exp / null_exp - 1.0);
+                            scale_ratio = std::clamp(scale_ratio, 1.0, 10.0);
+                            null_alpha[bid] = std::clamp(branch_alpha[bid] * scale_ratio, 1e-6, 1000.0);
+                        }
+                    }
 
-            // F-016 & F-017: Whenever the frozen-complement null produces a nominal 2*(full_ll - null_ll) > 2.0,
-            // also relax GTR rates and non-tested branches' mixtures inside the null loop (holding only bid's top omega <= 1)
-            if (std::isfinite(null_ll) && 2.0 * (full_ll - null_ll) > 2.0) {
-                const GTRParameters saved_full_gtr = gtr_params;
-                Scalar prev_full_null_ll = null_ll;
-                const int max_full_null_passes = 6;
-                for (int n_pass = 0; n_pass < max_full_null_passes; ++n_pass) {
+                    // F-016 & F-017: Up to 6 passes with 1e-3 threshold
+                    const int max_null_passes = 6;
+                    Scalar prev_nll = -1e20;
+
+                    for (int n_pass = 0; n_pass < max_null_passes; ++n_pass) {
+                        auto P_null = compute_all_branch_transition_matrices_with(null_alpha, null_omegas, null_weights);
+
+                        Scalar null_scale_offset = 0.0;
+                        compute_branch_context_matrices(bid, P_null, V_null_mat, D_null_mat, null_scale_offset);
+
+                        LocalBranchFit fit = optimize_branch_mixture_mat(
+                            bid, bres.rate_classes, V_null_mat, D_null_mat, true,
+                            null_alpha[bid], &null_omegas[bid], &null_weights[bid], null_scale_offset
+                        );
+                        null_alpha[bid] = fit.alpha;
+                        null_omegas[bid] = fit.omegas;
+                        null_weights[bid] = fit.weights;
+
+                        Scalar cur_nll = run_joint_branch_length_lbfgs_with_params(null_alpha, null_omegas, null_weights);
+                        if (n_pass > 0 && std::abs(cur_nll - prev_nll) < 1e-3) {
+                            null_ll = cur_nll;
+                            break;
+                        }
+                        null_ll = cur_nll;
+                        prev_nll = cur_nll;
+                    }
+                }
+
+                // F-016 & F-017: Relax GTR rates and non-tested branches' mixtures inside the null loop
+                // (holding only bid's top omega <= 1) whenever full_ll > null_ll
+                if (std::isfinite(null_ll) && full_ll > null_ll) {
+                    const GTRParameters saved_full_gtr = gtr_params;
+                    Scalar prev_full_null_ll = null_ll;
+                    const int max_full_null_passes = 6;
+                    for (int n_pass = 0; n_pass < max_full_null_passes; ++n_pass) {
+                        gtr_params = null_gtr;
+                        compute_syn_scale();
+                        run_gtr_optimization_with_params(null_gtr, null_alpha, null_omegas, null_weights);
+                        gtr_params = null_gtr;
+                        compute_syn_scale();
+                        run_mixture_refinement_with_params(null_alpha, null_omegas, null_weights, bid, false);
+                        Scalar cur_nll = run_joint_branch_length_lbfgs_with_params(null_alpha, null_omegas, null_weights);
+                        if (cur_nll > null_ll) {
+                            null_ll = cur_nll;
+                        }
+                        if (std::abs(cur_nll - prev_full_null_ll) < 1e-3) {
+                            break;
+                        }
+                        prev_full_null_ll = cur_nll;
+                    }
+                    gtr_params = saved_full_gtr;
+                    compute_syn_scale();
+                }
+
+                // F-080: If null_ll > full_ll + 1e-4, warm-start the full model from the null configuration
+                if (std::isfinite(null_ll) && null_ll > full_ll + 1e-4) {
+                    branch_alpha = null_alpha;
+                    branch_omegas = null_omegas;
+                    branch_weights = null_weights;
                     gtr_params = null_gtr;
                     compute_syn_scale();
-                    run_gtr_optimization_with_params(null_gtr, null_alpha, null_omegas, null_weights);
-                    gtr_params = null_gtr;
-                    compute_syn_scale();
-                    run_mixture_refinement_with_params(null_alpha, null_omegas, null_weights, bid, false);
-                    Scalar cur_nll = run_joint_branch_length_lbfgs_with_params(null_alpha, null_omegas, null_weights);
-                    if (cur_nll > null_ll) {
-                        null_ll = cur_nll;
+
+                    Scalar prev_ws_ll = null_ll;
+                    for (int ws_pass = 0; ws_pass < 4; ++ws_pass) {
+                        run_joint_branch_length_lbfgs();
+                        run_gtr_optimization();
+                        Scalar cur_ws_ll = run_mixture_refinement();
+                        if (std::abs(cur_ws_ll - prev_ws_ll) < 1e-3) break;
+                        prev_ws_ll = cur_ws_ll;
                     }
-                    if (std::abs(cur_nll - prev_full_null_ll) < 1e-3) {
-                        break;
+                    P_branches = compute_all_branch_transition_matrices();
+                    Scalar new_full_ll = compute_tree_log_likelihood(P_branches);
+                    if (new_full_ll > full_ll) {
+                        full_ll = new_full_ll;
+                        full_aicc = compute_aicc(full_ll, current_params);
+                        result.full_adaptive_fit = {full_ll, current_params, full_aicc};
+                        update_full_branch_summaries();
+                        recompute_full_io_cache();
+                        if (p5_restart < 2) {
+                            full_model_improved = true;
+                            break; // Restart Phase 5 so all branches are tested against the improved full model
+                        }
                     }
-                    prev_full_null_ll = cur_nll;
                 }
-                gtr_params = saved_full_gtr;
-                compute_syn_scale();
-            }
 
-            // F-080: If null_ll > full_ll + 1e-4, warm-start the full model from the null configuration
-            if (std::isfinite(null_ll) && null_ll > full_ll + 1e-4) {
-                branch_alpha = null_alpha;
-                branch_omegas = null_omegas;
-                branch_weights = null_weights;
-                gtr_params = null_gtr;
-                compute_syn_scale();
+                const Matrix& V_branch_full = V_full_all[bid];
+                const Matrix& D_branch_full = D_full_all[bid];
 
-                Scalar prev_ws_ll = null_ll;
-                for (int ws_pass = 0; ws_pass < 4; ++ws_pass) {
-                    run_joint_branch_length_lbfgs();
-                    run_gtr_optimization();
-                    Scalar cur_ws_ll = run_mixture_refinement();
-                    if (std::abs(cur_ws_ll - prev_ws_ll) < 1e-3) break;
-                    prev_ws_ll = cur_ws_ll;
-                }
-                P_branches = compute_all_branch_transition_matrices();
-                Scalar new_full_ll = compute_tree_log_likelihood(P_branches);
-                if (new_full_ll > full_ll) {
-                    full_ll = new_full_ll;
-                    full_aicc = compute_aicc(full_ll, current_params);
-                    result.full_adaptive_fit = {full_ll, current_params, full_aicc};
-                    update_full_branch_summaries();
-                    recompute_full_io_cache();
-                }
-            }
-
-            const Matrix& V_branch_full = V_full_all[bid];
-            const Matrix& D_branch_full = D_full_all[bid];
-
-            Scalar lrt = 0.0;
-            if (null_ll <= -1e19 || full_ll <= -1e19 || !std::isfinite(null_ll) || !std::isfinite(full_ll)) {
-                lrt = 0.0;
-                bres.lrt = 0.0;
-                bres.uncorrected_p_value = 1.0;
-            } else {
-                lrt = 2.0 * (full_ll - null_ll);
-                if (lrt <= 0.0) {
+                Scalar lrt = 0.0;
+                if (null_ll <= -1e19 || full_ll <= -1e19 || !std::isfinite(null_ll) || !std::isfinite(full_ll)) {
                     lrt = 0.0;
                     bres.lrt = 0.0;
-                    // F-080: When a tested branch had unconstrained omega_K > 1 and lrt == 0.0, set p_value = 0.5 (matching aBSREL.bf:938)
-                    bres.uncorrected_p_value = 0.5;
+                    bres.uncorrected_p_value = 1.0;
                 } else {
-                    bres.lrt = lrt;
-                    bres.uncorrected_p_value = compute_mixture_p_value(lrt);
-                }
-            }
-
-            // Compute Empirical Bayes Factors per site
-            size_t K = bres.rate_classes;
-            Scalar p_pos = bres.rate_distribution.weights.back();
-            Scalar prior_odds = (p_pos > 0.0 && p_pos < 1.0) ? (p_pos / (1.0 - p_pos)) : 1.0;
-
-            int sites_ebf_count = 0;
-            bres.site_ebf.assign(aln.num_codons, 1.0);
-
-            // Compute pattern EBFs
-            std::vector<Scalar> pattern_ebf(num_patterns, 1.0);
-            Scalar alpha = branch_alpha[bid];
-            std::vector<Matrix> P_comps(K);
-            for (size_t k = 0; k < K; ++k) {
-                MG94Matrix mat = build_q_matrix(bres.rate_distribution.rates[k]);
-                P_comps[k] = mat.transition_matrix(alpha);
-            }
-
-            for (size_t p = 0; p < num_patterns; ++p) {
-                std::vector<Scalar> comp_L(K);
-                Scalar denom = 0.0;
-                for (size_t k = 0; k < K; ++k) {
-                    Scalar L_k = V_branch_full.col(p).dot(P_comps[k] * D_branch_full.col(p));
-                    comp_L[k] = bres.rate_distribution.weights[k] * L_k;
-                    denom += comp_L[k];
-                }
-                if (denom > 1e-300 && p_pos < 1.0) {
-                    Scalar post_pos = comp_L.back() / denom;
-                    if (post_pos < 1.0) {
-                        Scalar post_odds = post_pos / (1.0 - post_pos);
-                        pattern_ebf[p] = post_odds / prior_odds;
+                    lrt = 2.0 * (full_ll - null_ll);
+                    if (lrt <= 0.0) {
+                        lrt = 0.0;
+                        bres.lrt = 0.0;
+                        // F-080: When a tested branch had unconstrained omega_K > 1 and lrt == 0.0, set p_value = 0.5 (matching aBSREL.bf:938)
+                        bres.uncorrected_p_value = 0.5;
                     } else {
-                        pattern_ebf[p] = 1e6;
+                        bres.lrt = lrt;
+                        bres.uncorrected_p_value = compute_mixture_p_value(lrt);
                     }
                 }
-            }
 
-            // Map pattern EBF to site EBF
-            for (size_t s = 0; s < aln.num_codons; ++s) {
-                size_t p = aln.site_to_pattern[s];
-                Scalar ebf = pattern_ebf[p];
-                bres.site_ebf[s] = ebf;
-                if (ebf >= 100.0) {
-                    sites_ebf_count++;
+                // Compute Empirical Bayes Factors per site
+                size_t K = bres.rate_classes;
+                Scalar p_pos = bres.rate_distribution.weights.back();
+                Scalar prior_odds = (p_pos > 0.0 && p_pos < 1.0) ? (p_pos / (1.0 - p_pos)) : 1.0;
+
+                int sites_ebf_count = 0;
+                bres.site_ebf.assign(aln.num_codons, 1.0);
+
+                // Compute pattern EBFs
+                std::vector<Scalar> pattern_ebf(num_patterns, 1.0);
+                Scalar alpha = branch_alpha[bid];
+                std::vector<Matrix> P_comps(K);
+                for (size_t k = 0; k < K; ++k) {
+                    MG94Matrix mat = build_q_matrix(bres.rate_distribution.rates[k]);
+                    P_comps[k] = mat.transition_matrix(alpha);
+                }
+
+                for (size_t p = 0; p < num_patterns; ++p) {
+                    std::vector<Scalar> comp_L(K);
+                    Scalar denom = 0.0;
+                    for (size_t k = 0; k < K; ++k) {
+                        Scalar L_k = V_branch_full.col(p).dot(P_comps[k] * D_branch_full.col(p));
+                        comp_L[k] = bres.rate_distribution.weights[k] * L_k;
+                        denom += comp_L[k];
+                    }
+                    if (denom > 1e-300 && p_pos < 1.0) {
+                        Scalar post_pos = comp_L.back() / denom;
+                        Scalar one_minus_post = std::max<Scalar>(1e-300, 1.0 - post_pos);
+                        Scalar post_odds = post_pos / one_minus_post;
+                        pattern_ebf[p] = post_odds / prior_odds;
+                    }
+                }
+
+                // Map pattern EBF to site EBF
+                for (size_t s = 0; s < aln.num_codons; ++s) {
+                    size_t p = aln.site_to_pattern[s];
+                    Scalar ebf = pattern_ebf[p];
+                    bres.site_ebf[s] = ebf;
+                    if (ebf >= 100.0) {
+                        sites_ebf_count++;
+                    }
+                }
+                bres.sites_ebf_100 = sites_ebf_count;
+
+                if (bres.uncorrected_p_value <= settings.p_threshold) {
+                    cand_pos_count.fetch_add(1, std::memory_order_relaxed);
+                }
+                if (pbar_p5 && p5_restart == 0) {
+                    size_t cpos = cand_pos_count.load(std::memory_order_relaxed);
+                    if (cpos > 0) {
+                        pbar_p5->set_status("\033[1;32m+" + std::to_string(cpos) + "\033[0m candidate positive (" + bname + ")");
+                    } else {
+                        pbar_p5->set_status(bname);
+                    }
+                    pbar_p5->tick();
+                }
+
+                t_idx++;
+                if (progress_cb && p5_restart == 0) {
+                    double frac = 0.80 + 0.15 * (static_cast<double>(t_idx) / static_cast<double>(to_test.size()));
+                    progress_cb("Phase 5: Hypothesis Testing (" + bname + ": p=" + std::to_string(bres.uncorrected_p_value).substr(0, 6) + ")", frac);
                 }
             }
-            bres.sites_ebf_100 = sites_ebf_count;
-
-            if (bres.uncorrected_p_value <= settings.p_threshold) {
-                cand_pos_count.fetch_add(1, std::memory_order_relaxed);
-            }
-            if (pbar_p5) {
-                size_t cpos = cand_pos_count.load(std::memory_order_relaxed);
-                if (cpos > 0) {
-                    pbar_p5->set_status("\033[1;32m+" + std::to_string(cpos) + "\033[0m candidate positive (" + bname + ")");
-                } else {
-                    pbar_p5->set_status(bname);
-                }
-                pbar_p5->tick();
-            }
-
-            t_idx++;
-            if (progress_cb) {
-                double frac = 0.80 + 0.15 * (static_cast<double>(t_idx) / static_cast<double>(to_test.size()));
-                progress_cb("Phase 5: Hypothesis Testing (" + bname + ": p=" + std::to_string(bres.uncorrected_p_value).substr(0, 6) + ")", frac);
-            }
+            if (!full_model_improved) break;
         }
 
         // Phase 6: Holm-Bonferroni correction

@@ -864,6 +864,9 @@ public:
         res.params.alpha = 1.0;
         res.params.beta = opt_pt.a;
 
+        // Note (F-067): res.tree stores branch lengths scaled by s in nucleotide GTR units
+        // (before the 3 / Q_scale codon-unit conversion applied by downstream analyzers'
+        // prepare_branch_lengths() or fit_full_model()).
         res.tree = tree;
         for (auto& node : res.tree.nodes) {
             if (node.id != res.tree.root_id) {
@@ -915,7 +918,7 @@ public:
         size_t B = branch_node_ids.size();
         size_t num_nodes = cur_tree.num_nodes();
 
-        if (max_iters <= 40) {
+        if (max_iters <= 100) {
             max_iters = std::max<int>(max_iters, std::min<int>(500, 5 * static_cast<int>(B) + 60));
         }
 

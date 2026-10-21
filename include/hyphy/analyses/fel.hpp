@@ -158,10 +158,18 @@ public:
         base_p.theta_CT = gtr_res.params.theta_CT;
         base_p.theta_GT = gtr_res.params.theta_GT;
 
+        auto sel = gtr_res.tree.select_branches(
+            settings.test_branches,
+            settings.test_branch_regex,
+            settings.test_branch_names,
+            true
+        );
+
         MG94Fitter mg_fitter(gtr_res.tree, aln);
         FitResult mg_res;
         if (settings.full_model) {
-            mg_res = mg_fitter.fit_full_model(1.0, base_p, progress_cb);
+            const std::vector<bool>* p_sel = (sel.num_selected > 0 && sel.num_unselected > 0) ? &sel.is_selected : nullptr;
+            mg_res = mg_fitter.fit_full_model(1.0, base_p, progress_cb, 250, 1e-5, p_sel);
             base_p = mg_res.params;
         } else {
             mg_res = mg_fitter.fit_omega_and_scale(1.0, base_p);
@@ -171,7 +179,7 @@ public:
 
         FELAnalyzer analyzer(mg_res.tree, std::move(aln), base_p, settings);
         analyzer.global_log_l = mg_res.log_likelihood;
-        size_t K_mg = 5 + 1 + (mg_res.tree.num_nodes() - 1);
+        size_t K_mg = 5 + ((sel.num_selected > 0 && sel.num_unselected > 0) ? 2 : 1) + (mg_res.tree.num_nodes() - 1);
         size_t N_codons = analyzer.aln.num_codons;
         analyzer.global_aicc = -2.0 * mg_res.log_likelihood + 2.0 * K_mg * N_codons / (N_codons - K_mg - 1.0);
 
@@ -263,17 +271,7 @@ public:
 
             if (node.is_leaf) {
                 size_t t_idx = leaf_to_taxon[node_id];
-                if (t_idx != static_cast<size_t>(-1)) {
-                    int8_t state = pattern.states[t_idx];
-                    if (state >= 0 && state < S) {
-                        node_L[node_id].setZero();
-                        node_L[node_id](state) = 1.0;
-                    } else {
-                        node_L[node_id].setOnes();
-                    }
-                } else {
-                    node_L[node_id].setOnes();
-                }
+                LikelihoodEngine::init_leaf_likelihood(pattern, t_idx, S, node_L[node_id]);
                 node_log_scale[node_id] = 0.0;
             } else {
                 double child_scale_sum = 0.0;

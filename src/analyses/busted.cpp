@@ -293,6 +293,13 @@ nlohmann::json BUSTEDAnalyzer::to_legacy_json(const BUSTEDResult& res) const {
             }
             j["Evidence Ratios"]["3H"] = er_3h;
         }
+        if (!res.branch_er_23h.empty()) {
+            nlohmann::json er_23h = nlohmann::json::object();
+            for (const auto& [bname, vec] : res.branch_er_23h) {
+                er_23h[bname] = vec;
+            }
+            j["Evidence Ratios"]["2H+3H"] = er_23h;
+        }
         if (res.settings.error_sink) {
             j["Evidence Ratios"]["error_sink_max_bf"] = {res.site_error_bfs};
         }
@@ -724,10 +731,11 @@ nlohmann::json BUSTEDAnalyzer::to_modern_json(const BUSTEDResult& res, const Pro
             }
             j["branch_site_posteriors"] = std::move(b_post);
         }
-        if (!res.branch_er_2h.empty() || !res.branch_er_3h.empty()) {
+        if (!res.branch_er_2h.empty() || !res.branch_er_3h.empty() || !res.branch_er_23h.empty()) {
             nlohmann::json mh_er = nlohmann::json::object();
             if (!res.branch_er_2h.empty()) mh_er["2H"] = res.branch_er_2h;
             if (!res.branch_er_3h.empty()) mh_er["3H"] = res.branch_er_3h;
+            if (!res.branch_er_23h.empty()) mh_er["2H+3H"] = res.branch_er_23h;
             j["multiple_hit_branch_evidence_ratios"] = std::move(mh_er);
         }
 

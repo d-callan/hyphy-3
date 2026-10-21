@@ -42,7 +42,7 @@ static void print_usage(const char* prog) {
               << "  " << Console::brand("--posterior, -p") << " <float>  Posterior probability cutoff for selection calls (default: 0.90)\n"
               << "  " << Console::brand("--non-zero") << "               Enforce non-zero synonymous rates (min 1e-3)\n"
               << "  " << Console::brand("--tree-scaling") << " <mode>    Tree scaling mode: 'grid' (default, HyPhy 2.5 standard) or 'mg94'\n"
-              << "  " << Console::brand("--chains") << " <N>             Number of MCMC chains for MCMC methods (default: 1)\n"
+              << "  " << Console::brand("--chains") << " <N>             Number of MCMC chains for MCMC methods (default: 5)\n"
               << "  " << Console::brand("--chain-length") << " <N>       MCMC chain length (default: 2000000)\n"
               << "  " << Console::brand("--burn-in") << " <N>            MCMC burn-in steps (default: 1000000)\n"
               << "  " << Console::brand("--samples") << " <N>            MCMC samples to draw (default: 100)\n"

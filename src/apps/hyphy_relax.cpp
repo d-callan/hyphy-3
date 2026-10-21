@@ -240,8 +240,6 @@ int run_relax(int argc, char* argv[]) {
         {"Total Execution Time", time_ss.str()}
     };
 
-    Panel::print_summary_card("RELAX Selection Relaxation Analysis Summary", sum_items, conclusion, res.is_significant);
-
     auto end_time = std::chrono::high_resolution_clock::now();
     double total_runtime = std::chrono::duration<double>(end_time - start_time).count();
 
@@ -277,6 +275,7 @@ int run_relax(int argc, char* argv[]) {
         return 1;
     }
 
+    Panel::print_summary_card("RELAX Selection Relaxation Analysis Summary", sum_items, conclusion, res.is_significant);
     return 0;
 }
 

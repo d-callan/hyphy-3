@@ -219,7 +219,11 @@ TEST_CASE("BUSTED-E: Saturation Error Sink (Option A) Quarantines Misalignment A
     std::string nwk = "((T1:0.002,T2:0.002)N1:0.05,(T3:0.04,T4:0.04)N2:0.05,(T5:0.04,T6:0.04)N3:0.05);";
     auto tree = Tree::from_newick(nwk);
 
-    // Base ancestral sequence of 300 4-fold degenerate codons (GCT=Ala, GTT=Val, CCT=Pro, GGT=Gly)
+    // Base ancestral sequence of 300 4-fold degenerate codons (GCT=Ala, GTT=Val, CCT=Pro, GGT=Gly).
+    // Note: 300 codons (298 invariant codons between sister tips T1 and T2) are required so that under
+    // converged Constrained Null branch-length optimization (F-001, F-005, F-007, F-067), the Null model
+    // cannot freely stretch terminal branch T1 to absorb the two 3-nt errors without paying a large
+    // synonymous survival penalty across the invariant sites, ensuring the true MLE LRT of Standard BUSTED has p < 0.05.
     std::vector<std::string> base_codons(300);
     for (size_t s = 0; s < 300; ++s) {
         if (s % 4 == 0) base_codons[s] = "GCT";
@@ -276,11 +280,7 @@ TEST_CASE("BUSTED-E: Saturation Error Sink (Option A) Quarantines Misalignment A
 
     std::cout << "\n[BUSTED vs BUSTED-E on Corrupted Purifying Alignment]\n"
               << "  Standard BUSTED : LRT = " << res_std.lrt << ", p = " << res_std.p_value
-              << ", omega_3 = " << res_std.unconstrained.test_distribution.omegas.back()
-              << ", is_failed = " << res_std.is_failed
-              << ", unc_ll = " << res_std.unconstrained.log_likelihood
-              << ", con_ll = " << res_std.constrained.log_likelihood << "\n"
-              << "  error_message: " << res_std.error_message << "\n"
+              << ", omega_3 = " << res_std.unconstrained.test_distribution.omegas.back() << "\n"
               << "  BUSTED-E (Sink) : LRT = " << res_sink.lrt << ", p = " << res_sink.p_value
               << ", omega_3 = " << res_sink.unconstrained.test_distribution.omegas.back()
               << ", eps_sink = " << res_sink.unconstrained.error_sink_weight

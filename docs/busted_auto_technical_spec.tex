@@ -99,7 +99,7 @@ In each Expectation-Maximization (EM) step, the maximum-likelihood update for $\
     \epsilon_{\text{sink}}^{\text{new}} = \text{clip}\left( \frac{1}{B_{\text{test}} C} \sum_{b \in \mathcal{B}_{\text{test}}} \sum_{p=1}^P w_p r_{b,p}^{\text{sink}}, \; 10^{-7}, \; \epsilon_{\max} \right).
     \label{eq:em_eps}
 \end{equation}
-To prevent the biological positive-selection rate class $\omega_K$ from degenerating into an infinite-rate saturation kernel ($\omega_K = 10000$) on short branches and competing with $\bm{P}_{\text{sink}}$, \textsc{HyPhy}~3 caps the biological rate at $\omega_K \le 100.0$ whenever \texttt{--error-sink} is active. Any instantaneous saturation jump or multi-codon misalignment tract (detected via a 2-state Markov HMM along adjacent codons on branch $b$ with $\rho_{\text{stay}} = 0.80$ and sink-quarantined branch lengths) is therefore routed into $\bm{P}_{\text{sink}}$ under both the Alternative and Null models.
+To prevent the biological positive-selection rate class $\omega_K$ from degenerating into an infinite-rate saturation kernel ($\omega_K = 10000$) on short branches and competing with $\bm{P}_{\text{sink}}$, \textsc{HyPhy}~3 caps the biological rate at $\omega_K \le 100.0$ whenever \texttt{--error-sink} is active. Any instantaneous saturation jump on a short branch is therefore routed into $\bm{P}_{\text{sink}}$ under both the Alternative and Null models while preserving exact, unweighted codon site log-likelihoods.
 
 For each branch-site $(b, s)$, \textsc{HyPhy}~3 reports the posterior error probability $r_{b,s}^{\text{sink}}$ and the Empirical Bayes Factor:
 \begin{equation}
@@ -117,14 +117,14 @@ At every tested branch $b$ and site $s$ (with pattern $p(s)$), Gate 1 computes t
 \begin{equation}
     \Delta I_{b,s}^{\text{sink}} = \log_2 \left( \frac{L_{b,p(s)}^{\text{sink}}}{L_{b,p(s)}^{\text{bio}}} \right) \quad \text{bits}.
 \end{equation}
-Under a well-specified single-hit biological model, $\Delta I_{b,s}^{\text{sink}} < 0$ at conserved sites and rarely exceeds $8$ bits at rapidly evolving sites. A 2-nt or 3-nt misalignment on a branch of length $t_b = 0.002$ has $L_{b,s}^{\text{bio}} \propto t_b^2$ or $t_b^3$, yielding $\Delta I_{b,s}^{\text{sink}} \in [14, 35]$ bits. Gate 1 also counts spatially adjacent outlier pairs on the same branch:
+Under a well-specified single-hit biological model, $\Delta I_{b,s}^{\text{sink}} < 0$ at conserved sites and rarely exceeds $8$ bits at rapidly evolving sites. A 2-nt or 3-nt misalignment on a branch of length $t_b = 0.002$ has $L_{b,s}^{\text{bio}} \propto t_b^2$ or $t_b^3$, yielding $\Delta I_{b,s}^{\text{sink}} \in [13, 35]$ bits. Gate 1 also counts spatially adjacent outlier pairs on the same branch:
 \begin{equation}
-    N_{\text{adj}} = \sum_{b \in \mathcal{B}_{\text{test}}} \sum_{s=1}^{C-1} \mathbb{I}\left(\Delta I_{b,s}^{\text{sink}} > 6.5 \text{ and } \Delta I_{b,s+1}^{\text{sink}} > 6.5\right),
+    N_{\text{adj}} = \sum_{b \in \mathcal{B}_{\text{test}}} \sum_{s=1}^{C-1} \mathbb{I}\left(\Delta I_{b,s}^{\text{sink}} > 8.0 \text{ and } \Delta I_{b,s+1}^{\text{sink}} > 8.0\right),
 \end{equation}
 which detects multi-codon indels and local frameshifts.
 \begin{itemize}[nosep]
-    \item \textbf{Screening rule:} If $\max_{b,s} \Delta I_{b,s}^{\text{sink}} \le 11.5$ bits and $N_{\text{adj}} = 0$, the alignment has no saturation anomalies; \texttt{--error-sink} is turned \textbf{OFF} ($\epsilon_{\text{sink}} = 0$) in zero extra tree passes.
-    \item \textbf{Confirmation probe:} Otherwise, Gate 1 evaluates $\epsilon_{\text{sink}} \in \{0.001, 0.003, 0.008\}$ followed by an EM update and activates \texttt{--error-sink} if and only if $\Delta \ell_{\text{sink}} > 2.2$ and either $\max_{b,s} \Delta I_{b,s}^{\text{sink}} \ge 14.0$ bits or ($N_{\text{adj}} \ge 1$ and $\max_{b,s} \Delta I_{b,s}^{\text{sink}} \ge 11.5$ bits).
+    \item \textbf{Screening rule:} If $\max_{b,s} \Delta I_{b,s}^{\text{sink}} \le 13.0$ bits and $N_{\text{adj}} = 0$, the alignment has no saturation anomalies; \texttt{--error-sink} is turned \textbf{OFF} ($\epsilon_{\text{sink}} = 0$) in zero extra tree passes.
+    \item \textbf{Confirmation probe:} Otherwise, Gate 1 evaluates $\epsilon_{\text{sink}} \in \{0.001, 0.003, 0.008\}$ followed by an EM update and activates \texttt{--error-sink} if and only if $\Delta \ell_{\text{sink}} > 2.2$ and either $\max_{b,s} \Delta I_{b,s}^{\text{sink}} \ge 13.0$ bits or ($N_{\text{adj}} \ge 1$ and $\max_{b,s} \Delta I_{b,s}^{\text{sink}} \ge 8.0$ bits).
 \end{itemize}
 
 \subsection{Gate 2: Error-Quarantined Multi-Hit Score Test ($\delta, \psi$)}

@@ -348,14 +348,13 @@ public:
                             return (*P_bridges)[static_cast<size_t>(b_idx)][r];
                         }
                         int32_t bid = wb.bridge_node_id;
-                        if (r == 0 && bid >= 0 && bid != nid && static_cast<size_t>(bid) < P_branches.size() &&
+                        if (bid >= 0 && bid != nid && static_cast<size_t>(bid) < P_branches.size() &&
                             P_branches[bid].rows() == S) {
                             return P_branches[bid];
                         }
-                        int32_t cid = wb.children[r % 3];
-                        if (cid >= 0 && static_cast<size_t>(cid) < P_branches.size() &&
-                            P_branches[cid].rows() == S) {
-                            return P_branches[cid];
+                        if (nid >= 0 && static_cast<size_t>(nid) < P_branches.size() &&
+                            P_branches[nid].rows() == S) {
+                            return P_branches[nid];
                         }
                         return P_branches[id_A];
                     };
@@ -501,14 +500,13 @@ public:
                             return (*P_bridges)[static_cast<size_t>(b_idx)][r];
                         }
                         int32_t bid = wb.bridge_node_id;
-                        if (r == 0 && bid >= 0 && bid != nid && static_cast<size_t>(bid) < P_branches.size() &&
+                        if (bid >= 0 && bid != nid && static_cast<size_t>(bid) < P_branches.size() &&
                             P_branches[bid].rows() == S) {
                             return P_branches[bid];
                         }
-                        int32_t cid = wb.children[r % 3];
-                        if (cid >= 0 && static_cast<size_t>(cid) < P_branches.size() &&
-                            P_branches[cid].rows() == S) {
-                            return P_branches[cid];
+                        if (nid >= 0 && static_cast<size_t>(nid) < P_branches.size() &&
+                            P_branches[nid].rows() == S) {
+                            return P_branches[nid];
                         }
                         return P_branches[id_A];
                     };

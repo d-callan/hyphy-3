@@ -482,14 +482,14 @@ public:
                     std::vector<Vector4> node_L(n_nodes);
                     std::vector<double> node_log_scale(n_nodes, 0.0);
                     std::vector<Vector4> P_D(n_nodes);
-                    std::vector<double> B(n_nodes, 1.0);
+                    std::vector<int> boost_counts(n_nodes, 0);
                     std::vector<Vector4> U(n_nodes, Vector4::Zero());
                     std::vector<Vector4> V(n_nodes, Vector4::Zero());
 
                     Scalar local_ll = 0.0;
                     std::vector<Scalar> local_dL(n_nodes, 0.0);
 
-                    #pragma omp for schedule(dynamic)
+                    #pragma omp for schedule(static)
                     for (size_t p = 0; p < n_pat; ++p) {
                         const auto& pattern = aln_ref.patterns[p];
 
@@ -508,18 +508,18 @@ public:
                                     }
                                 } else {
                                     node_L[nid].setOnes();
-                                }
+                                                                }
                                 node_log_scale[nid] = 0.0;
-                                B[nid] = 1.0;
+                                boost_counts[nid] = 0;
                             } else {
                                 double child_scale_sum = 0.0;
                                 for (int32_t cid : node.children) {
                                     P_D[cid] = P_b[cid] * node_L[cid];
                                 }
-                                double boost_mult = 1.0;
+                                int boost_cnt = 0;
                                 const std::vector<std::array<Matrix4, 3>>* no_bridges = nullptr;
-                                tree_ref.eval_internal_node(nid, P_b, node_L, node_log_scale, node_L[nid], child_scale_sum, no_bridges, &boost_mult);
-                                B[nid] = boost_mult;
+                                tree_ref.eval_internal_node(nid, P_b, node_L, node_log_scale, node_L[nid], child_scale_sum, no_bridges, nullptr, &boost_cnt);
+                                boost_counts[nid] = boost_cnt;
                                 node_log_scale[nid] = child_scale_sum;
                             }
                         }
@@ -536,16 +536,34 @@ public:
                                 const auto& node = tree_ref.nodes[uid];
                                 if (node.is_leaf) continue;
 
+                                const double SCALER_THRESH = 1e-150;
+                                const double SCALER_UP = 1e150;
+                                const double SCALER_DOWN = 1e-150;
                                 size_t num_children = node.children.size();
                                 for (size_t i = 0; i < num_children; ++i) {
                                     int32_t vid = node.children[i];
                                     Vector4 v_msg = U[uid];
+                                    int sib_boost = 0;
                                     for (size_t j = 0; j < num_children; ++j) {
                                         if (i != j) {
                                             v_msg.array() *= P_D[node.children[j]].array();
+                                            double cur_max = v_msg.maxCoeff();
+                                            while (cur_max < SCALER_THRESH && cur_max > 0.0) {
+                                                v_msg *= SCALER_UP;
+                                                cur_max *= SCALER_UP;
+                                                sib_boost++;
+                                            }
                                         }
                                     }
-                                    v_msg *= B[uid];
+                                    int net_boost = boost_counts[uid] - sib_boost;
+                                    while (net_boost > 0) {
+                                        v_msg *= SCALER_UP;
+                                        net_boost--;
+                                    }
+                                    while (net_boost < 0) {
+                                        v_msg *= SCALER_DOWN;
+                                        net_boost++;
+                                    }
                                     V[vid] = v_msg;
                                     U[vid] = P_b[vid].transpose() * v_msg;
 
@@ -722,7 +740,7 @@ public:
         std::vector<Vector4> V_all(num_nodes);
         std::vector<double> node_log_scale(num_nodes, 0.0);
         std::vector<Vector4> P_D(num_nodes);
-        std::vector<double> B(num_nodes, 1.0);
+        std::vector<int> boost_counts(num_nodes, 0);
 
         for (int32_t poly_id : polytomies) {
             const std::vector<int32_t> p_children = tree.nodes[poly_id].children;
@@ -753,16 +771,16 @@ public:
                             D_all[nid].setOnes();
                         }
                         node_log_scale[nid] = 0.0;
-                        B[nid] = 1.0;
+                        boost_counts[nid] = 0;
                     } else {
                         double child_scale_sum = 0.0;
                         for (int32_t cid : node.children) {
                             P_D[cid] = P_b[cid] * D_all[cid];
                         }
-                        double boost_mult = 1.0;
+                        int boost_cnt = 0;
                         const std::vector<std::array<Matrix4, 3>>* no_bridges = nullptr;
-                        tree.eval_internal_node(nid, P_b, D_all, node_log_scale, D_all[nid], child_scale_sum, no_bridges, &boost_mult);
-                        B[nid] = boost_mult;
+                        tree.eval_internal_node(nid, P_b, D_all, node_log_scale, D_all[nid], child_scale_sum, no_bridges, nullptr, &boost_cnt);
+                        boost_counts[nid] = boost_cnt;
                         node_log_scale[nid] = child_scale_sum;
                     }
                 }
@@ -772,6 +790,9 @@ public:
                 Scalar inv_L = pattern.weight / pat_l;
 
                 // Outside pass
+                const double SCALER_THRESH = 1e-150;
+                const double SCALER_UP = 1e150;
+                const double SCALER_DOWN = 1e-150;
                 std::vector<Vector4> U(num_nodes, Vector4::Zero());
                 U[tree.root_id] = gtr.pi;
                 for (auto it = tree.post_order.rbegin(); it != tree.post_order.rend(); ++it) {
@@ -783,12 +804,27 @@ public:
                     for (size_t i = 0; i < num_children; ++i) {
                         int32_t vid = node.children[i];
                         Vector4 v_msg = U[uid];
+                        int sib_boost = 0;
                         for (size_t j = 0; j < num_children; ++j) {
                             if (i != j) {
                                 v_msg.array() *= P_D[node.children[j]].array();
+                                double cur_max = v_msg.maxCoeff();
+                                while (cur_max < SCALER_THRESH && cur_max > 0.0) {
+                                    v_msg *= SCALER_UP;
+                                    cur_max *= SCALER_UP;
+                                    sib_boost++;
+                                }
                             }
                         }
-                        v_msg *= B[uid];
+                        int net_boost = boost_counts[uid] - sib_boost;
+                        while (net_boost > 0) {
+                            v_msg *= SCALER_UP;
+                            net_boost--;
+                        }
+                        while (net_boost < 0) {
+                            v_msg *= SCALER_DOWN;
+                            net_boost++;
+                        }
                         V_all[vid] = v_msg;
                         U[vid] = P_b[vid].transpose() * v_msg;
                     }
@@ -852,7 +888,7 @@ public:
                 V_all.resize(num_nodes, Vector4::Zero());
                 node_log_scale.resize(num_nodes, 0.0);
                 P_D.resize(num_nodes, Vector4::Zero());
-                B.resize(num_nodes, 1.0);
+                boost_counts.resize(num_nodes, 0);
                 leaf_to_taxon.resize(num_nodes, static_cast<size_t>(-1));
                 tree.compute_post_order();
 

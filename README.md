@@ -184,7 +184,7 @@ This allows joint L-BFGS optimization across all branch lengths simultaneously i
 | **Full aBSREL Analysis** | β-globin (17 taxa, 144 codons) | 48.0 s (ln L = -3631.58) | **25.7 s** (ln L = -3633.51) | **1.87×** (|Δ ln L| ≤ 1.9) |
 | **Full RELAX Analysis** | Fig4E (33 taxa, 286 codons) | 13.3 s (ln L = -4982.98) | **14.5 s** (ln L = -4957.65)¹ | **0.9×** (K = 0.000 in both; LRT 123.4 vs 119.6) |
 
-¹ Fig4E contains 49 partially-resolved codons (e.g. `AC-`) that hyphy-3 currently encodes as fully missing, whereas HyPhy 2.5 sums over the compatible codons; this raises hyphy-3's absolute codon ln L by ~25 on this alignment only. With those codons masked to `---`, the two agree (MG94 -4959.72 vs -4959.77, RELAX null -5017.29 vs -5017.42). Both timings: HyPhy 2.5.101 and hyphy-3, default threads, same machine.
+¹ Fig4E contains 49 partially-resolved codons (e.g. `AC-`); both HyPhy 2.5 and hyphy-3 resolve partial/IUPAC codons by summing over all compatible sense codons (prior benchmark numbers were recorded before IUPAC/partial-codon mask resolution was unified across all site and branch-site likelihood engines). Both timings: HyPhy 2.5.101 and hyphy-3, default threads, same machine.
 
 ---
 
@@ -198,7 +198,7 @@ This allows joint L-BFGS optimization across all branch lengths simultaneously i
 | **Contrast-FEL** | Do selective pressures differ across designated branch sets? | Site-level multi-group | Empirical Bayes Ridge Likelihood, LRT | Group-specific β | — | 100% Verified |
 | **FUBAR** | Which sites are under selection via fast Bayesian approximation? | Site-level (dN ≷ dS) | Bivariate (α, β) rate grid, VB0 / Gibbs | Bivariate 20x20 grid | — | 100% Verified |
 | **PRIME** | Which biophysical amino acid properties are under selection? | Site-level & Property | Variance-stabilized biophysical model, L₂ Ridge | Site α, β, λ | — | 100% Verified |
-| **MEME** | Which codon sites are under episodic selection? | Site-level & Lineage | 2-rate mixture, ½ χ²₀ + ½ χ²₂ LRT | Site mixture | — | 100% Verified |
+| **MEME** | Which codon sites are under episodic selection? | Site-level & Lineage | 2-rate mixture, 0.333 χ²₀ + 0.300 χ²₁ + 0.367 χ²₂ LRT | Site mixture | — | 100% Verified |
 | **BUSTED** | Has the gene evolved under episodic selection? | Gene-wide (all branches) | 3-category ω mixture, ½ χ²₀ + ½ χ²₂ | Site mixture | Optional | 100% Verified |
 | **BUSTED-S** | Gene-wide selection robust to synonymous variation? | Gene-wide with SRV | Discrete site-to-site α and ω mixture | Site α & ω | Optional | 100% Verified |
 | **BUSTED-MH** | Gene-wide selection accounting for multi-nucleotide hits? | Gene-wide with MH | Reversible 1-hit, 2-hit (δ), 3-hit (ψ) generator | Site α & ω | Double, Double+Triple | 100% Verified |
@@ -206,7 +206,7 @@ This allows joint L-BFGS optimization across all branch lengths simultaneously i
 | **BUSTED-PH** | Is episodic positive selection specifically associated with a phenotype/trait? | Phenotype-associated (3-way branch partition) | 4-model workflow, Union-Intersection Test ($\max(p_{FG}, p_{\text{diff}}) \le \alpha$) + $\text{AIC}_c$ BG neutrality | Separate FG, BG & Unclassified $\omega$ | Optional | 100% Verified |
 | **BUSTED-Auto** | Principled automatic selection of Sink, MH, SRV, and K? | Gene-wide Full-Auto | 4-Gate Surprisal & Score Model Selector | Auto-selected | Auto-selected | 100% Verified |
 | **aBSREL** | Which specific lineages/branches evolved under selection? | Lineage-specific | Adaptive complexity selection (AICc Step-Up) | Branch-site ω | — | |Δ ln L| < 2.0 |
-| **RELAX** | Has selection relaxed (K < 1) or intensified (K > 1) on test branches? | Branch-set contrast | 3-rate mixture with exponent K, χ²₁ LRT | Branch-site mixture (BS-REL) | — | |Δ ln L| ≤ 2.6 (CD2, adh)¹ |
+| **RELAX** | Has selection relaxed (K < 1) or intensified (K < 1) on test branches? | Branch-set contrast | 3-rate mixture with exponent K, χ²₁ LRT | Branch-site mixture (BS-REL) | — | |Δ ln L| ≤ 2.6 (CD2, adh)¹ |
 | **GTR / MG94** | What are baseline nucleotide biases & global dN/dS? | Alignment-wide | Reversible CTMC with F3x4 equilibrium | Global ω | Supported | 100% Verified |
 | **GARD** | Where are recombination breakpoints located? | Recombination & Topology | Segmented GTR + Neighbor-Joining, AICc selection | Independent segment rates | — | 100% Verified |
 | **SLAC** | Are individual sites undergoing selection using counting methods? | Site-level (dN ≷ dS) | Joint ML Ancestral Reconstruction, exact Binomial test | None | — | 100% Verified |
@@ -234,7 +234,7 @@ This allows joint L-BFGS optimization across all branch lengths simultaneously i
      - Fraction p⁻ of branches evolve with rate β⁻ under constraint β⁻ ≤ α.
      - Fraction p⁺ = 1 - p⁻ of branches evolve with unrestricted rate β⁺ (can exceed α).
   2. Maximizes profile mixture likelihood over (α, β⁻, β⁺, p⁺).
-  3. Compares alternative fit against constrained null (β⁺ ≤ α, effectively β⁺ = α) using asymptotic mixture distribution ½ χ²₀ + ½ χ²₂.
+  3. Compares alternative fit against constrained null (β⁺ ≤ α, effectively β⁺ = α) using HyPhy's calibrated mixture distribution 0.333 χ²₀ + 0.300 χ²₁ + 0.367 χ²₂.
   4. Calculates branch-level **Empirical Bayes Factors (EBF)** to determine which individual phylogenetic branches are experiencing positive selection at each site.
 - **Outputs**: Site-level LRTs, p-values, branch attribution lists, EBF matrices, and Datamonkey JSON export.
 

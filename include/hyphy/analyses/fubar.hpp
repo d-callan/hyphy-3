@@ -690,7 +690,7 @@ public:
                         sum_b += draw_b;
                         sum_p_neg += draw_neg;
                         sum_p_pos += draw_pos;
-                        chain_trace[c].push_back(draw_b - draw_a);
+                        chain_trace[c].push_back(draw_pos);
                         total_draws++;
                     }
                 }
@@ -754,8 +754,9 @@ public:
         return res;
     }
 
-    // Compute Gelman-Rubin PSRF (R-hat) and Effective Sample Size (N_eff) across chains (or split-chain if 1 chain)
+    // Compute Gelman-Rubin PSRF (R-hat) and Effective Sample Size (N_eff) across chains
     static std::pair<Scalar, Scalar> compute_psrf_and_neff(const std::vector<std::vector<Scalar>>& raw_chains) {
+        const bool single_chain_input = (raw_chains.size() <= 1);
         std::vector<std::vector<Scalar>> chains;
         if (raw_chains.size() == 1 && raw_chains[0].size() >= 4) {
             size_t half = raw_chains[0].size() / 2;
@@ -768,10 +769,10 @@ public:
         }
 
         size_t M = chains.size();
-        if (M == 0) return {1.0, 0.0};
+        if (M == 0) return {0.0, 0.0};
         size_t N = chains[0].size();
         for (const auto& ch : chains) N = std::min(N, ch.size());
-        if (N < 2) return {1.0, static_cast<Scalar>(M * N)};
+        if (N < 2) return {0.0, static_cast<Scalar>(M * N)};
 
         std::vector<Scalar> chain_means(M, 0.0);
         std::vector<Scalar> chain_vars(M, 0.0);
@@ -808,30 +809,36 @@ public:
 
         Scalar total_draws = static_cast<Scalar>(M * N);
         if (W <= 1e-16) {
-            return {1.0, total_draws};
+            return {single_chain_input ? 0.0 : 1.0, total_draws};
         }
 
         Scalar var_hat = ((static_cast<Scalar>(N - 1)) / static_cast<Scalar>(N)) * W + (B / static_cast<Scalar>(N));
-        Scalar psrf = (M > 1) ? std::sqrt(std::max<Scalar>(1.0, var_hat / W)) : 1.0;
+        Scalar psrf = (!single_chain_input && M > 1) ? std::sqrt(std::max<Scalar>(1.0, var_hat / W)) : 0.0;
 
-        // Lag-1 autocorrelation for effective sample size
-        Scalar rho1_sum = 0.0;
-        int valid_chains = 0;
-        for (size_t c = 0; c < M; ++c) {
-            if (chain_vars[c] <= 1e-16) continue;
-            Scalar cov1 = 0.0;
-            for (size_t i = 1; i < N; ++i) {
-                cov1 += (chains[c][i] - chain_means[c]) * (chains[c][i - 1] - chain_means[c]);
+        Scalar neff = total_draws;
+        if (!single_chain_input && M > 1) {
+            // Match HyPhy's ComputeRandNeff (FUBAR.bf:621): N_eff = M * N * var_hat / B
+            if (B > 1e-16) {
+                neff = std::clamp<Scalar>(total_draws * var_hat / B, 1.0, total_draws);
             }
-            cov1 /= static_cast<Scalar>(N - 1);
-            rho1_sum += cov1 / chain_vars[c];
-            valid_chains++;
+        } else {
+            // Single-chain fallback: lag-1 autocorrelation effective sample size
+            Scalar rho1_sum = 0.0;
+            int valid_chains = 0;
+            for (size_t c = 0; c < M; ++c) {
+                if (chain_vars[c] <= 1e-16) continue;
+                Scalar cov1 = 0.0;
+                for (size_t i = 1; i < N; ++i) {
+                    cov1 += (chains[c][i] - chain_means[c]) * (chains[c][i - 1] - chain_means[c]);
+                }
+                cov1 /= static_cast<Scalar>(N - 1);
+                rho1_sum += cov1 / chain_vars[c];
+                valid_chains++;
+            }
+            Scalar rho1 = (valid_chains > 0) ? (rho1_sum / static_cast<Scalar>(valid_chains)) : 0.0;
+            rho1 = std::clamp<Scalar>(rho1, -0.95, 0.99);
+            neff = std::clamp<Scalar>(total_draws * (1.0 - rho1) / (1.0 + rho1), 1.0, total_draws);
         }
-        Scalar rho1 = (valid_chains > 0) ? (rho1_sum / static_cast<Scalar>(valid_chains)) : 0.0;
-        rho1 = std::clamp<Scalar>(rho1, -0.95, 0.99);
-        Scalar neff_acf = total_draws * (1.0 - rho1) / (1.0 + rho1);
-        Scalar neff = (M > 1 && B > W) ? std::min(total_draws * var_hat / B, neff_acf) : neff_acf;
-        neff = std::clamp<Scalar>(neff, 1.0, total_draws);
 
         return {psrf, neff};
     }
@@ -999,11 +1006,11 @@ public:
         }
         weights /= weights.sum();
 
-        // Match HyPhy's initial baseline_step scaling from median initial weight (F-039)
+        // Match HyPhy's initial baseline_step = max(min(0.001, 1/sites), median(initial_weights)) (F-039)
         std::vector<Scalar> sorted_w(weights.data(), weights.data() + G);
         std::sort(sorted_w.begin(), sorted_w.end());
-        Scalar median_initial_weight = (G > 0) ? sorted_w[G / 2] : (1.0 / static_cast<Scalar>( std::max<size_t>(1, G)));
-        Scalar baseline_step = std::max<Scalar>(1e-5, std::min<Scalar>(0.1, median_initial_weight));
+        Scalar median_initial_weight = (G > 0) ? sorted_w[G / 2] : (1.0 / static_cast<Scalar>(std::max<size_t>(1, G)));
+        Scalar baseline_step = std::max<Scalar>(std::min<Scalar>(0.001, 1.0 / static_cast<Scalar>(std::max<size_t>(1, S))), median_initial_weight);
 
         Vector current_site_likelihoods = weights.transpose() * C;
 

@@ -114,10 +114,12 @@ public:
         base_p.theta_CT = gtr_res.params.theta_CT;
         base_p.theta_GT = gtr_res.params.theta_GT;
 
+        auto sel = gtr_res.tree.select_branches(branches_spec, "", {}, true);
         MG94Fitter mg_fitter(gtr_res.tree, aln);
         FitResult mg_res;
         if (full_model) {
-            mg_res = mg_fitter.fit_full_model(1.0, base_p, progress_cb);
+            const std::vector<bool>* p_sel = (sel.num_selected > 0 && sel.num_unselected > 0) ? &sel.is_selected : nullptr;
+            mg_res = mg_fitter.fit_full_model(1.0, base_p, progress_cb, 250, 1e-5, p_sel);
             base_p = mg_res.params;
         } else {
             mg_res = mg_fitter.fit_omega_and_scale(1.0, base_p);
@@ -128,7 +130,7 @@ public:
         MEMEAnalyzer analyzer(mg_res.tree, std::move(aln), base_p, std::move(branches_spec));
         analyzer.p_value_threshold = pvalue_threshold;
         analyzer.global_log_l = mg_res.log_likelihood;
-        size_t K_mg = 5 + 1 + (mg_res.tree.num_nodes() - 1);
+        size_t K_mg = 5 + ((sel.num_selected > 0 && sel.num_unselected > 0) ? 2 : 1) + (mg_res.tree.num_nodes() - 1);
         size_t N_codons = analyzer.aln.num_codons;
         analyzer.global_aicc = -2.0 * mg_res.log_likelihood + 2.0 * K_mg * N_codons / (N_codons - K_mg - 1.0);
 
@@ -346,16 +348,21 @@ public:
                 res.lrt = 0.0;
                 res.p_value = 1.0;
                 res.branches_under_selection = 0;
-            } else if (log_l_null >= res.log_l_meme) {
+            } else if (log_l_null > res.log_l_meme) {
                 Scalar alpha_null = opt_null.x[0];
                 Scalar omega1_null = opt_null.x[1];
+                Scalar p1_null = opt_null.x[2];
                 Scalar beta1_null = alpha_null * omega1_null;
                 res.alpha = alpha_null;
                 res.beta1 = beta1_null;
-                res.p1 = 1.0;
-                res.beta_plus = beta1_null;
-                res.p_plus = 0.0;
+                res.p1 = p1_null;
+                res.beta_plus = alpha_null;
+                res.p_plus = 1.0 - p1_null;
                 res.log_l_meme = log_l_null;
+                res.lrt = 0.0;
+                res.p_value = 2.0 / 3.0;
+                res.branches_under_selection = 0;
+            } else if (std::abs(res.log_l_meme - log_l_null) <= 1e-12) {
                 res.lrt = 0.0;
                 res.p_value = 2.0 / 3.0;
                 res.branches_under_selection = 0;

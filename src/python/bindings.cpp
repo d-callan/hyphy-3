@@ -343,8 +343,6 @@ NB_MODULE(_hyphy3, m) {
         .def_rw("max_rate_classes", &ABSRELSettings::max_rate_classes)
         .def_rw("p_threshold", &ABSRELSettings::p_threshold)
         .def_rw("test_branches", &ABSRELSettings::test_branches)
-        .def_rw("do_srv", &ABSRELSettings::do_srv)
-        .def_rw("syn_rate_classes", &ABSRELSettings::syn_rate_classes)
         .def_rw("verbose", &ABSRELSettings::verbose);
 
     nb::class_<ABSRELRateDistribution>(m, "ABSRELRateDistribution")
