@@ -24,6 +24,7 @@ int run_tree(int argc, char* argv[]);
 int run_joint_align(int argc, char* argv[]);
 int run_characterize(int argc, char* argv[]);
 int run_mss(int argc, char* argv[]);
+int run_expcm(int argc, char* argv[]);
 int run_report(int argc, char* argv[]);
 
 void print_hyphy3_banner() {
@@ -60,7 +61,8 @@ void print_hyphy3_usage(const char* prog) {
               << "  " << Console::brand("mss          ") << "  Multi-class Synonymous Substitution Models (SynREV, TSVs & fast DP selector)\n"
               << "  " << Console::brand("ohmic        ") << "  Ohmic Phylogenetic Networks & Wheatstone Pruning\n"
               << "  " << Console::brand("tree         ") << "  ML/Ohmic Tree Engine (spectral scaffold & native polytomies)\n"
-              << "  " << Console::brand("joint-align  ") << "  Ohmic Co-Inference of Codon Alignment, Phylogeny & Selection\n\n";
+              << "  " << Console::brand("joint-align  ") << "  Ohmic Co-Inference of Codon Alignment, Phylogeny & Selection\n"
+              << "  " << Console::brand("expcm        ") << "  Experimentally-informed Codon Model (site-specific dN/dS analysis)\n\n";
 
     std::cout << Console::bold("Reports:") << "\n"
               << "  " << Console::brand("report       ") << "  Write a self-contained HTML report for an existing result JSON\n\n";
@@ -154,6 +156,8 @@ int main(int argc, char* argv[]) {
             return run_tree(sub_argc, sub_argv.data());
         } else if (cmd == "joint-align" || cmd == "joint_align" || cmd == "align") {
             return run_joint_align(sub_argc, sub_argv.data());
+        } else if (cmd == "expcm" || cmd == "ExpCM" || cmd == "EXPCM") {
+            return run_expcm(sub_argc, sub_argv.data());
         } else if (cmd == "report") {
             return run_report(sub_argc, sub_argv.data());
         } else {

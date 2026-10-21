@@ -1323,6 +1323,719 @@ public:
 
         return res;
     }
+
+    /**
+     * Compute stationary distribution for ExpCM at a single site.
+     *
+     * p_{r,x} = (π_{r,A(x)})^β · φ_{x1} φ_{x2} φ_{x3} / Z_r
+     */
+    static Vector61Codon compute_expcm_stationary(
+        const GeneticCode& gcode,
+        const Preferences& prefs,
+        size_t site,
+        Scalar beta,
+        const Vector4& phi
+    ) {
+        Vector61Codon p = Vector61Codon::Zero();
+        Scalar Z = 0.0;
+
+        for (int x = 0; x < gcode.num_sense_codons; ++x) {
+            char aa = gcode.sense_codon_aa[x];
+            Scalar pref_beta = std::pow(prefs.at(site, aa), beta);
+
+            const std::string& codon = gcode.sense_codons[x];
+            int8_t n1 = char_to_nuc(codon[0]);
+            int8_t n2 = char_to_nuc(codon[1]);
+            int8_t n3 = char_to_nuc(codon[2]);
+            Scalar nuc_freq = phi(n1) * phi(n2) * phi(n3);
+
+            p(x) = pref_beta * nuc_freq;
+            Z += p(x);
+        }
+
+        if (Z > 0.0) {
+            p /= Z;
+        }
+
+        return p;
+    }
+
+    /**
+     * Compute analytical derivative of site stationary distribution p_r w.r.t. β:
+     *
+     * ∂p_{r,x} / ∂β = p_{r,x} · [ ln(π_{r,A(x)}) - Σ_z p_{r,z} ln(π_{r,A(z)}) ]
+     */
+    static Vector61Codon compute_dp_dbeta(
+        const GeneticCode& gcode,
+        const Preferences& prefs,
+        size_t site,
+        const Vector61Codon& pi_site
+    ) {
+        Vector61Codon ln_pref = Vector61Codon::Zero();
+        for (int x = 0; x < gcode.num_sense_codons; ++x) {
+            char aa = gcode.sense_codon_aa[x];
+            ln_pref(x) = std::log(prefs.at(site, aa));
+        }
+        Scalar mean_ln_pref = pi_site.dot(ln_pref);
+        return pi_site.array() * (ln_pref.array() - mean_ln_pref);
+    }
+
+    /**
+     * Compute ExpCM log-likelihood at fixed parameters using per-site reversible
+     * spectral decomposition.
+     */
+    static Scalar compute_expcm_log_likelihood(
+        const Tree& tree,
+        const Alignment& aln,
+        const GeneticCode& gcode,
+        const Preferences& prefs,
+        const ExpCMParameters& params,
+        Scalar branch_scale = 1.0
+    ) {
+        params.validate();
+
+        size_t num_nodes = tree.num_nodes();
+        size_t num_sites = prefs.num_sites();
+        std::vector<size_t> leaf_to_taxon = build_leaf_to_taxon_map(tree, aln);
+
+        ExpCMQMatrix Q_matrix;
+        Q_matrix.build(gcode, params);
+        const Matrix61Codon& Q = Q_matrix.Q;
+
+        std::vector<Scalar> site_lls(num_sites, 0.0);
+        const double SCALER_THRESH = 1e-150;
+        const double SCALER_UP = 1e150;
+        const double LOG_SCALER = std::log(SCALER_UP);
+
+        #pragma omp parallel for schedule(dynamic)
+        for (size_t site = 0; site < num_sites; ++site) {
+            size_t pattern_idx = aln.site_to_pattern[site];
+            const auto& pattern = aln.patterns[pattern_idx];
+
+            ExpCMFMatrix F_matrix;
+            F_matrix.build(gcode, prefs, site, params);
+
+            Matrix61Codon P = F_matrix.F.cwiseProduct(Q);
+            for (int x = 0; x < 61; ++x) {
+                P(x, x) = -P.row(x).sum();
+            }
+
+            Vector61Codon pi_site = compute_expcm_stationary(
+                gcode, prefs, site, params.beta, params.phi
+            );
+
+            ExpCMSiteEigen site_eigen;
+            site_eigen.decompose(P, pi_site);
+
+            std::vector<Matrix61Codon> P_branches(num_nodes);
+            for (const auto& node : tree.nodes) {
+                if (node.id != tree.root_id) {
+                    Scalar scaled_bl = node.branch_length * branch_scale;
+                    P_branches[node.id] = site_eigen.transition_matrix(scaled_bl);
+                }
+            }
+
+            std::vector<Vector61Codon> node_L(num_nodes);
+            std::vector<double> node_log_scale(num_nodes, 0.0);
+
+            for (int32_t node_id : tree.post_order) {
+                const auto& node = tree.nodes[node_id];
+
+                if (node.is_leaf) {
+                    size_t t_idx = leaf_to_taxon[node_id];
+                    init_leaf_likelihood(pattern, t_idx, 61, node_L[node_id]);
+                    node_log_scale[node_id] = 0.0;
+                } else {
+                    double child_scale_sum = 0.0;
+                    tree.eval_internal_node(node_id, P_branches, node_L, node_log_scale, node_L[node_id], child_scale_sum);
+
+                    double max_val = node_L[node_id].maxCoeff();
+                    int boost_count = 0;
+                    while (max_val < SCALER_THRESH && max_val > 0.0) {
+                        node_L[node_id] *= SCALER_UP;
+                        max_val *= SCALER_UP;
+                        boost_count++;
+                    }
+                    node_log_scale[node_id] = child_scale_sum - boost_count * LOG_SCALER;
+                }
+            }
+
+            Scalar site_likelihood = pi_site.dot(node_L[tree.root_id]);
+            if (site_likelihood > 0.0) {
+                site_lls[site] = std::log(site_likelihood) + node_log_scale[tree.root_id];
+            } else {
+                site_lls[site] = -1e20;
+            }
+        }
+
+        return neumaier_sum(site_lls);
+    }
+
+    /**
+     * Compute log-likelihood for a single site using reversible spectral decomposition.
+     */
+    static Scalar compute_expcm_site_log_likelihood(
+        const Tree& tree,
+        const Alignment& aln,
+        const GeneticCode& gcode,
+        const Preferences& prefs,
+        size_t site,
+        const ExpCMParameters& params,
+        Scalar branch_scale = 1.0,
+        const std::vector<size_t>* custom_leaf_to_taxon = nullptr
+    ) {
+        params.validate();
+        if (site >= prefs.num_sites()) {
+            throw std::out_of_range("Site index " + std::to_string(site) +
+                                   " exceeds num_sites " + std::to_string(prefs.num_sites()));
+        }
+
+        size_t num_nodes = tree.num_nodes();
+        std::vector<size_t> local_map;
+        const std::vector<size_t>& leaf_to_taxon = custom_leaf_to_taxon
+            ? *custom_leaf_to_taxon
+            : (local_map = build_leaf_to_taxon_map(tree, aln));
+
+        ExpCMQMatrix Q_matrix;
+        Q_matrix.build(gcode, params);
+        const Matrix61Codon& Q = Q_matrix.Q;
+
+        const double SCALER_THRESH = 1e-150;
+        const double SCALER_UP = 1e150;
+        const double LOG_SCALER = std::log(SCALER_UP);
+
+        size_t pattern_idx = aln.site_to_pattern[site];
+        const auto& pattern = aln.patterns[pattern_idx];
+
+        ExpCMFMatrix F_matrix;
+        F_matrix.build(gcode, prefs, site, params);
+
+        Matrix61Codon P = F_matrix.F.cwiseProduct(Q);
+        for (int x = 0; x < 61; ++x) {
+            P(x, x) = -P.row(x).sum();
+        }
+
+        Vector61Codon pi_site = compute_expcm_stationary(
+            gcode, prefs, site, params.beta, params.phi
+        );
+
+        ExpCMSiteEigen site_eigen;
+        site_eigen.decompose(P, pi_site);
+
+        std::vector<Matrix61Codon> P_branches(num_nodes);
+        for (const auto& node : tree.nodes) {
+            if (node.id != tree.root_id) {
+                Scalar scaled_bl = node.branch_length * branch_scale;
+                P_branches[node.id] = site_eigen.transition_matrix(scaled_bl);
+            }
+        }
+
+        std::vector<Vector61Codon> node_L(num_nodes);
+        std::vector<double> node_log_scale(num_nodes, 0.0);
+
+        for (int32_t node_id : tree.post_order) {
+            const auto& node = tree.nodes[node_id];
+
+            if (node.is_leaf) {
+                size_t t_idx = leaf_to_taxon[node_id];
+                init_leaf_likelihood(pattern, t_idx, 61, node_L[node_id]);
+                node_log_scale[node_id] = 0.0;
+            } else {
+                double child_scale_sum = 0.0;
+                tree.eval_internal_node(node_id, P_branches, node_L, node_log_scale, node_L[node_id], child_scale_sum);
+
+                double max_val = node_L[node_id].maxCoeff();
+                int boost_count = 0;
+                while (max_val < SCALER_THRESH && max_val > 0.0) {
+                    node_L[node_id] *= SCALER_UP;
+                    max_val *= SCALER_UP;
+                    boost_count++;
+                }
+                node_log_scale[node_id] = child_scale_sum - boost_count * LOG_SCALER;
+            }
+        }
+
+        Scalar site_likelihood = pi_site.dot(node_L[tree.root_id]);
+        if (site_likelihood > 0.0) {
+            return std::log(site_likelihood) + node_log_scale[tree.root_id];
+        } else {
+            return -1e20;
+        }
+    }
+
+    /**
+     * Compute log-likelihood for all sites individually.
+     */
+    static std::vector<Scalar> compute_expcm_all_sites_log_likelihood(
+        const Tree& tree,
+        const Alignment& aln,
+        const GeneticCode& gcode,
+        const Preferences& prefs,
+        const ExpCMParameters& params,
+        Scalar branch_scale = 1.0
+    ) {
+        size_t num_sites = prefs.num_sites();
+        std::vector<Scalar> site_likelihoods(num_sites);
+        std::vector<size_t> leaf_to_taxon = build_leaf_to_taxon_map(tree, aln);
+
+        #pragma omp parallel for schedule(dynamic)
+        for (size_t site = 0; site < num_sites; ++site) {
+            site_likelihoods[site] = compute_expcm_site_log_likelihood(
+                tree, aln, gcode, prefs, site, params, branch_scale, &leaf_to_taxon
+            );
+        }
+
+        return site_likelihoods;
+    }
+
+    /**
+     * Compute central finite-difference gradient of log-likelihood w.r.t. β.
+     */
+    static Scalar compute_expcm_beta_gradient_finite_diff(
+        const Tree& tree,
+        const Alignment& aln,
+        const GeneticCode& gcode,
+        const Preferences& prefs,
+        const ExpCMParameters& params,
+        Scalar branch_scale = 1.0,
+        Scalar epsilon = 1e-6
+    ) {
+        ExpCMParameters params_plus = params;
+        params_plus.beta += epsilon;
+        Scalar L_plus = compute_expcm_log_likelihood(tree, aln, gcode, prefs, params_plus, branch_scale);
+
+        ExpCMParameters params_minus = params;
+        params_minus.beta -= epsilon;
+        Scalar L_minus = compute_expcm_log_likelihood(tree, aln, gcode, prefs, params_minus, branch_scale);
+
+        return (L_plus - L_minus) / (2.0 * epsilon);
+    }
+
+    /**
+     * Compute dF/dβ matrix (derivative of fixation bias w.r.t. β) for a single site.
+     */
+    static Matrix61Codon compute_dF_dbeta(
+        const GeneticCode& gcode,
+        const Preferences& prefs,
+        size_t site,
+        Scalar beta,
+        Scalar omega
+    ) {
+        Matrix61Codon dF_dbeta = Matrix61Codon::Zero();
+        const double EXPCM_ALMOST_ZERO_VAL = 1e-10;
+
+        for (int x = 0; x < gcode.num_sense_codons; ++x) {
+            for (int y = 0; y < gcode.num_sense_codons; ++y) {
+                if (x == y) continue;
+
+                char aa_x = gcode.sense_codon_aa[x];
+                char aa_y = gcode.sense_codon_aa[y];
+
+                if (aa_x == aa_y) {
+                    dF_dbeta(x, y) = 0.0;
+                } else {
+                    Scalar pi_x = prefs.at(site, aa_x);
+                    Scalar pi_y = prefs.at(site, aa_y);
+
+                    Scalar ratio = pi_x / pi_y;
+                    Scalar ratio_beta = std::pow(ratio, beta);
+                    Scalar ln_ratio = std::log(ratio);
+
+                    if (std::fabs(1.0 - ratio_beta) < EXPCM_ALMOST_ZERO_VAL) {
+                        dF_dbeta(x, y) = omega * (-ln_ratio / 2.0);
+                    } else {
+                        Scalar denominator = (1.0 - ratio_beta);
+                        Scalar denom_squared = denominator * denominator;
+                        Scalar numerator = -ln_ratio * (1.0 - ratio_beta + beta * ratio_beta * ln_ratio);
+                        dF_dbeta(x, y) = omega * (numerator / denom_squared);
+                    }
+                }
+            }
+        }
+
+        dF_dbeta.diagonal().setZero();
+        return dF_dbeta;
+    }
+
+    /**
+     * Compute dF/dω matrix (derivative of fixation bias w.r.t. ω) for a single site.
+     */
+    static Matrix61Codon compute_dF_domega(
+        const GeneticCode& gcode,
+        const Preferences& prefs,
+        size_t site,
+        Scalar beta
+    ) {
+        Matrix61Codon dF_domega = Matrix61Codon::Zero();
+        const double EXPCM_ALMOST_ZERO_VAL = 1e-10;
+
+        for (int x = 0; x < gcode.num_sense_codons; ++x) {
+            for (int y = 0; y < gcode.num_sense_codons; ++y) {
+                if (x == y) continue;
+
+                char aa_x = gcode.sense_codon_aa[x];
+                char aa_y = gcode.sense_codon_aa[y];
+
+                if (aa_x == aa_y) {
+                    dF_domega(x, y) = 0.0;
+                } else {
+                    Scalar pi_x = prefs.at(site, aa_x);
+                    Scalar pi_y = prefs.at(site, aa_y);
+
+                    Scalar ratio = pi_x / pi_y;
+                    Scalar ratio_beta = std::pow(ratio, beta);
+                    Scalar ln_ratio_beta = std::log(ratio_beta);
+
+                    if (std::fabs(1.0 - ratio_beta) < EXPCM_ALMOST_ZERO_VAL) {
+                        dF_domega(x, y) = 1.0;
+                    } else {
+                        dF_domega(x, y) = -ln_ratio_beta / (1.0 - ratio_beta);
+                    }
+                }
+            }
+        }
+
+        dF_domega.diagonal().setZero();
+        return dF_domega;
+    }
+
+    /**
+     * Check if nucleotide substitution is a transition (A↔G or C↔T).
+     */
+    static bool is_transition(int8_t nuc_from, int8_t nuc_to) {
+        return (nuc_from == 0 && nuc_to == 2) ||
+               (nuc_from == 2 && nuc_to == 0) ||
+               (nuc_from == 1 && nuc_to == 3) ||
+               (nuc_from == 3 && nuc_to == 1);
+    }
+
+    /**
+     * Compute dQ/dκ matrix (derivative of mutation rates w.r.t. κ).
+     */
+    static Matrix61Codon compute_dQ_dkappa(
+        const GeneticCode& gcode,
+        const ExpCMParameters& params
+    ) {
+        Matrix61Codon dQ_dkappa = Matrix61Codon::Zero();
+
+        for (int x = 0; x < gcode.num_sense_codons; ++x) {
+            for (int y = 0; y < gcode.num_sense_codons; ++y) {
+                if (x == y) continue;
+
+                const auto& diff = gcode.diff_matrix[x][y];
+                if (diff.num_diffs != 1) continue;
+
+                int8_t nuc_to = diff.nuc_to;
+                int8_t nuc_from = diff.nuc_from;
+
+                if (is_transition(nuc_from, nuc_to)) {
+                    dQ_dkappa(x, y) = params.phi(nuc_to);
+                }
+            }
+        }
+
+        for (int x = 0; x < gcode.num_sense_codons; ++x) {
+            dQ_dkappa(x, x) = -dQ_dkappa.row(x).sum();
+        }
+
+        return dQ_dkappa;
+    }
+
+    struct ExpCMGradients {
+        Scalar log_likelihood = 0.0;
+        Scalar grad_beta = 0.0;
+        Scalar grad_omega = 0.0;
+        Scalar grad_kappa = 0.0;
+    };
+
+    /**
+     * Jointly evaluate ExpCM log-likelihood and exact analytical gradients
+     * (∂lnL/∂β, ∂lnL/∂ω, ∂lnL/∂κ) in a single pass over sites using
+     * reversible spectral decomposition + 2-pass Inside-Outside + spectral Fréchet derivatives.
+     */
+    static ExpCMGradients compute_expcm_joint_frechet_gradients(
+        const Tree& tree,
+        const Alignment& aln,
+        const GeneticCode& gcode,
+        const Preferences& prefs,
+        const ExpCMParameters& params,
+        Scalar branch_scale = 1.0
+    ) {
+        params.validate();
+
+        size_t num_nodes = tree.num_nodes();
+        size_t num_sites = prefs.num_sites();
+        std::vector<size_t> leaf_to_taxon = build_leaf_to_taxon_map(tree, aln);
+
+        ExpCMQMatrix Q_matrix;
+        Q_matrix.build(gcode, params);
+        const Matrix61Codon& Q = Q_matrix.Q;
+        Matrix61Codon dQ_dkappa = compute_dQ_dkappa(gcode, params);
+
+        std::vector<Scalar> site_ll(num_sites, 0.0);
+        std::vector<Scalar> site_g_beta(num_sites, 0.0);
+        std::vector<Scalar> site_g_omega(num_sites, 0.0);
+        std::vector<Scalar> site_g_kappa(num_sites, 0.0);
+
+        #pragma omp parallel
+        {
+            InsideOutsideWorkspace ws;
+            ws.init(num_nodes, 61);
+            std::vector<Matrix> P_branches(num_nodes, Matrix::Zero(61, 61));
+
+            #pragma omp for schedule(dynamic)
+            for (size_t site = 0; site < num_sites; ++site) {
+                size_t pattern_idx = aln.site_to_pattern[site];
+                const auto& pattern = aln.patterns[pattern_idx];
+
+                ExpCMFMatrix F_matrix;
+                F_matrix.build(gcode, prefs, site, params);
+                const Matrix61Codon& F = F_matrix.F;
+
+                Matrix61Codon P = F.cwiseProduct(Q);
+                for (int x = 0; x < 61; ++x) {
+                    P(x, x) = -P.row(x).sum();
+                }
+
+                Vector61Codon pi_site = compute_expcm_stationary(
+                    gcode, prefs, site, params.beta, params.phi
+                );
+
+                ExpCMSiteEigen site_eigen;
+                site_eigen.decompose(P, pi_site);
+
+                for (const auto& node : tree.nodes) {
+                    if (node.id != tree.root_id) {
+                        Scalar tb = node.branch_length * branch_scale;
+                        P_branches[node.id] = site_eigen.transition_matrix(tb);
+                    }
+                }
+
+                Vector pi_dyn = pi_site;
+                compute_inside_outside_in_place(tree, pattern, leaf_to_taxon, P_branches, pi_dyn, 61, ws);
+
+                Scalar L_r = ws.likelihood;
+                site_ll[site] = ws.log_likelihood;
+                if (L_r <= 0.0) continue;
+
+                Scalar inv_L = 1.0 / L_r;
+
+                // Accumulate spectral Fréchet sensitivity matrix H_r across all branches
+                Matrix61Codon H_r = Matrix61Codon::Zero();
+                for (const auto& node : tree.nodes) {
+                    if (node.id != tree.root_id) {
+                        int32_t bid = node.id;
+                        Scalar tb = node.branch_length * branch_scale;
+
+                        Vector61Codon u_v = site_eigen.U_pi.transpose() * ws.V[bid];
+                        Vector61Codon v_d = site_eigen.V_pi * ws.D[bid];
+                        Matrix61Codon A_tilde = inv_L * (u_v * v_d.transpose());
+
+                        Matrix61Codon E;
+                        for (int i = 0; i < 61; ++i) {
+                            Scalar li = site_eigen.eigenvalues(i);
+                            Scalar exp_li = std::exp(li * tb);
+                            for (int j = 0; j < 61; ++j) {
+                                Scalar lj = site_eigen.eigenvalues(j);
+                                Scalar diff = li - lj;
+                                if (std::fabs(diff) < 1e-9) {
+                                    E(i, j) = tb * exp_li;
+                                } else {
+                                    E(i, j) = (exp_li - std::exp(lj * tb)) / diff;
+                                }
+                            }
+                        }
+
+                        H_r.noalias() += A_tilde.cwiseProduct(E);
+                    }
+                }
+
+                // Back-project H_r to codon space: G_r = U_pi * H_r * V_pi
+                // so that for any dP_r, sum( (V_pi * dP_r * U_pi) ⊙ H_r ) = sum( dP_r ⊙ (V_pi^T * H_r * U_pi^T) )
+                Matrix61Codon W_r = site_eigen.V_pi.transpose() * H_r * site_eigen.U_pi.transpose();
+
+                // 1. Beta gradient: includes branch Fréchet term + root stationary derivative term
+                Matrix61Codon dF_dbeta = compute_dF_dbeta(gcode, prefs, site, params.beta, params.omega);
+                Matrix61Codon dP_dbeta = dF_dbeta.cwiseProduct(Q);
+                for (int x = 0; x < 61; ++x) {
+                    dP_dbeta(x, x) = -dP_dbeta.row(x).sum();
+                }
+                Vector61Codon dp_dbeta = compute_dp_dbeta(gcode, prefs, site, pi_site);
+                Scalar root_term_beta = dp_dbeta.dot(ws.D[tree.root_id]) * inv_L;
+                site_g_beta[site] = root_term_beta + (dP_dbeta.cwiseProduct(W_r)).sum();
+
+                // 2. Omega gradient
+                Matrix61Codon dF_domega = compute_dF_domega(gcode, prefs, site, params.beta);
+                Matrix61Codon dP_domega = dF_domega.cwiseProduct(Q);
+                for (int x = 0; x < 61; ++x) {
+                    dP_domega(x, x) = -dP_domega.row(x).sum();
+                }
+                site_g_omega[site] = (dP_domega.cwiseProduct(W_r)).sum();
+
+                // 3. Kappa gradient
+                Matrix61Codon dP_dkappa = F.cwiseProduct(dQ_dkappa);
+                for (int x = 0; x < 61; ++x) {
+                    dP_dkappa(x, x) = -dP_dkappa.row(x).sum();
+                }
+                site_g_kappa[site] = (dP_dkappa.cwiseProduct(W_r)).sum();
+            }
+        }
+
+        ExpCMGradients res;
+        res.log_likelihood = neumaier_sum(site_ll);
+        res.grad_beta = neumaier_sum(site_g_beta);
+        res.grad_omega = neumaier_sum(site_g_omega);
+        res.grad_kappa = neumaier_sum(site_g_kappa);
+        return res;
+    }
+
+    /**
+     * Compute analytical beta gradient using Inside-Outside and spectral Fréchet derivatives.
+     */
+    static Scalar compute_expcm_beta_gradient_frechet(
+        const Tree& tree,
+        const Alignment& aln,
+        const GeneticCode& gcode,
+        const Preferences& prefs,
+        const ExpCMParameters& params,
+        Scalar branch_scale = 1.0
+    ) {
+        return compute_expcm_joint_frechet_gradients(tree, aln, gcode, prefs, params, branch_scale).grad_beta;
+    }
+
+    /**
+     * Compute analytical beta gradient (alias to exact spectral Fréchet derivative).
+     */
+    static Scalar compute_expcm_beta_gradient_analytical(
+        const Tree& tree,
+        const Alignment& aln,
+        const GeneticCode& gcode,
+        const Preferences& prefs,
+        const ExpCMParameters& params,
+        Scalar branch_scale = 1.0
+    ) {
+        return compute_expcm_beta_gradient_frechet(tree, aln, gcode, prefs, params, branch_scale);
+    }
+
+    /**
+     * Compute central finite-difference gradient of log-likelihood w.r.t. ω.
+     */
+    static Scalar compute_expcm_omega_gradient_finite_diff(
+        const Tree& tree,
+        const Alignment& aln,
+        const GeneticCode& gcode,
+        const Preferences& prefs,
+        const ExpCMParameters& params,
+        Scalar branch_scale = 1.0,
+        Scalar epsilon = 1e-6
+    ) {
+        ExpCMParameters params_plus = params;
+        params_plus.omega += epsilon;
+        Scalar L_plus = compute_expcm_log_likelihood(tree, aln, gcode, prefs, params_plus, branch_scale);
+
+        ExpCMParameters params_minus = params;
+        params_minus.omega -= epsilon;
+        Scalar L_minus = compute_expcm_log_likelihood(tree, aln, gcode, prefs, params_minus, branch_scale);
+
+        return (L_plus - L_minus) / (2.0 * epsilon);
+    }
+
+    /**
+     * Compute analytical omega gradient using Inside-Outside and spectral Fréchet derivatives.
+     */
+    static Scalar compute_expcm_omega_gradient_frechet(
+        const Tree& tree,
+        const Alignment& aln,
+        const GeneticCode& gcode,
+        const Preferences& prefs,
+        const ExpCMParameters& params,
+        Scalar branch_scale = 1.0
+    ) {
+        return compute_expcm_joint_frechet_gradients(tree, aln, gcode, prefs, params, branch_scale).grad_omega;
+    }
+
+    /**
+     * Compute central finite-difference gradient of log-likelihood w.r.t. κ.
+     */
+    static Scalar compute_expcm_kappa_gradient_finite_diff(
+        const Tree& tree,
+        const Alignment& aln,
+        const GeneticCode& gcode,
+        const Preferences& prefs,
+        const ExpCMParameters& params,
+        Scalar branch_scale = 1.0,
+        Scalar epsilon = 1e-6
+    ) {
+        ExpCMParameters params_plus = params;
+        params_plus.kappa += epsilon;
+        Scalar L_plus = compute_expcm_log_likelihood(tree, aln, gcode, prefs, params_plus, branch_scale);
+
+        ExpCMParameters params_minus = params;
+        params_minus.kappa -= epsilon;
+        Scalar L_minus = compute_expcm_log_likelihood(tree, aln, gcode, prefs, params_minus, branch_scale);
+
+        return (L_plus - L_minus) / (2.0 * epsilon);
+    }
+
+    /**
+     * Compute analytical kappa gradient using Inside-Outside and spectral Fréchet derivatives.
+     */
+    static Scalar compute_expcm_kappa_gradient_frechet(
+        const Tree& tree,
+        const Alignment& aln,
+        const GeneticCode& gcode,
+        const Preferences& prefs,
+        const ExpCMParameters& params,
+        Scalar branch_scale = 1.0
+    ) {
+        return compute_expcm_joint_frechet_gradients(tree, aln, gcode, prefs, params, branch_scale).grad_kappa;
+    }
+
+    /**
+     * Compute matrix exponential using scaling and squaring method with Padé (5,5) approximant.
+     * Retained for direct matrix-exponential validation tests.
+     */
+    static Matrix61Codon matrix_exp_scaling_squaring(const Matrix61Codon& M) {
+        const int max_scale = 30;
+        Scalar norm_inf = M.rowwise().lpNorm<1>().maxCoeff();
+
+        if (norm_inf < 1e-10) {
+            return Matrix61Codon::Identity() + M;
+        }
+
+        int s = 0;
+        Scalar one_half_power = 1.0;
+        while (norm_inf > 1.0 && s < max_scale) {
+            norm_inf *= 0.5;
+            one_half_power *= 0.5;
+            s++;
+        }
+
+        Matrix61Codon M_scaled = M * one_half_power;
+        Matrix61Codon result = pade_exp(M_scaled);
+
+        for (int i = 0; i < s; ++i) {
+            result = result * result;
+        }
+
+        return result;
+    }
+
+    /**
+     * Padé (5,5) approximation for matrix exponential.
+     */
+    static Matrix61Codon pade_exp(const Matrix61Codon& X) {
+        Matrix61Codon I = Matrix61Codon::Identity();
+        Matrix61Codon X2 = X * X;
+        Matrix61Codon X3 = X2 * X;
+        Matrix61Codon X4 = X3 * X;
+        Matrix61Codon X5 = X4 * X;
+
+        Matrix61Codon num = 30240.0 * I + 15120.0 * X + 3360.0 * X2 + 420.0 * X3 + 30.0 * X4 + X5;
+        Matrix61Codon den = 30240.0 * I - 15120.0 * X + 3360.0 * X2 - 420.0 * X3 + 30.0 * X4 - X5;
+
+        return den.inverse() * num;
+    }
 };
 
 } // namespace hyphy::core
