@@ -48,9 +48,9 @@ def group_key(output, mode):
         # Group object files by which binary/app they feed, inferred from
         # CMakeFiles/<target>.dir/ path segments.
         parts = Path(output).parts
-        for i, p in enumerate(parts):
-            if p.endswith(".dir") and i > 0:
-                return parts[i - 1]
+        for p in parts:
+            if p.endswith(".dir"):
+                return p[:-4]
         return "(other)"
     return output
 
@@ -78,7 +78,7 @@ def main():
     wall_ms = max(e for _, e, _ in entries) - min(s for s, _, _ in entries)
 
     per_group = collections.Counter()
-    per_output = {}
+    per_output = collections.Counter()
     for s, e, out in entries:
         dur = e - s
         per_group[group_key(out, args.group_by)] += dur
