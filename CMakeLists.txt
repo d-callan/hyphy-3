@@ -371,6 +371,34 @@ add_executable(hyphy3
 target_compile_definitions(hyphy3 PRIVATE HYPHY3_COMBINED_DRIVER)
 target_link_libraries(hyphy3 PRIVATE hyphy3_report)
 
+# Regression gates G1 (golden CLI output vs committed snapshots, plus v3
+# schema validation of the raw output) and G3 (driver dispatch / argv[0]
+# alias surface). Only python3 is required — no package dependencies.
+if(HYPHY3_BUILD_TESTS)
+    find_program(HYPHY3_PYTHON3 NAMES python3 python)
+    if(HYPHY3_PYTHON3)
+        add_test(NAME GoldenOutputTest
+            COMMAND "${HYPHY3_PYTHON3}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tests/golden_diff.py"
+                --bin "$<TARGET_FILE:hyphy3>"
+            WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+        )
+        add_test(NAME GoldenOutputDeepTest
+            COMMAND "${HYPHY3_PYTHON3}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tests/golden_diff.py"
+                --bin "$<TARGET_FILE:hyphy3>" --tier slow
+            WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+        )
+        set_tests_properties(GoldenOutputDeepTest PROPERTIES LABELS deep)
+        add_test(NAME CLISurfaceTest
+            COMMAND "${HYPHY3_PYTHON3}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_cli_surface.py"
+                "$<TARGET_FILE:hyphy3>"
+            WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+        )
+    endif()
+endif()
+
 # Standalone CLI Applications
 # With HYPHY3_STANDALONE_SYMLINKS these targets are not built at all: every
 # standalone main() is just a try/catch wrapper around the same run_*() entry

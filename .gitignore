@@ -40,6 +40,7 @@ generated/
 !benchmarks/data/*.json
 !benchmarks/ground_truth/*.json
 !tests/data/*.json
+!tests/golden/*.json
 tests/data/*.GARD.json
 tests/data/rbp3.nex
 !schemas/**/*.json
