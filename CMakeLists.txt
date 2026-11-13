@@ -608,12 +608,18 @@ endif()
 # Every executable links hyphy3_emitters (out-of-line emitter definitions) and,
 # when HYPHY3_PCH is on, reuses the shared precompiled header compiled by
 # hyphy3_pch instead of re-parsing nlohmann/json + Eigen + the ubiquitous core
-# headers. Per-analysis emitters are intentionally excluded from the PCH (see
-# src/pch.hpp). Disable PCH with -DHYPHY3_PCH=OFF if it causes toolchain issues.
+# headers. Disable PCH with -DHYPHY3_PCH=OFF if it causes toolchain issues.
 if(HYPHY3_PCH)
     add_library(hyphy3_pch STATIC src/pch.cpp)
     target_link_libraries(hyphy3_pch PUBLIC hyphy3_core)
     target_precompile_headers(hyphy3_pch PUBLIC "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/pch.hpp>")
+
+    # hyphy3_emitters gets its OWN PCH of the same stable stack rather than
+    # REUSE_FROM hyphy3_pch: emitters compile with -fPIC and hyphy3_pch does
+    # not, and GCC silently ignores a PCH built with mismatched flags. The
+    # extra PCH costs one parse of the stack and speeds all ~14 emitter TUs.
+    target_precompile_headers(hyphy3_emitters
+        PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src/pch.hpp>")
 endif()
 
 get_property(_hyphy3_all_targets DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
