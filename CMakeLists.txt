@@ -176,11 +176,14 @@ add_dependencies(hyphy3_core hyphy3_viewer_assets)
 add_library(hyphy3_emitters STATIC
     src/analyses/absrel.cpp
     src/analyses/busted.cpp
+    src/analyses/busted_impl.cpp
+    src/analyses/characterize_impl.cpp
     src/analyses/contrast_fel.cpp
     src/analyses/directional_fel.cpp
     src/analyses/fel.cpp
     src/analyses/fubar.cpp
     src/analyses/gard.cpp
+    src/analyses/joint_align_impl.cpp
     src/analyses/meme.cpp
     src/analyses/mss.cpp
     src/analyses/ohmic.cpp
