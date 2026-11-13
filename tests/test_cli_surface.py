@@ -19,8 +19,10 @@ import sys
 import tempfile
 from pathlib import Path
 
-BIN = sys.argv[1] if len(sys.argv) > 1 else os.environ.get(
-    "HYPHY3_BIN", str(Path(__file__).resolve().parent.parent / "build" / "hyphy3"))
+BIN = os.path.abspath(
+    sys.argv[1] if len(sys.argv) > 1 else os.environ.get(
+        "HYPHY3_BIN",
+        str(Path(__file__).resolve().parent.parent / "build" / "hyphy3")))
 
 # Subcommands routed by dispatch_subcommand() in src/apps/hyphy3.cpp.
 SUBCOMMANDS = [

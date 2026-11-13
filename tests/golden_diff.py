@@ -45,7 +45,8 @@ DEFAULT_FLOAT_PRECISION = 12
 # recorded under explicit path keys). Matched case-insensitively as a
 # substring of the key name.
 VOLATILE_KEYS = re.compile(
-    r"time|timer|duration|elapsed|timestamp|commit|build|^path$|_path$", re.IGNORECASE
+    r"time|timer|duration|elapsed|timestamp|commit|build|^path$|_path$|cli_command",
+    re.IGNORECASE,
 )
 
 ABS_PATH = re.compile(r"^(?:[A-Za-z]:[/\\]|/)")

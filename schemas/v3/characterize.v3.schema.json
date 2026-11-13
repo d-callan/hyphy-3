@@ -385,6 +385,7 @@
         "additionalProperties": false,
         "properties": {
           "branch_name": { "type": "string" },
+          "model_tag": { "type": "string" },
           "is_leaf": { "type": "boolean" },
           "branch_length_subs": { "type": "number", "minimum": 0 },
           "compositional_regime": { "type": "string" },
