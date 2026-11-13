@@ -560,7 +560,7 @@ if(HYPHY3_PCH)
     # not, and GCC silently ignores a PCH built with mismatched flags. The
     # extra PCH costs one parse of the stack and speeds all ~14 emitter TUs.
     target_precompile_headers(hyphy3_emitters
-        PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src/pch.hpp>")
+        PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src/pch.hpp")
 endif()
 
 get_property(_hyphy3_all_targets DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
