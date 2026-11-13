@@ -7,6 +7,8 @@
   "additionalProperties": false,
   "required": [
     "$schema",
+    "schema_version",
+    "software",
     "alignment_and_network",
     "analysis",
     "branch_profiles",
@@ -25,6 +27,12 @@
   "properties": {
     "$schema": {
       "type": "string"
+    },
+    "schema_version": {
+      "type": "string"
+    },
+    "software": {
+      "type": "object"
     },
     "analysis": {
       "type": "object",

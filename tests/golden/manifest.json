@@ -45,15 +45,15 @@
         {
             "name": "relax_cd2",
             "subcommand": "relax",
-            "args": ["--alignment", "benchmarks/data/cd2.fna", "--tree", "benchmarks/data/cd2.nwk", "--test", "Group1", "--threads", "4"],
+            "args": ["--alignment", "benchmarks/data/cd2.fna", "--tree", "benchmarks/data/cd2.nwk", "--test", "Group1", "--reference", "Group2", "--threads", "4"],
             "schema": "relax.v3.schema.json",
             "tier": "slow",
-            "source": "CD2 codon alignment + {Group1-4}-tagged tree (benchmarks/data/cd2.fna, cd2.nwk); reference set is the tag complement"
+            "source": "CD2 codon alignment + {Group1-4}-tagged tree (benchmarks/data/cd2.fna, cd2.nwk); --reference is required because the tree carries multiple tag groups"
         },
         {
             "name": "contrast_fel_cd2",
             "subcommand": "contrast-fel",
-            "args": ["--alignment", "benchmarks/data/cd2.fna", "--tree", "benchmarks/data/cd2.nwk", "--test", "Group1", "--threads", "4"],
+            "args": ["--alignment", "benchmarks/data/cd2.fna", "--tree", "benchmarks/data/cd2.nwk", "--branches", "Group1,Group2", "--threads", "4"],
             "schema": "contrast_fel.v3.schema.json",
             "tier": "slow",
             "source": "CD2 codon alignment + {Group1-4}-tagged tree (benchmarks/data/cd2.fna, cd2.nwk)"
