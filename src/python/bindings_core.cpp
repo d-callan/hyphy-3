@@ -10,7 +10,6 @@
 namespace nb = nanobind;
 using namespace nb::literals;
 using namespace hyphy::core;
-using namespace hyphy::analyses;
 
 namespace hyphy::bindings {
 
