@@ -556,6 +556,18 @@ if(Python_FOUND)
             message(STATUS "Building Python bindings with nanobind")
             nanobind_add_module(_hyphy3 NB_STATIC
                 src/python/bindings.cpp
+                src/python/bindings_core.cpp
+                src/python/bindings_fel.cpp
+                src/python/bindings_meme.cpp
+                src/python/bindings_busted.cpp
+                src/python/bindings_absrel.cpp
+                src/python/bindings_relax.cpp
+                src/python/bindings_fubar.cpp
+                src/python/bindings_prime.cpp
+                src/python/bindings_gard.cpp
+                src/python/bindings_slac.cpp
+                src/python/bindings_dfel.cpp
+                src/python/bindings_ohmic.cpp
             )
             target_link_libraries(_hyphy3 PRIVATE hyphy3_core hyphy3_emitters)
             set_target_properties(_hyphy3 PROPERTIES
