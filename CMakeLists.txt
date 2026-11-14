@@ -207,17 +207,41 @@ if(HYPHY3_BUILD_TESTS)
     # file's DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN supplies main() and doctest
     # registers every TEST_CASE. ctest selects per-file cases with doctest's
     # -sf (source-file) filter, so the ctest name list is unchanged.
+    #
+    # All test targets link hyphy3_emitters (not just hyphy3_core): R3 moved
+    # the analysis engine and emitter bodies into that static lib, and the
+    # emitters PUBLIC-link propagates core. Static-lib semantics mean unneeded
+    # objects are never pulled in.
+    #
+    # Five tests are standalone programs — own main(), plain asserts, no
+    # doctest TEST_CASEs — so they cannot be textually merged and keep their
+    # own executables: test_cpp_autograd, test_dfel, test_mss,
+    # test_joint_align, test_characterize.
     add_executable(hyphy_test_core_bin tests/bin_core.cpp)
-    target_link_libraries(hyphy_test_core_bin PRIVATE hyphy3_core hyphy3_report)
+    target_link_libraries(hyphy_test_core_bin PRIVATE hyphy3_emitters hyphy3_report)
 
     add_executable(hyphy_test_optimizer_bin
         tests/bin_optimizer.cpp
         src/analyses/expcm_optimizer.cpp
         src/analyses/persite_optimizer.cpp)
-    target_link_libraries(hyphy_test_optimizer_bin PRIVATE hyphy3_core)
+    target_link_libraries(hyphy_test_optimizer_bin PRIVATE hyphy3_emitters)
 
     add_executable(hyphy_test_analyses_bin tests/bin_analyses.cpp)
-    target_link_libraries(hyphy_test_analyses_bin PRIVATE hyphy3_core)
+    target_link_libraries(hyphy_test_analyses_bin PRIVATE hyphy3_emitters)
+
+    function(hyphy3_add_standalone target name src)
+        add_executable(${target} tests/${src})
+        target_link_libraries(${target} PRIVATE hyphy3_emitters)
+        add_test(NAME ${name}
+            COMMAND ${target}
+            WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")
+    endfunction()
+
+    hyphy3_add_standalone(hyphy_cpp_autograd_test  CppAutogradTest    test_cpp_autograd.cpp)
+    hyphy3_add_standalone(hyphy_dfel_test          DirectionalFELTest test_dfel.cpp)
+    hyphy3_add_standalone(hyphy_mss_test           MSSTest            test_mss.cpp)
+    hyphy3_add_standalone(hyphy_joint_align_test   JointAlignTest     test_joint_align.cpp)
+    hyphy3_add_standalone(hyphy_characterize_test  CharacterizeTest   test_characterize.cpp)
 
     function(hyphy3_add_doctest name bin src)
         add_test(NAME ${name}
@@ -226,7 +250,6 @@ if(HYPHY3_BUILD_TESTS)
     endfunction()
 
     hyphy3_add_doctest(CoreTests                hyphy_test_core_bin     test_core.cpp)
-    hyphy3_add_doctest(CppAutogradTest          hyphy_test_core_bin     test_cpp_autograd.cpp)
     hyphy3_add_doctest(TreeEngineTest           hyphy_test_core_bin     test_tree_engine.cpp)
     hyphy3_add_doctest(ReportTest               hyphy_test_core_bin     test_report.cpp)
     hyphy3_add_doctest(ExpcmTest                hyphy_test_optimizer_bin test_expcm.cpp)
@@ -249,11 +272,7 @@ if(HYPHY3_BUILD_TESTS)
     hyphy3_add_doctest(PRIMETest                hyphy_test_analyses_bin  test_prime.cpp)
     hyphy3_add_doctest(GARDTest                 hyphy_test_analyses_bin  test_gard.cpp)
     hyphy3_add_doctest(SLACTest                 hyphy_test_analyses_bin  test_slac.cpp)
-    hyphy3_add_doctest(DirectionalFELTest       hyphy_test_analyses_bin  test_dfel.cpp)
-    hyphy3_add_doctest(MSSTest                  hyphy_test_analyses_bin  test_mss.cpp)
     hyphy3_add_doctest(OhmicTest                hyphy_test_analyses_bin  test_ohmic.cpp)
-    hyphy3_add_doctest(JointAlignTest           hyphy_test_analyses_bin  test_joint_align.cpp)
-    hyphy3_add_doctest(CharacterizeTest         hyphy_test_analyses_bin  test_characterize.cpp)
 
     add_test(NAME HTMLReportEndToEndTest
         COMMAND ${CMAKE_COMMAND}
